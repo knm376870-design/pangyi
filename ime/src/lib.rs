@@ -94,10 +94,17 @@ impl TextService {
 }
 
 impl ITfKeyEventSink_Impl for TextService {
-    fn OnSetFocus(&self, _fg: BOOL) -> Result<()> { Ok(()) }
+    fn OnSetFocus(&self, fg: BOOL) -> Result<()> {
+        log(&format!("OnSetFocus fg={}", fg.as_bool()));
+        Ok(())
+    }
 
     fn OnTestKeyDown(&self, _pic: Option<&ITfContext>, wparam: WPARAM, _lp: LPARAM) -> Result<BOOL> {
-        Ok(BOOL(handleable(wparam) as i32))
+        let want = handleable(wparam);
+        if want {
+            log(&format!("OnTestKeyDown wparam={} 我要={want}", wparam.0));
+        }
+        Ok(BOOL(want as i32))
     }
     fn OnTestKeyUp(&self, _pic: Option<&ITfContext>, _w: WPARAM, _l: LPARAM) -> Result<BOOL> {
         Ok(BOOL(0))
@@ -222,6 +229,7 @@ pub extern "system" fn DllGetClassObject(
     riid: *const GUID,
     ppv: *mut *mut c_void,
 ) -> HRESULT {
+    log("DllGetClassObject 被调用");
     unsafe {
         if ppv.is_null() {
             return E_POINTER;
