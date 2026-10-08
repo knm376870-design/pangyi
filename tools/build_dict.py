@@ -70,7 +70,7 @@ if os.path.exists(uz):
                 kman[chr(int(cp[2:], 16))] = v.split()
 
 # ---------- CC-CEDICT: 每个读音一条 ----------
-entries, seen = [], set()
+entries, seen = [], {}   # (简体, 拼音) -> 在 entries 里的下标
 line_re = re.compile(r"^(\S+)\s+(\S+)\s+\[([^\]]*)\]\s+/(.*)/\s*$")
 with gzip.open(os.path.join(RAW, "cedict.txt.gz"), "rt", encoding="utf-8") as f:
     for line in f:
