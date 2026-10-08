@@ -16,7 +16,8 @@ use windows::Win32::Foundation::{BOOL, CLASS_E_NOAGGREGATION, E_FAIL, E_POINTER,
 use windows::Win32::System::Com::{IClassFactory, IClassFactory_Impl};
 use windows::Win32::UI::TextServices::{
     ITfContext, ITfKeyEventSink, ITfKeyEventSink_Impl, ITfKeystrokeMgr, ITfTextInputProcessor_Impl,
-    ITfRangeACP, ITfTextInputProcessorEx, ITfTextInputProcessorEx_Impl, ITfThreadMgr, TF_SELECTION,
+    ITfEditSession, ITfEditSession_Impl, ITfTextInputProcessorEx, ITfTextInputProcessorEx_Impl,
+    ITfThreadMgr, TF_CONTEXT_EDIT_CONTEXT_FLAGS, TF_ES_READWRITE, TF_ES_SYNC, TF_SELECTION,
 };
 
 pub const CLSID_PANGYI: GUID = GUID::from_u128(0xB4E8F2A1_7C3D_4E5F_9A21_8D6C4B3E1F07);
@@ -43,12 +44,13 @@ fn log(msg: &str) {
 #[implement(ITfTextInputProcessorEx, ITfKeyEventSink)]
 struct TextService {
     client_id: Cell<u32>,
+    tid: Cell<u32>,
     buf: RefCell<String>,
 }
 
 impl TextService {
     fn new() -> Self {
-        Self { client_id: Cell::new(0), buf: RefCell::new(String::new()) }
+        Self { client_id: Cell::new(0), tid: Cell::new(0), buf: RefCell::new(String::new()) }
     }
 }
 
@@ -73,6 +75,7 @@ impl TextService {
         if let Some(tm) = ptim {
             unsafe {
                 self.client_id.set(tid);
+                self.tid.set(tid);
                 let ks: ITfKeystrokeMgr = tm.cast()?;
                 let sink: ITfKeyEventSink = self.cast()?;
                 match ks.AdviseKeyEventSink(tid, &sink, BOOL(1)) {
@@ -122,7 +125,17 @@ impl ITfKeyEventSink_Impl for TextService {
             let hits = dict::lookup(&key);
             log(&format!("上屏 key={key} 候选={}", hits.len()));
             if let (Some(h), Some(ctx)) = (hits.first(), pic) {
-                unsafe { let _ = commit(ctx, &h.word, key.len()); }
+                // TSF 规定：改文本必须包在编辑会话里，否则 SetText 会被拒
+                let session: ITfEditSession = CommitSession {
+                    ctx: ctx.clone(),
+                    text: h.word.encode_utf16().collect(),
+                }
+                .into();
+                let flags = TF_CONTEXT_EDIT_CONTEXT_FLAGS(TF_ES_SYNC.0 | TF_ES_READWRITE.0);
+                match unsafe { ctx.RequestEditSession(self.tid.get(), &session, flags) } {
+                    Ok(hr) => log(&format!("RequestEditSession -> {hr:?}")),
+                    Err(e) => log(&format!("RequestEditSession 失败 {e:?}")),
+                }
             }
             return Ok(BOOL(1));
         }
@@ -139,26 +152,33 @@ fn handleable(wparam: WPARAM) -> bool {
     ch.is_ascii_alphabetic() || wparam.0 == 0x20 || wparam.0 == 0x1B
 }
 
-/// 把光标前 `back` 个 ASCII 字符替换成上屏文本。
-unsafe fn commit(ctx: &ITfContext, word: &str, back: usize) -> Result<()> {
-    let mut sel = [TF_SELECTION::default()];
-    let mut fetched = 0u32;
-    ctx.GetSelection(0, 0, &mut sel, &mut fetched)?;
-    if fetched == 0 {
-        return Ok(());
+/// 编辑会话：在 TSF 允许的时机把文本写进文档。
+#[implement(ITfEditSession)]
+struct CommitSession {
+    ctx: ITfContext,
+    text: Vec<u16>,
+}
+
+impl ITfEditSession_Impl for CommitSession {
+    fn DoEditSession(&self, ec: u32) -> Result<()> {
+        unsafe {
+            let mut sel = [TF_SELECTION::default()];
+            let mut n = 0u32;
+            self.ctx.GetSelection(ec, 0, &mut sel, &mut n)?;
+            if n == 0 {
+                return Ok(());
+            }
+            let range = match (&*sel[0].range).as_ref() {
+                Some(r) => r,
+                None => return Ok(()),
+            };
+            match range.SetText(ec, 0, &self.text) {
+                Ok(()) => log(&format!("DoEditSession 上屏成功 {} 字", self.text.len())),
+                Err(e) => log(&format!("DoEditSession SetText 失败 {e:?}")),
+            }
+        }
+        Ok(())
     }
-    let range = match (&*sel[0].range).as_ref() {
-        Some(r) => r,
-        None => return Ok(()),
-    };
-    let acp: ITfRangeACP = range.cast()?;
-    let mut s = 0i32;
-    let mut e = 0i32;
-    acp.GetExtent(&mut s, &mut e)?;
-    acp.SetExtent(e - back as i32, e)?;
-    let utf16: Vec<u16> = word.encode_utf16().collect();
-    range.SetText(0, 0, &utf16)?;
-    Ok(())
 }
 
 // ============================ COM 服务器 ============================
