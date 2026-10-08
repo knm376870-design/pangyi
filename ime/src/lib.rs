@@ -157,6 +157,10 @@ impl ITfKeyEventSink_Impl for TextService {
     }
 
     fn OnTestKeyDown(&self, _pic: Option<&ITfContext>, wparam: WPARAM, _lp: LPARAM) -> Result<BOOL> {
+        let ch0 = wparam.0 as u8 as char;
+        if ch0.is_ascii_alphabetic() && status::english() {
+            return Ok(BOOL(0));
+        }
         let want = handleable(wparam);
         log(&format!("KeySink::OnTestKeyDown wparam={} 我要={want}", wparam.0));
         Ok(BOOL(want as i32))
