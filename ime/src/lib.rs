@@ -5,7 +5,7 @@
 
 #![allow(non_snake_case)]
 
-mod dict;
+pub mod dict;
 
 use std::cell::{Cell, RefCell};
 use std::os::raw::c_void;
