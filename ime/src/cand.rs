@@ -385,13 +385,11 @@ pub unsafe fn init() {
         hbrBackground: BG,
         ..Default::default()
     };
-    RegisterClassW(&wc);
-    let title: Vec<u16> = "旁译候选\0".encode_utf16().collect();
+    let hr = RegisterClassW(&wc);    let title: Vec<u16> = "旁译候选\0".encode_utf16().collect();
     WND = CreateWindowExW(
         WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE | WS_EX_TOPMOST,
         PCWSTR(cls.as_ptr()), PCWSTR(title.as_ptr()), WS_POPUP,
-        0, 0, sc(400), sc(40), None, None, hinst, None);
-}
+        0, 0, sc(400), sc(40), None, None, hinst, None);}
 
 pub unsafe fn set_items(items: Vec<Item>) {
     { let mut g = ITEMS.lock().unwrap(); *g = items; }
@@ -423,8 +421,7 @@ pub unsafe fn count() -> usize { ITEMS.lock().unwrap().len() }
 
 pub unsafe fn show_at(x: i32, y: i32) {
     if WND.0 == 0 { return; }
-    let n = ITEMS.lock().unwrap().len().min(9);
-    if n == 0 { hide(); return; }
+    let n = ITEMS.lock().unwrap().len().min(9);    if n == 0 { hide(); return; }
     let dc = GetDC(WND);
     let (mut cw, mut ch) = (sc(400), sc(40));
     if dc.0 != 0 {

@@ -28,6 +28,8 @@ use windows::Win32::UI::TextServices::{
     ITfSource, ITfThreadMgr, TF_CONTEXT_EDIT_CONTEXT_FLAGS, TF_ES_READWRITE, TF_ES_SYNC, TF_SELECTION,
 };
 
+static PENDING_CAND: Mutex<Option<(i32, i32)>> = Mutex::new(None);
+
 pub const CLSID_PANGYI: GUID = GUID::from_u128(0xB4E8F2A1_7C3D_4E5F_9A21_8D6C4B3E1F07);
 pub const GUID_PROFILE: GUID = GUID::from_u128(0x5A7C9E12_3D4B_4F8A_B6E1_2C9D7A5E8F34);
 
@@ -194,6 +196,10 @@ impl ITfKeyEventSink_Impl for TextService {
                 let s: ITfEditSession = CompSession { ctx: ctx.clone(), text, sink }.into();
                 let flags = TF_CONTEXT_EDIT_CONTEXT_FLAGS(TF_ES_SYNC.0 | TF_ES_READWRITE.0);
                 let _ = unsafe { ctx.RequestEditSession(self.client_id.get(), &s, flags) };
+            }
+            // 窗口操作放在编辑会话之外，否则会干扰上屏
+            if let Some((x, y)) = *PENDING_CAND.lock().unwrap() {
+                unsafe { cand_update(x, y); }
             }
             return Ok(BOOL(1));
         }
@@ -410,8 +416,8 @@ unsafe fn cand_init() {
 }
 
 unsafe fn cand_update(x: i32, y: i32) {
-    if CAND_HWND.0 == 0 { return; }
-    let _ = (x, y);
+    // 注意：不要再用旧的 CAND_HWND 判断——候选窗已经搬到 cand 模块里了，
+    // 这里留着旧判断会导致候选窗永远不显示。
     cand::show_at(x, y);
 }
 
@@ -457,14 +463,34 @@ impl ITfEditSession_Impl for CompSession {
                 }
             }
 
-            // 把候选窗放到光标下方
+            // 把候选窗放到光标下方；取不到文本范围就退回系统光标位置（否则候选窗根本不出现）
+            let mut placed = false;
             if let Ok(view) = self.ctx.GetActiveView() {
                 let mut rc = RECT::default();
                 let mut clipped = BOOL(0);
                 let r2 = COMPOSITION.as_ref().and_then(|c| c.GetRange().ok()).unwrap_or(range);
                 if view.GetTextExt(ec, &r2, &mut rc, &mut clipped).is_ok() {
-                    cand_update(rc.left, rc.bottom + 6);
+                    log(&format!("候选窗定位: 文本范围 {} ,{}", rc.left, rc.bottom));
+                    *PENDING_CAND.lock().unwrap() = Some((rc.left, rc.bottom + 6));
+                    placed = true;
+                } else {
+                    log("候选窗定位: GetTextExt 失败，改用光标位置");
                 }
+            }
+            if !placed {
+                let mut gi = GUITHREADINFO::default();
+                gi.cbSize = std::mem::size_of::<GUITHREADINFO>() as u32;
+                let (mut x, mut y) = (400, 400);
+                if GetGUIThreadInfo(0, &mut gi).is_ok() {
+                    let mut pt = POINT::default();
+                    if GetCaretPos(&mut pt).is_ok() {
+                        ClientToScreen(gi.hwndCaret, &mut pt);
+                        x = pt.x;
+                        y = pt.y + 26;
+                    }
+                }
+                log(&format!("候选窗定位: 光标 {x},{y}"));
+                *PENDING_CAND.lock().unwrap() = Some((x, y));
             }
         }
         Ok(())
@@ -482,15 +508,17 @@ impl ITfEditSession_Impl for DoneSession {
     fn DoEditSession(&self, ec: u32) -> Result<()> {
         unsafe {
             // 换字 + 结束组合放在同一次会话里（拆成两次会让某些宿主把文字丢掉）
+            let mut wrote = false;
             if let Some(comp) = COMPOSITION.take() {
                 if let Ok(r) = comp.GetRange() {
-                    let _ = r.SetText(ec, 0, &self.text);
+                    wrote = r.SetText(ec, 0, &self.text).is_ok();
                 }
                 let hr = comp.EndComposition(ec);
-                log(&format!("上屏: EndComposition -> {hr:?}"));
+                log(&format!("上屏: SetText={wrote} EndComposition -> {hr:?}"));
             } else {
                 log("上屏: 没有活动组合");
             }
+
         }
         Ok(())
     }
