@@ -238,7 +238,29 @@ for (simp, a), rec in rows.items():
         rec["src"] = "pivot"
         pivot_n += 1
 
-print(f"CC-CEDICT {len(entries)}（去重读音） FreeDict {len(fd)}  RU-wikt {len(rw)}  枢轴补 {pivot_n}")
+# ---------- 人工撰写的高频词（助手逐条写，优先于枢轴；直连语料优先于人工） ----------
+manual = {}
+mp = os.path.join(RAW, "manual-zh-ru.tsv")
+if os.path.exists(mp):
+    with io.open(mp, encoding="utf-8") as f:
+        for line in f:
+            if line.startswith("#"):
+                continue
+            c = line.rstrip("\n").split("\t")
+            if len(c) >= 3 and c[0] and c[1] and c[2]:
+                manual[(c[0], c[1])] = [x.strip() for x in c[2].split(";") if x.strip()]
+manual_n = 0
+for (simp, a), rec in rows.items():
+    g = manual.get((simp, a))
+    if not g:
+        continue
+    # 人工表永远优先：实测直连语料在这些高频词上也会错
+    # （他→другие、很→непослушание、看→думать、会→собрание）
+    rec["ru"] = g
+    rec["src"] = "manual"
+    manual_n += 1
+
+print(f"CC-CEDICT {len(entries)}（去重读音） FreeDict {len(fd)}  RU-wikt {len(rw)}  枢轴补 {pivot_n}  人工补 {manual_n}")
 
 out = []
 for (simp, a), r in rows.items():
