@@ -73,30 +73,16 @@ pub unsafe fn dpi() -> i32 {
 }
 
 pub fn horizontal() -> bool {
-    HORIZONTAL.load(Ordering::Relaxed)
-}
-
-fn cfg_file() -> String {
-    let base = std::env::var("LOCALAPPDATA").unwrap_or_else(|_| ".".into());
-    format!("{base}\\Pangyi\\layout.txt")
-}
-
-fn load_layout() {
-    if let Ok(s) = std::fs::read_to_string(cfg_file()) {
-        HORIZONTAL.store(s.trim().eq_ignore_ascii_case("h"), Ordering::Relaxed);
-    }
-}
-
-fn save_layout() {
-    if let Some(dir) = std::path::Path::new(&cfg_file()).parent() {
-        let _ = std::fs::create_dir_all(dir);
-    }
-    let _ = std::fs::write(cfg_file(), if horizontal() { "h" } else { "v" });
+    crate::settings::horizontal()
 }
 
 pub unsafe fn set_horizontal(v: bool) {
-    HORIZONTAL.store(v, Ordering::Relaxed);
-    save_layout();
+    crate::settings::set_horizontal(v);
+    refresh_settings();
+}
+
+/// 设置改了以后让候选窗按新配置重画/重新量尺寸。
+pub unsafe fn refresh_settings() {
     if WND.0 != 0 {
         let _ = InvalidateRect(WND, None, TRUE);
     }
@@ -110,7 +96,7 @@ fn sc(px: i32) -> i32 {
 fn font(px: i32) -> HFONT {
     unsafe {
         CreateFontW(
-            -sc(px), 0, 0, 0, 400, 0, 0, 0,
+            -sc(px * crate::settings::font_scale() / 100), 0, 0, 0, 400, 0, 0, 0,
             DEFAULT_CHARSET.0 as u32,
             OUT_TT_PRECIS.0 as u32,
             CLIP_DEFAULT_PRECIS.0 as u32,
@@ -182,7 +168,7 @@ unsafe fn compute_layout(dc: HDC, items: &[Item]) -> Layout {
     let mut row_h = 0;
     let mut line_h = 0;
     let mut item_w: Vec<i32> = Vec::new();
-    for (i, it) in items.iter().take(9).enumerate() {
+    for (i, it) in items.iter().take(crate::settings::max_cands()).enumerate() {
         let idx = format!("{}.", i + 1);
         let a = measure(dc, f_idx, &idx).0;
         let (bw, bh) = measure(dc, f_text, &it.word);
@@ -222,7 +208,7 @@ unsafe fn compute_layout(dc: HDC, items: &[Item]) -> Layout {
     };
     let pre_h = if !has_top { 0 } else { measure(dc, f_anno, "x").1 + sc(ROW_PAD) * 2 };
 
-    let (width, height) = if HORIZONTAL.load(Ordering::Relaxed) {
+    let (width, height) = if crate::settings::horizontal() {
         let inset = sc(PAD) / 2;
         let mut w = pad * 2 + inset * 2;
         for (i, iw) in item_w.iter().take(nth).enumerate() {
@@ -264,7 +250,7 @@ pub unsafe fn detect_theme() {
         let _ = ReleaseDC(None, dc);
     }
     if DPI <= 0 { DPI = 96; }
-    load_layout();
+    crate::settings::load();
 }
 
 unsafe extern "system" fn proc_cand(h: HWND, msg: u32, w: WPARAM, l: LPARAM) -> LRESULT {
@@ -272,7 +258,7 @@ unsafe extern "system" fn proc_cand(h: HWND, msg: u32, w: WPARAM, l: LPARAM) -> 
         WM_PAINT => {
             let mut ps = PAINTSTRUCT::default();
             let dc = BeginPaint(h, &mut ps);
-            let p = palette(DARK.load(Ordering::Relaxed));
+            let p = palette(crate::settings::dark(DARK.load(Ordering::Relaxed)));
             let mut rc = RECT::default();
             let _ = GetClientRect(h, &mut rc);
             let bg = CreateSolidBrush(p.background);
@@ -320,11 +306,11 @@ unsafe extern "system" fn proc_cand(h: HWND, msg: u32, w: WPARAM, l: LPARAM) -> 
             let small_idx = ((lay.line_h - measure(dc, f_idx, "x").1) / 2).max(0);
             let small_anno = ((lay.line_h - measure(dc, f_anno, "x").1) / 2).max(0);
 
-            if HORIZONTAL.load(Ordering::Relaxed) {
+            if crate::settings::horizontal() {
                 let inset = sc(PAD) / 2;
                 let mut x = pad + inset;
                 let baseline = y + sc(ROW_PAD);
-                for (i, it) in items.iter().take(9).enumerate() {
+                for (i, it) in items.iter().take(crate::settings::max_cands()).enumerate() {
                     let iw = lay.item_w.get(i).copied().unwrap_or(0);
                     if i == sel {
                         let hb = CreateSolidBrush(p.highlight);
@@ -360,7 +346,7 @@ unsafe extern "system" fn proc_cand(h: HWND, msg: u32, w: WPARAM, l: LPARAM) -> 
                 let x_word = x_index + lay.index_w + gap;
                 let x_pinyin = x_word + lay.word_w + gap;
                 let x_ru = x_pinyin + lay.pinyin_w + gap;
-                for (i, it) in items.iter().take(9).enumerate() {
+                for (i, it) in items.iter().take(crate::settings::max_cands()).enumerate() {
                     let ry = y + (i as i32) * lay.row_h;
                     if i == sel {
                         let hb = CreateSolidBrush(p.highlight);
@@ -404,7 +390,7 @@ unsafe extern "system" fn proc_cand(h: HWND, msg: u32, w: WPARAM, l: LPARAM) -> 
 pub unsafe fn init() {
     if WND.0 != 0 { return; }
     detect_theme();
-    let p = palette(DARK.load(Ordering::Relaxed));
+    let p = palette(crate::settings::dark(DARK.load(Ordering::Relaxed)));
     BG = CreateSolidBrush(p.background);
     let hinst = windows::Win32::System::LibraryLoader::GetModuleHandleW(None).unwrap();
     let cls: Vec<u16> = "PangyiCandModern\0".encode_utf16().collect();
@@ -453,7 +439,7 @@ pub unsafe fn count() -> usize { ITEMS.lock().unwrap().len() }
 
 pub unsafe fn show_at(x: i32, y: i32) {
     if WND.0 == 0 { return; }
-    let n = ITEMS.lock().unwrap().len().min(9);    if n == 0 { hide(); return; }
+    let n = ITEMS.lock().unwrap().len().min(crate::settings::max_cands());    if n == 0 { hide(); return; }
     let dc = GetDC(WND);
     let (mut cw, mut ch) = (sc(400), sc(40));
     if dc.0 != 0 {

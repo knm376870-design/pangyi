@@ -7,6 +7,7 @@
 
 pub mod cand;
 pub mod dict;
+pub mod settings;
 pub mod status;
 
 use std::cell::{Cell, RefCell};
@@ -87,7 +88,7 @@ impl ITfTextInputProcessorEx_Impl for TextService {
 impl TextService {
     fn activate(&self, ptim: Option<&ITfThreadMgr>, tid: u32) -> Result<()> {
         log("Activate");
-        unsafe { status::init(); status::show(); }
+        unsafe { settings::load(); status::init(); status::show(); }
         if let Some(tm) = ptim {
             unsafe {
                 self.tid.set(tid);
