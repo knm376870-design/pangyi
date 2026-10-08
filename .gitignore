@@ -1,5 +1,6 @@
 # 原始数据体积大，不入库；用 tools/build_dict.py 重新下载生成
 data/raw/
+!data/raw/manual-zh-ru.tsv
 __pycache__/
 *.pyc
 ime/target/
