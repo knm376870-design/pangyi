@@ -16,7 +16,7 @@ use windows::Win32::Foundation::{BOOL, CLASS_E_NOAGGREGATION, E_FAIL, E_POINTER,
 use windows::Win32::System::Com::{IClassFactory, IClassFactory_Impl};
 use windows::Win32::UI::TextServices::{
     ITfContext, ITfKeyEventSink, ITfKeyEventSink_Impl, ITfKeystrokeMgr, ITfTextInputProcessor_Impl,
-    ITfDocumentMgr, ITfEditSession, ITfEditSession_Impl, ITfTextInputProcessorEx,
+    ITfClientId, ITfDocumentMgr, ITfEditSession, ITfEditSession_Impl, ITfTextInputProcessorEx,
     ITfTextInputProcessorEx_Impl, ITfThreadMgrEventSink, ITfThreadMgrEventSink_Impl,
     ITfSource, ITfThreadMgr, TF_CONTEXT_EDIT_CONTEXT_FLAGS, TF_ES_READWRITE, TF_ES_SYNC, TF_SELECTION,
 };
@@ -76,8 +76,16 @@ impl TextService {
         log("Activate");
         if let Some(tm) = ptim {
             unsafe {
-                self.client_id.set(tid);
                 self.tid.set(tid);
+                // TSF 要的是 TfClientId（用 CLSID 换），不是线程 ID。
+                // 传错会导致 AdviseKeyEventSink 返回 0x80040201（事件无法调用任何订户）。
+                match tm.cast::<ITfClientId>() {
+                    Ok(ci) => match ci.GetClientId(&CLSID_PANGYI) {
+                        Ok(cid) => { self.client_id.set(cid); log(&format!("TfClientId={cid}")); }
+                        Err(e) => log(&format!("GetClientId 失败 {e:?}")),
+                    },
+                    Err(e) => log(&format!("拿不到 ITfClientId: {e:?}")),
+                }
                 self.tm.set(tm.as_raw());
                 let tmsink: ITfThreadMgrEventSink = self.cast()?;
                 match tm.cast::<ITfSource>() {
@@ -101,9 +109,10 @@ impl TextService {
             let tm = std::mem::ManuallyDrop::new(ITfThreadMgr::from_raw(raw));
             let Ok(ks) = tm.cast::<ITfKeystrokeMgr>() else { return };
             let Ok(sink) = self.cast::<ITfKeyEventSink>() else { return };
-            match ks.AdviseKeyEventSink(self.tid.get(), &sink, BOOL(1)) {
-                Ok(()) => log("AdviseKeyEventSink ok"),
-                Err(e) => log(&format!("AdviseKeyEventSink 失败 {e:?}")),
+            let cid = self.client_id.get();
+            match ks.AdviseKeyEventSink(cid, &sink, BOOL(1)) {
+                Ok(()) => log(&format!("AdviseKeyEventSink ok (TfClientId={cid})")),
+                Err(e) => log(&format!("AdviseKeyEventSink 失败 cid={cid} {e:?}")),
             }
         }
     }
