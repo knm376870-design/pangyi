@@ -9,6 +9,7 @@ use windows::Win32::Foundation::*;
 use windows::Win32::Graphics::Gdi::*;
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::Input::KeyboardAndMouse::*;
+use windows::Win32::UI::Shell::*;
 use windows::Win32::UI::WindowsAndMessaging::*;
 
 #[derive(Default)]
@@ -20,6 +21,8 @@ struct State {
 static ST: Mutex<Option<State>> = Mutex::new(None);
 static mut HWND_CAND: HWND = HWND(0);
 static mut HOOK: HHOOK = HHOOK(0);
+const WM_TRAY: u32 = WM_APP + 1;
+const TRAY_ID: u32 = 1;
 
 fn wide(s: &str) -> Vec<u16> { s.encode_utf16().chain(std::iter::once(0)).collect() }
 
@@ -49,6 +52,55 @@ unsafe fn show_cands() {
     InvalidateRect(h, None, TRUE);
 }
 
+unsafe fn tray_add(hwnd: HWND, first: bool) {
+    let mut nid = NOTIFYICONDATAW::default();
+    nid.cbSize = std::mem::size_of::<NOTIFYICONDATAW>() as u32;
+    nid.hWnd = hwnd;
+    nid.uID = TRAY_ID;
+    nid.uCallbackMessage = WM_TRAY;
+    nid.uFlags = NIF_ICON | NIF_MESSAGE | NIF_TIP;
+    nid.hIcon = LoadIconW(None, IDI_APPLICATION).unwrap_or_default();
+    let tip: Vec<u16> = "旁译 · 中俄输入（敲拼音，空格上屏）".encode_utf16().collect();
+    let n = tip.len().min(nid.szTip.len());
+    nid.szTip[..n].copy_from_slice(&tip[..n]);
+    let _ = Shell_NotifyIconW(if first { NIM_ADD } else { NIM_MODIFY }, &nid);
+
+    if first {
+        let mut ball = nid;
+        ball.uFlags = NIF_INFO;
+        ball.dwInfoFlags = NIIF_INFO;
+        let title: Vec<u16> = "旁译 已启动".encode_utf16().collect();
+        let m = title.len().min(ball.szInfoTitle.len());
+        ball.szInfoTitle[..m].copy_from_slice(&title[..m]);
+        let info: Vec<u16> = "在任何软件里敲拼音，候选窗会出现中文和俄语译词，空格上屏。托盘图标右键可退出。".encode_utf16().collect();
+        let k = info.len().min(ball.szInfo.len());
+        ball.szInfo[..k].copy_from_slice(&info[..k]);
+        let _ = Shell_NotifyIconW(NIM_MODIFY, &ball);
+    }
+}
+
+unsafe fn tray_remove(hwnd: HWND) {
+    let mut nid = NOTIFYICONDATAW::default();
+    nid.cbSize = std::mem::size_of::<NOTIFYICONDATAW>() as u32;
+    nid.hWnd = hwnd;
+    nid.uID = TRAY_ID;
+    let _ = Shell_NotifyIconW(NIM_DELETE, &nid);
+}
+
+unsafe fn tray_menu(hwnd: HWND) {
+    let Ok(menu) = CreatePopupMenu() else { return };
+    let s: Vec<u16> = "退出旁译".encode_utf16().chain(std::iter::once(0)).collect();
+    let _ = AppendMenuW(menu, MF_STRING, 1, PCWSTR(s.as_ptr()));
+    let mut pt = POINT::default();
+    let _ = GetCursorPos(&mut pt);
+    let _ = SetForegroundWindow(hwnd);
+    let cmd = TrackPopupMenu(menu, TPM_RETURNCMD | TPM_RIGHTBUTTON, pt.x, pt.y, 0, hwnd, None);
+    let _ = DestroyMenu(menu);
+    if cmd.0 == 1 {
+        tray_remove(hwnd);
+        let _ = DestroyWindow(hwnd);
+    }
+}
 unsafe fn send_backspaces(n: usize) {
     let mut inputs: Vec<INPUT> = Vec::new();
     for _ in 0..n {
@@ -209,6 +261,7 @@ unsafe extern "system" fn cand_proc(h: HWND, msg: u32, w: WPARAM, l: LPARAM) -> 
             EndPaint(h, &ps);
             LRESULT(0)
         }
+        WM_TRAY => { if l.0 as u32 == WM_RBUTTONUP { tray_menu(h); } LRESULT(0) }
         WM_DESTROY => { PostQuitMessage(0); LRESULT(0) }
         _ => DefWindowProcW(h, msg, w, l),
     }
@@ -233,6 +286,7 @@ fn main() {
             PCWSTR(cls.as_ptr()), w!("旁译"), WS_POPUP,
             0, 0, 560, 300, None, None, hinst, None);
 
+        tray_add(HWND_CAND, true);
         HOOK = SetWindowsHookExW(WH_KEYBOARD_LL, Some(hook_proc), hinst, 0).unwrap();
 
         let mut msg = MSG::default();
