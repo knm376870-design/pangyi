@@ -1,13 +1,18 @@
 #!/usr/bin/env python3
 """Pangyi / 旁译 - 词典构建。
 
-合并四个免费数据源 -> data/zh-ru.tsv
-  cedict.txt.gz       CC-CEDICT          CC BY-SA 4.0  繁/简/拼音
-  zho-rus.tei         FreeDict zho-rus   CC BY-SA 3.0  繁 -> 俄语（偏生僻）
-  ruwikt-zh-ru.tsv    RU Wiktionary      CC BY-SA 3.0  常用词 -> 俄语（直接）
-  jieba_dict.txt      jieba 词频          MIT           候选排序
+关键设计：多音字按「一个读音一条」输出。
+  都(dōu) 和 都(dū) 是两条记录 —— 否则只存一条，敲 dou 永远查不到 都。
+
+数据源（全部免费）:
+  cedict.txt.gz       CC-CEDICT          CC BY-SA 4.0   繁/简/拼音，一个读音一条
+  zho-rus.tei         FreeDict zho-rus   CC BY-SA 3.0   繁 -> 俄语（偏生僻）
+  ruwikt-zh-ru.tsv    RU Wiktionary      CC BY-SA 3.0   常用词 -> 俄语（直连，高置信）
+  pivot-zh-ru.tsv     中->英->俄枢轴兜底   CC BY-SA      低置信，只用于多字词
+  Unihan.zip          Unicode Unihan     Unicode License 单字主读音（兜底）
+  jieba_dict.txt      jieba 词频          MIT            候选排序
 """
-import gzip, io, os, re, sys
+import gzip, io, os, re, sys, zipfile
 sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -41,17 +46,31 @@ def tone_mark(syl, tone):
 
 
 def parse_pinyin(num):
-    disp, asc = [], []
-    for syl, d in re.findall(r"([A-Za-zü:ê]+)([1-5])", num or ""):
-        t = int(d)
-        m = tone_mark(syl, t)
-        disp.append(m)
-        asc.append("".join(PLAIN.get(c, c) for c in m))
-    return "".join(asc), "".join(disp)
+    """'kai1fa1' / 'kai1 fa1' -> ('kaifa', 'kāifā')"""
+    disp = [tone_mark(s, int(d)) for s, d in re.findall(r"([A-Za-zü:ê]+)([1-5])", num or "")]
+    return "".join(PLAIN.get(c, c) for c in "".join(disp)), "".join(disp)
 
 
-# ---------- CC-CEDICT ----------
-ced = {}
+def split_marks(s):
+    """Unihan 的 'shàng' -> ('shang', 'shàng')"""
+    s = s.strip().lower()
+    return "".join(PLAIN.get(c, c) for c in s), s
+
+
+# ---------- Unihan: 单字主读音 ----------
+kman = {}
+uz = os.path.join(RAW, "Unihan.zip")
+if os.path.exists(uz):
+    with zipfile.ZipFile(uz).open("Unihan_Readings.txt") as fh:
+        for line in io.TextIOWrapper(fh, encoding="utf-8"):
+            if line.startswith("#") or "kMandarin" not in line:
+                continue
+            cp, k, v = line.rstrip("\n").split("\t")[:3]
+            if k == "kMandarin":
+                kman[chr(int(cp[2:], 16))] = v.split()
+
+# ---------- CC-CEDICT: 每个读音一条 ----------
+entries, seen = [], set()
 line_re = re.compile(r"^(\S+)\s+(\S+)\s+\[([^\]]*)\]\s+/(.*)/\s*$")
 with gzip.open(os.path.join(RAW, "cedict.txt.gz"), "rt", encoding="utf-8") as f:
     for line in f:
@@ -60,10 +79,25 @@ with gzip.open(os.path.join(RAW, "cedict.txt.gz"), "rt", encoding="utf-8") as f:
         m = line_re.match(line.rstrip("\n"))
         if not m:
             continue
-        trad, simp, num = m.group(1), m.group(2), m.group(3)
+        trad, simp, num, defs = m.group(1), m.group(2), m.group(3), m.group(4)
         a, d = parse_pinyin(num)
-        ced.setdefault(trad, (simp, a, d))
-        ced.setdefault("=" + simp, (simp, a, d))
+        if not a:
+            continue
+        k = (simp, a)
+        if k in seen:
+            # 同音（不分声调）已经有记录了：优先保留与 Unihan 主读音写法一致的那条。
+            # 否则 上 会显示成 shǎng —— CC-CEDICT 里 shǎng 那条先出现。
+            i = seen[k]
+            cur = entries[i]
+            pref = set(kman.get(simp, []))
+            if d in pref and cur["d"] not in pref:
+                entries[i] = {"simp": simp, "trad": trad, "a": a, "d": d, "def": defs}
+            continue
+        seen[k] = len(entries)
+        entries.append({"simp": simp, "trad": trad, "a": a, "d": d, "def": defs})
+by_simp = {}
+for e in entries:
+    by_simp.setdefault(e["simp"], []).append(e)
 
 # ---------- FreeDict zho-rus ----------
 ENTRY = re.compile(r"<entry\b.*?</entry>", re.S)
@@ -71,39 +105,37 @@ ORTH  = re.compile(r"<orth>(.*?)</orth>", re.S)
 POSR  = re.compile(r"<pos>(.*?)</pos>", re.S)
 RU    = re.compile(r'<cit type="trans" xml:lang="ru">(.*?)</cit>', re.S)
 QUOTE = re.compile(r"<quote>(.*?)</quote>", re.S)
-WIKI  = re.compile(r"\[\[|\]\]")
-
-
 def clean(t):
-    t = WIKI.sub("", t)
+    t = re.sub(r"\[\[|\]\]", "", t)
     t = re.sub(r"<[^>]+>", "", t)
     return re.sub(r"\s+", " ", t).strip()
-
-
 fd = {}
 s = io.open(os.path.join(RAW, "zho-rus", "zho-rus.tei"), encoding="utf-8").read()
-for block in ENTRY.findall(s):
-    om = ORTH.search(block)
+for blk in ENTRY.findall(s):
+    om = ORTH.search(blk)
     if not om:
         continue
     trad = clean(om.group(1))
-    pos = clean(POSR.search(block).group(1)) if POSR.search(block) else ""
-    g = [clean(q) for cit in RU.findall(block) for q in QUOTE.findall(cit)]
+    pos = clean(POSR.search(blk).group(1)) if POSR.search(blk) else ""
+    g = [clean(q) for cit in RU.findall(blk) for q in QUOTE.findall(cit)]
     g = [x for x in g if x]
     if g:
         fd[trad] = (pos, g)
 
-# ---------- RU Wiktionary ----------
-rw = {}
-p = os.path.join(RAW, "ruwikt-zh-ru.tsv")
-if os.path.exists(p):
-    with io.open(p, encoding="utf-8") as f:
-        for line in f:
-            if line.startswith("#"):
-                continue
-            c = line.rstrip("\n").split("\t")
-            if len(c) >= 6:
-                rw[c[0]] = c[1:6]   # simp, trad, pint, pos, ru
+# ---------- RU Wiktionary（直连） / 枢轴（兜底） ----------
+def read_cache(path):
+    d = {}
+    if os.path.exists(path):
+        with io.open(path, encoding="utf-8") as f:
+            for line in f:
+                if line.startswith("#"):
+                    continue
+                c = line.rstrip("\n").split("\t")
+                if len(c) >= 6:
+                    d[c[0]] = c[1:6]
+    return d
+rw    = read_cache(os.path.join(RAW, "ruwikt-zh-ru.tsv"))
+pivot = read_cache(os.path.join(RAW, "pivot-zh-ru.tsv"))
 
 # ---------- 词频 ----------
 freq = {}
@@ -113,88 +145,86 @@ with io.open(os.path.join(RAW, "jieba_dict.txt"), encoding="utf-8") as f:
         if len(c) >= 2 and c[1].isdigit():
             freq[c[0]] = int(c[1])
 
-# ---------- 合并 ----------
+# ---------- 合并：key = (简体, 拼音) ----------
 rows = {}
 
-def put(simp, trad, a, d, pos, ru):
-    if not simp or not CJK.match(simp):
+
+def emit(simp, trad, a, d, pos="", ru=None):
+    if not simp or not a or not CJK.match(simp):
         return
-    old = rows.get(simp)
-    if old is None:
-        rows[simp] = {"trad": trad or simp, "a": a, "d": d, "pos": pos, "ru": list(ru)}
-    else:
-        if not old["a"] and a:
-            old["a"], old["d"] = a, d
-        if ru and not old["ru"]:
-            old["ru"] = list(ru)
-        if pos and not old["pos"]:
-            old["pos"] = pos
+    key = (simp, a)
+    cur = rows.get(key)
+    if cur is None:
+        rows[key] = {"trad": trad or simp, "d": d, "pos": pos, "ru": list(ru or [])}
+        return cur if cur else rows[key]
+    if pos and not cur["pos"]:
+        cur["pos"] = pos
+    if ru and not cur["ru"]:
+        cur["ru"] = list(ru)
+    return cur
 
 
-for trad, (simp, a, d) in ced.items():
-    if trad.startswith("="):
-        continue
-    f = fd.get(trad)
-    put(simp, trad, a, d, f[0] if f else "", f[1] if f else [])
+# 1) CC-CEDICT 每个读音一条 + FreeDict 直连
+for e in entries:
+    f = fd.get(e["trad"])
+    emit(e["simp"], e["trad"], e["a"], e["d"], f[0] if f else "", f[1] if f else [])
 
+# 2) 俄语维基（直连）—— 覆盖到该词的每个读音上
 for title, (sim, tra, pint, pos, ru) in rw.items():
-    key = sim or title
-    a, d = "", ""
-    src = ced.get(key) or ced.get("=" + key) or (ced.get(tra) if tra else None)
-    # 优先用维基词典这一条自己的拼音：多音字（如 都 dou1/du1）才不会被 CC-CEDICT 取错读音
-    if pint:
-        a, d = parse_pinyin(pint)
-    if not a and src:
-        a, d = src[1], src[2]
+    simp = sim or title
+    if not simp:
+        continue
     g = [x.strip() for x in ru.split("|") if x.strip()]
-    # 丢掉领域/古旧标记的义项（「(шахматы) королева」「† устар.」），那多半不是常用义
     g = [x for x in g if not x.startswith(("(", "†", "устар", "обл."))]
-    put(key, tra or key, a, d, pos, g)
-    if g and key in rows:
-        rows[key]["ru"] = g   # 俄语维基是直连来源，优先于 FreeDict
+    if not g:
+        continue
+    reads = [(e["a"], e["d"], e["trad"]) for e in by_simp.get(simp, [])]
+    if pint:
+        pa, pd = parse_pinyin(pint)
+        if pa:
+            reads = [(pa, pd, tra or simp)] + [r for r in reads if r[0] != pa]
+    if not reads and len(simp) == 1:
+        reads = [(split_marks(k)[0], split_marks(k)[1], tra or simp) for k in kman.get(simp, [])]
+    for a, d, tr in reads:
+        cur = emit(simp, tr, a, d, pos)
+        if cur:
+            cur["ru"] = g
 
-# ---------- 枢轴兜底（中->英->俄）: 只补还没有俄语的词 ----------
+# 3) 枢轴兜底：只给多字词，且只补还没有俄语的
 pivot_n = 0
-pp = os.path.join(RAW, "pivot-zh-ru.tsv")
-if os.path.exists(pp):
-    with io.open(pp, encoding="utf-8") as f:
-        for line in f:
-            if line.startswith("#"):
-                continue
-            c = line.rstrip("\n").split("\t")
-            if len(c) < 6 or not c[1] or not c[5]:
-                continue
-            simp, trad, ru = c[1], c[2], c[5]
-            # 单字歧义太大（简繁合并 + 多音字），只信直连来源，宁缺毋滥
-            if len(simp) < 2:
-                continue
-            g = [x.strip() for x in ru.split("|") if x.strip()]
-            cur = rows.get(simp)
-            if cur is None:
-                src = ced.get(simp) or ced.get("=" + simp) or (ced.get(trad) if trad else None)
-                a, d = (src[1], src[2]) if src else ("", "")
-                rows[simp] = {"trad": trad or simp, "a": a, "d": d, "pos": "", "ru": g}
-                pivot_n += 1
-            elif not cur["ru"]:
-                cur["ru"] = g
-                pivot_n += 1
+for title, (sim, tra, pint, pos, ru) in pivot.items():
+    simp = sim or title
+    if len(simp) < 2:
+        continue
+    g = [x.strip() for x in ru.split("|") if x.strip()]
+    g = [x for x in g if not x.startswith(("(", "†"))]
+    if not g:
+        continue
+    for e in by_simp.get(simp, []):
+        key = (simp, e["a"])
+        cur = rows.get(key)
+        if cur is None:
+            cur = emit(simp, e["trad"], e["a"], e["d"])
+            pivot_n += 1
+        elif not cur["ru"]:
+            pivot_n += 1
+        if cur and not cur["ru"]:
+            cur["ru"] = g
 
-print(f"CC-CEDICT {len(ced)}  FreeDict {len(fd)}  RU-wikt {len(rw)}  枢轴 {pivot_n}  ->  合并 {len(rows)} 条")
+print(f"CC-CEDICT {len(entries)}（去重读音） FreeDict {len(fd)}  RU-wikt {len(rw)}  枢轴补 {pivot_n}")
 
-out_rows = []
-for simp, r in rows.items():
-    out_rows.append((simp, r["trad"], r["a"], r["d"], r["pos"], freq.get(simp, 0),
-                     " | ".join(r["ru"][:4])))
-out_rows.sort(key=lambda x: (-x[5], len(x[0]), x[2]))
+out = []
+for (simp, a), r in rows.items():
+    if r["ru"]:
+        out.append((simp, r["trad"], a, r["d"], r["pos"], freq.get(simp, 0), " | ".join(r["ru"][:4])))
+out.sort(key=lambda x: (-x[5], len(x[0]), x[2]))
 with io.open(OUT, "w", encoding="utf-8", newline="\n") as f:
     f.write("#simplified\ttraditional\tpinyin_ascii\tpinyin_display\tpos\tfreq\tru\n")
-    for r in out_rows:
-        if r[2] and r[6]:
-            f.write("\t".join(str(x) for x in r) + "\n")
-n = sum(1 for _ in io.open(OUT, encoding="utf-8")) - 1
-print(f"写出 {OUT}: {n} 条（有拼音 + 有俄语）")
+    for r in out:
+        f.write("\t".join(str(x) for x in r) + "\n")
+print(f"写出 {OUT}: {len(out)} 条")
 
-# ---------- 常用词覆盖率 ----------
+# ---------- 覆盖率 ----------
 words = []
 with io.open(os.path.join(RAW, "jieba_dict.txt"), encoding="utf-8") as f:
     for line in f:
@@ -202,14 +232,16 @@ with io.open(os.path.join(RAW, "jieba_dict.txt"), encoding="utf-8") as f:
         if len(c) >= 2 and c[1].isdigit() and CJK.match(c[0]):
             words.append((c[0], int(c[1])))
 words.sort(key=lambda x: -x[1])
-have = {r[0] for r in out_rows if r[6]}
-print("\n常用词覆盖率（有俄语译词）:")
-for k in (100, 500, 1000, 2000, 3000, 5000, 10000, 20000):
+have = {r[0] for r in out}
+print("\n常用词覆盖率:")
+for k in (100, 1000, 5000, 10000):
     h = sum(1 for w, _ in words[:k] if w in have)
     print(f"  前 {k:>6}: {h:>6}  {h*100.0/k:>5.1f}%")
 
-print("\n以前查不到、现在有的:")
-for w in ("人", "中国", "又", "都", "她", "这", "月", "日", "道"):
-    r = rows.get(w)
-    if r and r["ru"]:
-        print(f"  {w}  [{r['d']}]  {' · '.join(r['ru'][:3])}")
+print("\n多音字现在有几个读音（敲不同拼音都能出）:")
+for w in ("都", "地", "的", "着", "说", "上", "行", "长", "乐"):
+    rs = [(a, r["d"]) for (s, a), r in rows.items() if s == w and r["ru"]]
+    if rs:
+        print(f"  {w}: " + "  ".join(f"{a}/{d}" for a, d in rs))
+    else:
+        print(f"  {w}: （无）")
