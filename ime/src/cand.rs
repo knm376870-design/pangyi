@@ -153,6 +153,10 @@ unsafe fn compute_layout(dc: HDC, items: &[Item]) -> Layout {
     Layout { index_w, word_w, pinyin_w, ru_w, row_h, line_h, width, height }
 }
 
+pub fn is_dark() -> bool { DARK.load(Ordering::Relaxed) }
+
+pub unsafe fn dpi() -> i32 { if DPI <= 0 { 96 } else { DPI } }
+
 pub unsafe fn detect_theme() {
     use windows::Win32::System::Registry::*;
     let mut h = HKEY::default();

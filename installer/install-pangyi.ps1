@@ -11,8 +11,8 @@ Remove-Item $log -Force -ErrorAction SilentlyContinue
 
 $src   = 'C:\Users\33354\Documents\Codex\2026-10-08\github-yenharvey-qingjian\pangyi\dist'
 $dst   = 'C:\Program Files\Pangyi'
-$dll64 = 'pangyi_ime-0.1.0.dll'
-$dll32 = 'pangyi_ime-0.1.0-x86.dll'
+$dll64 = 'pangyi_ime-0.1.1.dll'
+$dll32 = 'pangyi_ime-0.1.1-x86.dll'
 $ico   = 'pangyi.ico'
 $clsid = '{B4E8F2A1-7C3D-4E5F-9A21-8D6C4B3E1F07}'
 $prof  = '{5A7C9E12-3D4B-4F8A-B6E1-2C9D7A5E8F34}'
@@ -70,4 +70,6 @@ W '已注册 TSF 文本服务 + 语言配置'
 foreach ($h in @("HKCU:\Software\Classes\CLSID\$clsid", "HKCU:\Software\Microsoft\CTF\TIP\$clsid")) {
   if (Test-Path $h) { Remove-Item -Recurse -Force $h; W ('已清除旧项: ' + $h) }
 }
+# 6) 清理旧版本 DLL（被占用就跳过）
+Get-ChildItem 'C:\Program Files\Pangyi\pangyi_ime-*.dll' | Where-Object { $_.Name -ne $dll64 -and $_.Name -ne $dll32 } | ForEach-Object { try { Remove-Item $_.FullName -Force -ErrorAction Stop; W ('已删除旧版本: ' + $_.Name) } catch { W ('旧版本占用中，跳过: ' + $_.Name) } }
 W '=== 完成 ==='

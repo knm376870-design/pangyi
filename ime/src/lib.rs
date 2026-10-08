@@ -7,6 +7,7 @@
 
 pub mod cand;
 pub mod dict;
+pub mod status;
 
 use std::cell::{Cell, RefCell};
 use std::os::raw::c_void;
@@ -84,6 +85,7 @@ impl ITfTextInputProcessorEx_Impl for TextService {
 impl TextService {
     fn activate(&self, ptim: Option<&ITfThreadMgr>, tid: u32) -> Result<()> {
         log("Activate");
+        unsafe { status::init(); status::show(); }
         if let Some(tm) = ptim {
             unsafe {
                 self.tid.set(tid);
@@ -133,6 +135,7 @@ impl TextService {
 
     fn deactivate(&self) -> Result<()> {
         log("Deactivate");
+        unsafe { status::hide(); }
         // 关键：切走再切回来会重新 Activate，必须允许重新挂按键接收器。
         // 之前这里没复位，导致"切换回来后按键全部漏给应用"。
         self.advised.set(false);
@@ -175,6 +178,7 @@ impl ITfKeyEventSink_Impl for TextService {
         let ch = wparam.0 as u8 as char;
         log(&format!("KeySink::OnKeyDown wparam={} ch={ch:?}", wparam.0));
         if ch.is_ascii_alphabetic() {
+            if status::english() { return Ok(BOOL(0)); }
             self.buf.borrow_mut().push(ch.to_ascii_lowercase());
             let key = self.buf.borrow().clone();
             let hits = dict::lookup(&key);
