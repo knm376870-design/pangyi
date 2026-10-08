@@ -147,6 +147,8 @@ for title, (sim, tra, pint, pos, ru) in rw.items():
     if not a and src:
         a, d = src[1], src[2]
     g = [x.strip() for x in ru.split("|") if x.strip()]
+    # 丢掉领域/古旧标记的义项（「(шахматы) королева」「† устар.」），那多半不是常用义
+    g = [x for x in g if not x.startswith(("(", "†", "устар", "обл."))]
     put(key, tra or key, a, d, pos, g)
     if g and key in rows:
         rows[key]["ru"] = g   # 俄语维基是直连来源，优先于 FreeDict
