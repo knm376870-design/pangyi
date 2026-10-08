@@ -148,6 +148,8 @@ for title, (sim, tra, pint, pos, ru) in rw.items():
         a, d = src[1], src[2]
     g = [x.strip() for x in ru.split("|") if x.strip()]
     put(key, tra or key, a, d, pos, g)
+    if g and key in rows:
+        rows[key]["ru"] = g   # 俄语维基是直连来源，优先于 FreeDict
 
 # ---------- 枢轴兜底（中->英->俄）: 只补还没有俄语的词 ----------
 pivot_n = 0
@@ -161,6 +163,9 @@ if os.path.exists(pp):
             if len(c) < 6 or not c[1] or not c[5]:
                 continue
             simp, trad, ru = c[1], c[2], c[5]
+            # 单字歧义太大（简繁合并 + 多音字），只信直连来源，宁缺毋滥
+            if len(simp) < 2:
+                continue
             g = [x.strip() for x in ru.split("|") if x.strip()]
             cur = rows.get(simp)
             if cur is None:
