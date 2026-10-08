@@ -152,7 +152,7 @@ unsafe fn commit(idx: usize) {
     send_text(&word);
     let mut st = ST.lock().unwrap();
     if let Some(s) = st.as_mut() { s.buf.clear(); s.cands.clear(); }
-    ShowWindow(HWND_CAND, SW_HIDE);
+    pangyi_ime::cand::hide();
 }
 
 unsafe fn refresh() {
@@ -165,7 +165,7 @@ unsafe fn refresh() {
         } else {
             let hits = pangyi_ime::dict::lookup(&st.buf);
             let items: Vec<pangyi_ime::cand::Item> = hits.iter().map(|h| pangyi_ime::cand::Item {
-                word: h.word.clone(), pinyin: h.pinyin.clone(), ru: h.ru.clone() }).collect();
+                word: h.word.clone(), pinyin: h.pinyin.clone(), ru: h.ru.clone(), fresh: false }).collect();
             pangyi_ime::cand::set_items(items);
             let v: Vec<(String, String)> = hits.into_iter().map(|h| (h.word, h.ru)).collect();
             st.cands = v.clone();
@@ -187,7 +187,7 @@ unsafe extern "system" fn hook_proc(code: i32, w: WPARAM, l: LPARAM) -> LRESULT 
     if ctrl || (kb.flags.0 & 0x20u32) != 0 { 
         let mut st = ST.lock().unwrap();
         if let Some(s) = st.as_mut() { s.buf.clear(); s.cands.clear(); }
-        ShowWindow(HWND_CAND, SW_HIDE);
+        pangyi_ime::cand::hide();
         return CallNextHookEx(None, code, w, l);
     }
 
@@ -209,7 +209,7 @@ unsafe extern "system" fn hook_proc(code: i32, w: WPARAM, l: LPARAM) -> LRESULT 
     if has && vk == 0x1B {
         let mut st = ST.lock().unwrap();
         if let Some(s) = st.as_mut() { s.buf.clear(); s.cands.clear(); }
-        ShowWindow(HWND_CAND, SW_HIDE);
+        pangyi_ime::cand::hide();
         return LRESULT(1);
     }
     if has && vk == 0x08 {
@@ -223,7 +223,7 @@ unsafe extern "system" fn hook_proc(code: i32, w: WPARAM, l: LPARAM) -> LRESULT 
     if vk == 0x0D || vk == 0x09 {  // Enter/Tab 结束
         let mut st = ST.lock().unwrap();
         if let Some(s) = st.as_mut() { s.buf.clear(); s.cands.clear(); }
-        ShowWindow(HWND_CAND, SW_HIDE);
+        pangyi_ime::cand::hide();
     }
     CallNextHookEx(None, code, w, l)
 }
@@ -270,7 +270,8 @@ unsafe extern "system" fn cand_proc(h: HWND, msg: u32, w: WPARAM, l: LPARAM) -> 
 
 fn main() {
     unsafe {
-        *ST.lock().unwrap() = Some(State::default());\n        pangyi_ime::cand::init();
+        *ST.lock().unwrap() = Some(State::default());
+        pangyi_ime::cand::init();
 
         let hinst = GetModuleHandleW(None).unwrap();
         let cls = wide("PangyiCand");
