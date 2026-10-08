@@ -451,8 +451,14 @@ pub unsafe fn show_at(x: i32, y: i32) {
     }
     let rgn = CreateRoundRectRgn(0, 0, cw + 1, ch + 1, sc(RADIUS) * 2, sc(RADIUS) * 2);
     let _ = SetWindowRgn(WND, rgn, TRUE);
-    // 不动 z 序：每次输入都抢到最顶层会让某些宿主丢焦点，导致上屏失败
-    let _ = SetWindowPos(WND, HWND(0), x, y, cw, ch, SWP_NOZORDER | SWP_NOACTIVATE | SWP_SHOWWINDOW);
+    // 只在“从隐藏变显示”的那一次抬高到置顶带的最前面（保证能盖住置顶窗口），
+    // 后续按键只挪位置、不动 z 序——每次按键都抢顶层会让某些宿主丢焦点、上屏失败。
+    let was_visible = IsWindowVisible(WND).as_bool();
+    if was_visible {
+        let _ = SetWindowPos(WND, HWND(0), x, y, cw, ch, SWP_NOZORDER | SWP_NOACTIVATE | SWP_SHOWWINDOW);
+    } else {
+        let _ = SetWindowPos(WND, HWND_TOPMOST, x, y, cw, ch, SWP_NOACTIVATE | SWP_SHOWWINDOW);
+    }
     let _ = InvalidateRect(WND, None, TRUE);
 }
 
