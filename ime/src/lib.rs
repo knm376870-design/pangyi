@@ -129,30 +129,31 @@ impl TextService {
 
 impl ITfKeyEventSink_Impl for TextService {
     fn OnSetFocus(&self, fg: BOOL) -> Result<()> {
-        log(&format!("OnSetFocus fg={}", fg.as_bool()));
+        log(&format!("KeySink::OnSetFocus fg={}", fg.as_bool()));
         Ok(())
     }
 
     fn OnTestKeyDown(&self, _pic: Option<&ITfContext>, wparam: WPARAM, _lp: LPARAM) -> Result<BOOL> {
         let want = handleable(wparam);
-        if want {
-            log(&format!("OnTestKeyDown wparam={} 我要={want}", wparam.0));
-        }
+        log(&format!("KeySink::OnTestKeyDown wparam={} 我要={want}", wparam.0));
         Ok(BOOL(want as i32))
     }
-    fn OnTestKeyUp(&self, _pic: Option<&ITfContext>, _w: WPARAM, _l: LPARAM) -> Result<BOOL> {
+    fn OnTestKeyUp(&self, _pic: Option<&ITfContext>, w: WPARAM, _l: LPARAM) -> Result<BOOL> {
+        log(&format!("KeySink::OnTestKeyUp wparam={}", w.0));
         Ok(BOOL(0))
     }
-    fn OnKeyUp(&self, _pic: Option<&ITfContext>, _w: WPARAM, _l: LPARAM) -> Result<BOOL> {
+    fn OnKeyUp(&self, _pic: Option<&ITfContext>, w: WPARAM, _l: LPARAM) -> Result<BOOL> {
+        log(&format!("KeySink::OnKeyUp wparam={}", w.0));
         Ok(BOOL(0))
     }
-    fn OnPreservedKey(&self, _pic: Option<&ITfContext>, _g: *const GUID) -> Result<BOOL> {
+    fn OnPreservedKey(&self, _pic: Option<&ITfContext>, g: *const GUID) -> Result<BOOL> {
+        log(&format!("KeySink::OnPreservedKey guid={g:?}"));
         Ok(BOOL(0))
     }
 
     fn OnKeyDown(&self, pic: Option<&ITfContext>, wparam: WPARAM, _lp: LPARAM) -> Result<BOOL> {
         let ch = wparam.0 as u8 as char;
-        log(&format!("key wparam={} ch={ch:?}", wparam.0));
+        log(&format!("KeySink::OnKeyDown wparam={} ch={ch:?}", wparam.0));
         if ch.is_ascii_alphabetic() {
             self.buf.borrow_mut().push(ch.to_ascii_lowercase());
             return Ok(BOOL(1));
