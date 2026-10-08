@@ -1,8 +1,10 @@
-# 原始数据体积大，不入库；用 tools/build_dict.py 重新下载生成
+# 原始数据体积大，不入库；用 tools/llvm-mingw/
+tools/llvm-mingw.zipbuild_dict.py 重新下载生成
 data/raw/
 __pycache__/
 *.pyc
 ime/target/
 dist/
-tools/
+tools/llvm-mingw/
+tools/llvm-mingw.zip
 ime/build/*.o
