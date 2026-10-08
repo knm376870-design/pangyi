@@ -215,8 +215,11 @@ unsafe fn gear_menu(h: HWND) {
     let Ok(menu) = CreatePopupMenu() else { return };
     let a = wide("关于旁译");
     let b = wide("恢复默认位置");
+    let c = wide(if crate::cand::horizontal() { "切换为竖排" } else { "切换为横排" });
     let _ = AppendMenuW(menu, MF_STRING, 1, PCWSTR(a.as_ptr()));
     let _ = AppendMenuW(menu, MF_STRING, 2, PCWSTR(b.as_ptr()));
+    let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
+    let _ = AppendMenuW(menu, MF_STRING, 3, PCWSTR(c.as_ptr()));
     let mut pt = POINT::default();
     let _ = GetCursorPos(&mut pt);
     let _ = SetForegroundWindow(h);
@@ -233,6 +236,9 @@ unsafe fn gear_menu(h: HWND) {
             let (x, y) = default_pos(w, hh);
             let _ = SetWindowPos(h, HWND_TOPMOST, x, y, w, hh, SWP_NOACTIVATE);
             save_pos(h);
+        }
+        3 => {
+            crate::cand::set_horizontal(!crate::cand::horizontal());
         }
         _ => {}
     }

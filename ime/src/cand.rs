@@ -1,5 +1,6 @@
-//! 候选窗 —— 视觉与排版照青简（qingjian）的 candidates/ui 实现：
-//! 同一套配色、同一套字体与字号、同一套 8/4/8 间距与 8px 圆角，列宽按实际文字宽度测量后对齐。
+//! 候选窗 —— 视觉与排版照青简（apps/windows/server/src/ui/candidates）：
+//! 同一套配色/字体/间距/圆角；竖排为「序号 中文 拼音 俄语」四列对齐，
+//! 横排为「序号 中文」一行排开、当前项的拼音与俄语另起一行。
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use windows::core::{PCWSTR, w};
@@ -18,6 +19,7 @@ static ITEMS: Mutex<Vec<Item>> = Mutex::new(Vec::new());
 static PREEDIT: Mutex<String> = Mutex::new(String::new());
 static SEL: AtomicUsize = AtomicUsize::new(0);
 static DARK: AtomicBool = AtomicBool::new(true);
+static HORIZONTAL: AtomicBool = AtomicBool::new(false);
 static mut WND: HWND = HWND(0);
 static mut DPI: i32 = 96;
 static mut BG: HBRUSH = HBRUSH(0);
@@ -58,6 +60,44 @@ fn palette(dark: bool) -> Palette {
     }
 }
 
+pub fn is_dark() -> bool {
+    DARK.load(Ordering::Relaxed)
+}
+
+pub unsafe fn dpi() -> i32 {
+    if DPI <= 0 { 96 } else { DPI }
+}
+
+pub fn horizontal() -> bool {
+    HORIZONTAL.load(Ordering::Relaxed)
+}
+
+fn cfg_file() -> String {
+    let base = std::env::var("LOCALAPPDATA").unwrap_or_else(|_| ".".into());
+    format!("{base}\\Pangyi\\layout.txt")
+}
+
+fn load_layout() {
+    if let Ok(s) = std::fs::read_to_string(cfg_file()) {
+        HORIZONTAL.store(s.trim().eq_ignore_ascii_case("h"), Ordering::Relaxed);
+    }
+}
+
+fn save_layout() {
+    if let Some(dir) = std::path::Path::new(&cfg_file()).parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    let _ = std::fs::write(cfg_file(), if horizontal() { "h" } else { "v" });
+}
+
+pub unsafe fn set_horizontal(v: bool) {
+    HORIZONTAL.store(v, Ordering::Relaxed);
+    save_layout();
+    if WND.0 != 0 {
+        let _ = InvalidateRect(WND, None, TRUE);
+    }
+}
+
 fn sc(px: i32) -> i32 {
     let d = unsafe { if DPI <= 0 { 96 } else { DPI } };
     (px * d) / 96
@@ -95,6 +135,10 @@ fn truncate(s: &str, max_chars: usize) -> String {
     out
 }
 
+fn gloss_of(it: &Item) -> String {
+    truncate(&it.ru.replace('|', " · "), MAX_RU_CHARS)
+}
+
 fn measure(dc: HDC, f: HFONT, s: &str) -> (i32, i32) {
     let u: Vec<u16> = s.encode_utf16().collect();
     let mut sz = SIZE::default();
@@ -110,8 +154,11 @@ struct Layout {
     word_w: i32,
     pinyin_w: i32,
     ru_w: i32,
+    item_w: Vec<i32>,
     row_h: i32,
     line_h: i32,
+    anno_w: i32,
+    anno_h: i32,
     width: i32,
     height: i32,
 }
@@ -120,42 +167,68 @@ unsafe fn compute_layout(dc: HDC, items: &[Item]) -> Layout {
     let f_text = font(TEXT_PX);
     let f_anno = font(ANNO_PX);
     let f_idx = font(INDEX_PX);
+    let pad = sc(PAD);
+    let gap = sc(GAP);
+    let nth = items.len().min(9);
+
     let mut index_w = 0;
     let mut word_w = 0;
     let mut pinyin_w = 0;
     let mut ru_w = 0;
     let mut row_h = 0;
     let mut line_h = 0;
-    for (i, it) in items.iter().enumerate() {
+    let mut item_w: Vec<i32> = Vec::new();
+    for (i, it) in items.iter().take(9).enumerate() {
         let idx = format!("{}.", i + 1);
         let a = measure(dc, f_idx, &idx).0;
-        let b = measure(dc, f_text, &it.word);
+        let (bw, bh) = measure(dc, f_text, &it.word);
         let c = measure(dc, f_anno, &it.pinyin).0;
-        let d = measure(dc, f_anno, &truncate(&it.ru.replace('|', " · "), MAX_RU_CHARS)).0;
+        let d = measure(dc, f_anno, &gloss_of(it)).0;
         if a > index_w { index_w = a; }
-        if b.0 > word_w { word_w = b.0; }
+        if bw > word_w { word_w = bw; }
         if c > pinyin_w { pinyin_w = c; }
         if d > ru_w { ru_w = d; }
-        let rh = b.1 + sc(ROW_PAD) * 2;
+        let rh = bh + sc(ROW_PAD) * 2;
         if rh > row_h { row_h = rh; }
-        line_h = b.1;
+        line_h = bh;
+        item_w.push(a + gap / 2 + bw);
     }
-    if row_h == 0 { row_h = sc(TEXT_PX) + sc(ROW_PAD) * 2; }
-    let pad = sc(PAD);
-    let gap = sc(GAP);
+    if row_h == 0 {
+        row_h = sc(TEXT_PX) + sc(ROW_PAD) * 2;
+    }
+
+    // 高亮项的注释行（横排时另起一行）
+    let mut anno_w = 0;
+    let mut anno_h = 0;
+    if let Some(it) = items.get(SEL.load(Ordering::Relaxed)) {
+        let s = format!("{}   {}", it.pinyin, gloss_of(it));
+        anno_w = measure(dc, f_anno, &s).0;
+        anno_h = measure(dc, f_anno, "x").1 + sc(ROW_PAD);
+    }
+
     let pre = PREEDIT.lock().unwrap().clone();
     let pre_h = if pre.is_empty() { 0 } else { measure(dc, f_anno, "x").1 + sc(ROW_PAD) * 2 };
-    let width = pad * 2 + index_w + gap + word_w + gap + pinyin_w + gap + ru_w;
-    let height = pad * 2 + pre_h + (items.len() as i32).min(9) * row_h;
+
+    let (width, height) = if HORIZONTAL.load(Ordering::Relaxed) {
+        let inset = sc(PAD) / 2;
+        let mut w = pad * 2 + inset * 2;
+        for (i, iw) in item_w.iter().take(nth).enumerate() {
+            if i > 0 { w += gap; }
+            w += iw;
+        }
+        let h = pad * 2 + pre_h + row_h + if anno_h > 0 { anno_h } else { 0 };
+        (w.max(pad * 2 + anno_w).max(sc(120)), h)
+    } else {
+        let w = pad * 2 + index_w + gap + word_w + gap + pinyin_w + gap + ru_w;
+        let h = pad * 2 + pre_h + (nth as i32) * row_h;
+        (w, h)
+    };
+
     let _ = DeleteObject(f_text);
     let _ = DeleteObject(f_anno);
     let _ = DeleteObject(f_idx);
-    Layout { index_w, word_w, pinyin_w, ru_w, row_h, line_h, width, height }
+    Layout { index_w, word_w, pinyin_w, ru_w, item_w, row_h, line_h, anno_w, anno_h, width, height }
 }
-
-pub fn is_dark() -> bool { DARK.load(Ordering::Relaxed) }
-
-pub unsafe fn dpi() -> i32 { if DPI <= 0 { 96 } else { DPI } }
 
 pub unsafe fn detect_theme() {
     use windows::Win32::System::Registry::*;
@@ -178,6 +251,7 @@ pub unsafe fn detect_theme() {
         let _ = ReleaseDC(None, dc);
     }
     if DPI <= 0 { DPI = 96; }
+    load_layout();
 }
 
 unsafe extern "system" fn proc_cand(h: HWND, msg: u32, w: WPARAM, l: LPARAM) -> LRESULT {
@@ -201,6 +275,7 @@ unsafe extern "system" fn proc_cand(h: HWND, msg: u32, w: WPARAM, l: LPARAM) -> 
             let pad = sc(PAD);
             let gap = sc(GAP);
             let mut y = pad;
+
             let pre = PREEDIT.lock().unwrap().clone();
             if !pre.is_empty() {
                 let (_, ph) = measure(dc, f_anno, "x");
@@ -210,42 +285,82 @@ unsafe extern "system" fn proc_cand(h: HWND, msg: u32, w: WPARAM, l: LPARAM) -> 
                 TextOutW(dc, pad, y + sc(ROW_PAD), &s);
                 y += ph + sc(ROW_PAD) * 2;
             }
+
             let sel = SEL.load(Ordering::Relaxed);
-            let x_index = pad;
-            let x_word = x_index + lay.index_w + gap;
-            let x_pinyin = x_word + lay.word_w + gap;
-            let x_ru = x_pinyin + lay.pinyin_w + gap;
-            let small_off = ((lay.line_h - measure(dc, f_anno, "x").1) / 2).max(0);
-            for (i, it) in items.iter().take(9).enumerate() {
-                let ry = y + (i as i32) * lay.row_h;
-                if i == sel {
-                    let hb = CreateSolidBrush(p.highlight);
-                    let rgn = CreateRoundRectRgn(pad / 2, ry, rc.right - pad / 2, ry + lay.row_h, sc(RADIUS) * 2, sc(RADIUS) * 2);
-                    FillRgn(dc, rgn, hb);
-                    let _ = DeleteObject(rgn);
-                    let _ = DeleteObject(hb);
+            let small_idx = ((lay.line_h - measure(dc, f_idx, "x").1) / 2).max(0);
+            let small_anno = ((lay.line_h - measure(dc, f_anno, "x").1) / 2).max(0);
+
+            if HORIZONTAL.load(Ordering::Relaxed) {
+                let inset = sc(PAD) / 2;
+                let mut x = pad + inset;
+                let baseline = y + sc(ROW_PAD);
+                for (i, it) in items.iter().take(9).enumerate() {
+                    let iw = lay.item_w.get(i).copied().unwrap_or(0);
+                    if i == sel {
+                        let hb = CreateSolidBrush(p.highlight);
+                        let rgn = CreateRoundRectRgn(x - inset, y, x + iw + inset, y + lay.row_h, sc(RADIUS), sc(RADIUS));
+                        FillRgn(dc, rgn, hb);
+                        let _ = DeleteObject(rgn);
+                        let _ = DeleteObject(hb);
+                    }
+                    let idx = format!("{}.", i + 1);
+                    let iwid = measure(dc, f_idx, &idx).0;
+                    SelectObject(dc, f_idx);
+                    SetTextColor(dc, p.index);
+                    let n: Vec<u16> = idx.encode_utf16().collect();
+                    TextOutW(dc, x, baseline + small_idx, &n);
+
+                    SelectObject(dc, f_text);
+                    SetTextColor(dc, p.text);
+                    let word: Vec<u16> = it.word.encode_utf16().collect();
+                    TextOutW(dc, x + iwid + gap / 2, baseline, &word);
+                    x += iw + gap;
                 }
-                let ty = ry + sc(ROW_PAD);
-                SelectObject(dc, f_idx);
-                SetTextColor(dc, p.index);
-                let n: Vec<u16> = format!("{}.", i + 1).encode_utf16().collect();
-                TextOutW(dc, x_index, ty + small_off, &n);
+                if lay.anno_h > 0 {
+                    if let Some(it) = items.get(sel) {
+                        let s = format!("{}   {}", it.pinyin, gloss_of(it));
+                        SelectObject(dc, f_anno);
+                        SetTextColor(dc, if it.fresh { p.fresh } else { p.gloss });
+                        let g: Vec<u16> = s.encode_utf16().collect();
+                        TextOutW(dc, pad, y + lay.row_h + sc(ROW_PAD) / 2, &g);
+                    }
+                }
+            } else {
+                let x_index = pad;
+                let x_word = x_index + lay.index_w + gap;
+                let x_pinyin = x_word + lay.word_w + gap;
+                let x_ru = x_pinyin + lay.pinyin_w + gap;
+                for (i, it) in items.iter().take(9).enumerate() {
+                    let ry = y + (i as i32) * lay.row_h;
+                    if i == sel {
+                        let hb = CreateSolidBrush(p.highlight);
+                        let rgn = CreateRoundRectRgn(pad / 2, ry, rc.right - pad / 2, ry + lay.row_h, sc(RADIUS), sc(RADIUS));
+                        FillRgn(dc, rgn, hb);
+                        let _ = DeleteObject(rgn);
+                        let _ = DeleteObject(hb);
+                    }
+                    let ty = ry + sc(ROW_PAD);
+                    SelectObject(dc, f_idx);
+                    SetTextColor(dc, p.index);
+                    let n: Vec<u16> = format!("{}.", i + 1).encode_utf16().collect();
+                    TextOutW(dc, x_index, ty + small_idx, &n);
 
-                SelectObject(dc, f_text);
-                SetTextColor(dc, p.text);
-                let word: Vec<u16> = it.word.encode_utf16().collect();
-                TextOutW(dc, x_word, ty, &word);
+                    SelectObject(dc, f_text);
+                    SetTextColor(dc, p.text);
+                    let word: Vec<u16> = it.word.encode_utf16().collect();
+                    TextOutW(dc, x_word, ty, &word);
 
-                SelectObject(dc, f_anno);
-                SetTextColor(dc, p.index);
-                let py: Vec<u16> = it.pinyin.encode_utf16().collect();
-                TextOutW(dc, x_pinyin, ty + small_off, &py);
+                    SelectObject(dc, f_anno);
+                    SetTextColor(dc, p.index);
+                    let py: Vec<u16> = it.pinyin.encode_utf16().collect();
+                    TextOutW(dc, x_pinyin, ty + small_anno, &py);
 
-                SetTextColor(dc, if it.fresh { p.fresh } else { p.gloss });
-                let gloss_s = truncate(&it.ru.replace('|', " · "), MAX_RU_CHARS);
-                let gloss: Vec<u16> = gloss_s.encode_utf16().collect();
-                TextOutW(dc, x_ru, ty + small_off, &gloss);
+                    SetTextColor(dc, if it.fresh { p.fresh } else { p.gloss });
+                    let gloss: Vec<u16> = gloss_of(it).encode_utf16().collect();
+                    TextOutW(dc, x_ru, ty + small_anno, &gloss);
+                }
             }
+
             let _ = DeleteObject(f_text);
             let _ = DeleteObject(f_anno);
             let _ = DeleteObject(f_idx);

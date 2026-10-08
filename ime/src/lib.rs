@@ -215,8 +215,8 @@ impl ITfKeyEventSink_Impl for TextService {
                 .into();
                 let flags = TF_CONTEXT_EDIT_CONTEXT_FLAGS(TF_ES_SYNC.0 | TF_ES_READWRITE.0);
                 match unsafe { ctx.RequestEditSession(self.client_id.get(), &session, flags) } {
-                    Ok(hr) => log(&format!("RequestEditSession -> {hr:?}")),
-                    Err(e) => log(&format!("RequestEditSession 失败 {e:?}")),
+                    Ok(hr) => log(&format!("上屏会话 -> {hr:?}")),
+                    Err(e) => log(&format!("上屏会话失败 {e:?}")),
                 }
             }
             return Ok(BOOL(1));
@@ -481,11 +481,34 @@ struct DoneSession {
 impl ITfEditSession_Impl for DoneSession {
     fn DoEditSession(&self, ec: u32) -> Result<()> {
         unsafe {
+            // 换字 + 结束组合放在同一次会话里（拆成两次会让某些宿主把文字丢掉）
             if let Some(comp) = COMPOSITION.take() {
                 if let Ok(r) = comp.GetRange() {
                     let _ = r.SetText(ec, 0, &self.text);
                 }
-                let _ = comp.EndComposition(ec);
+                let hr = comp.EndComposition(ec);
+                log(&format!("上屏: EndComposition -> {hr:?}"));
+            } else {
+                log("上屏: 没有活动组合");
+            }
+        }
+        Ok(())
+    }
+}
+
+/// 结束组合：单独一次编辑会话。以前和“换字”挤在同一次会话里，会出现上屏成拼音或干脆不上屏。
+#[implement(ITfEditSession)]
+struct EndSession {
+    ctx: ITfContext,
+}
+
+impl ITfEditSession_Impl for EndSession {
+    fn DoEditSession(&self, ec: u32) -> Result<()> {
+        unsafe {
+            log(&format!("EndSession: 有组合={}", COMPOSITION.as_ref().is_some()));
+            if let Some(comp) = COMPOSITION.take() {
+                let hr = comp.EndComposition(ec);
+                log(&format!("EndSession: EndComposition -> {hr:?}"));
             }
         }
         Ok(())
