@@ -72,10 +72,13 @@ for trad, simp, num, defs in ced:
         if hit_cand:
             # 只取第一个命中释义的译法：跨义项累加会把「和」变成「сумма」
             ru = [x for x in er[hit_cand][:3]]
+            hit_key = hit_cand
             break
     if ru:
         hit += 1
-        rows.append((simp, trad, "", "", " | ".join(ru[:3])))
+        rows.append((simp, simp, trad, "", "", " | ".join(ru[:3])))
+        if len(rows) <= 8:
+            print(f"    [debug] {simp} <- 英文键「{hit_key}」")
 
 print(f"CC-CEDICT {len(ced)} 条，其中 {hit} 条能经英文枢轴拿到俄语")
 with io.open(OUT, "w", encoding="utf-8", newline="\n") as f:
