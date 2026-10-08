@@ -46,7 +46,8 @@ def api(titles):
 
 
 def cmn_block(text):
-    m = re.search(r"=\s*\{\{\s*-cmn-\s*\}\}\s*=", text)
+    # 汉语词条有两种页头：{{-cmn-}} 是词，{{-hanzi-}} 是单字，两种都要认
+    m = re.search(r"=\s*\{\{\s*-(?:cmn|hanzi)-\s*\}\}\s*=", text)
     if not m:
         return None
     rest = text[m.end():]
@@ -76,7 +77,7 @@ def parse(text):
     blk = cmn_block(text)
     if not blk:
         return None
-    head = text[:text.find("{{-cmn-}}") + 12] if "{{-cmn-}}" in text else text[:800]
+    head = text[:1200]
     def grab(k, src):
         m = re.search(k + r"\s*=\s*([^|}\s]+)", src)
         return m.group(1) if m else None
@@ -122,12 +123,23 @@ if os.path.exists(cur):
                 if len(p) > 1:
                     have.add(p[0])
 
+CHARS_ONLY = len(sys.argv) > 2 and sys.argv[2] == "chars"
+
 done = set()
-if os.path.exists(DONE):
+if os.path.exists(DONE) and not CHARS_ONLY:
     with io.open(DONE, encoding="utf-8") as f:
         done = set(x.strip() for x in f if x.strip())
 
-todo = [w for w, _ in freq[:LIMIT] if w not in have and w not in done]
+seen_out = set()
+if os.path.exists(OUT):
+    with io.open(OUT, encoding="utf-8") as f:
+        for line in f:
+            if not line.startswith("#") and line.strip():
+                seen_out.add(line.split("\t")[0])
+
+todo = [w for w, _ in freq[:LIMIT]
+        if w not in have and w not in done and w not in seen_out
+        and (not CHARS_ONLY or len(w) == 1)]
 print(f"前 {LIMIT} 常用词: 已有 {LIMIT - len([1 for w,_ in freq[:LIMIT] if w not in have])}, "
       f"待抓 {len(todo)}", flush=True)
 if not todo:
