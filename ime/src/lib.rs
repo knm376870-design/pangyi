@@ -123,6 +123,9 @@ impl TextService {
 
     fn deactivate(&self) -> Result<()> {
         log("Deactivate");
+        // 关键：切走再切回来会重新 Activate，必须允许重新挂按键接收器。
+        // 之前这里没复位，导致"切换回来后按键全部漏给应用"。
+        self.advised.set(false);
         Ok(())
     }
 }
@@ -174,7 +177,7 @@ impl ITfKeyEventSink_Impl for TextService {
                 }
                 .into();
                 let flags = TF_CONTEXT_EDIT_CONTEXT_FLAGS(TF_ES_SYNC.0 | TF_ES_READWRITE.0);
-                match unsafe { ctx.RequestEditSession(self.tid.get(), &session, flags) } {
+                match unsafe { ctx.RequestEditSession(self.client_id.get(), &session, flags) } {
                     Ok(hr) => log(&format!("RequestEditSession -> {hr:?}")),
                     Err(e) => log(&format!("RequestEditSession 失败 {e:?}")),
                 }
