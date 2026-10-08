@@ -208,7 +208,7 @@ unsafe extern "system" fn proc_settings(h: HWND, msg: u32, wp: WPARAM, lp: LPARA
                 }
                 y += sc(ROW_H);
             }
-            draw(dc, f_text, faint, sc(PAD), y + sc(6), "点齿轮可关闭 / 重新打开此面板");
+            // 底部「关闭」按钮`n            let label = "关闭";`n            let (lw, lh) = measure(dc, f_text, label);`n            let bx = sc(340) - sc(PAD) - lw - sc(20);`n            let by = y + sc(6);`n            let br = RECT { left: bx, top: by, right: bx + lw + sc(20), bottom: by + lh + sc(8) };`n            let rb = CreateSolidBrush(hl);`n            let rgn = CreateRoundRectRgn(br.left, br.top, br.right, br.bottom, sc(8), sc(8));`n            FillRgn(dc, rgn, rb);`n            let _ = DeleteObject(rgn);`n            let _ = DeleteObject(rb);`n            draw(dc, f_text, text, bx + sc(10), by + sc(4), label);
             let _ = DeleteObject(f_title);
             let _ = DeleteObject(f_text);
             let _ = EndPaint(h, &ps);
@@ -219,6 +219,7 @@ unsafe extern "system" fn proc_settings(h: HWND, msg: u32, wp: WPARAM, lp: LPARA
             let f_text = font(12);
             let (_, _, _, _) = colors();
             let mut y = sc(48);
+            let py2 = ((lp.0 >> 16) & 0xFFFF) as i16 as i32;
             let mut hit = 0;
             for (_label, opts) in rows() {
                 let mut x = sc(96);
@@ -237,11 +238,29 @@ unsafe extern "system" fn proc_settings(h: HWND, msg: u32, wp: WPARAM, lp: LPARA
             }
             let _ = DeleteObject(f_text);
             let _ = ReleaseDC(h, dc);
+            // 点到底部的「关闭」就关窗
+            let close_y = sc(48) + sc(ROW_H) * 4;
+            if hit == 0 && py2 >= close_y && py2 <= close_y + sc(30) {
+                let _ = SendMessageW(h, WM_CLOSE, WPARAM(0), LPARAM(0));
+                let _ = DeleteObject(f_text);
+                let _ = ReleaseDC(h, dc);
+                return LRESULT(1);
+            }
             if hit != 0 {
                 apply(hit);
                 let _ = InvalidateRect(h, None, TRUE);
                 crate::cand::refresh_settings();
             }
+            LRESULT(0)
+        }
+        WM_KEYDOWN => {
+            if wp.0 == 0x1B {
+                let _ = SendMessageW(h, WM_CLOSE, WPARAM(0), LPARAM(0));
+            }
+            LRESULT(0)
+        }
+        WM_CLOSE => {
+            let _ = DestroyWindow(h);
             LRESULT(0)
         }
         WM_DESTROY => {
@@ -273,30 +292,6 @@ fn apply(action: i32) {
     save();
 }
 
-pub unsafe fn toggle() {
-    if WND.0 == 0 {
-        init();
-    }
-    if WND.0 == 0 {
-        return;
-    }
-    if IsWindowVisible(WND).as_bool() {
-        let _ = ShowWindow(WND, SW_HIDE);
-    } else {
-        let (_, _, bg, _) = colors();
-        let _ = DeleteObject(BG);
-        BG = CreateSolidBrush(bg);
-        let (w, h) = (sc(340), sc(230));
-        let rgn = CreateRoundRectRgn(0, 0, w + 1, h + 1, sc(16), sc(16));
-        let _ = SetWindowRgn(WND, rgn, TRUE);
-        let mut pt = POINT::default();
-        let _ = GetCursorPos(&mut pt);
-        let _ = SetWindowPos(WND, HWND_TOPMOST, pt.x - w / 2, pt.y - h - sc(16), w, h,
-            SWP_NOACTIVATE | SWP_SHOWWINDOW);
-        let _ = InvalidateRect(WND, None, TRUE);
-    }
-}
-
 unsafe fn init() {
     if WND.0 != 0 {
         return;
@@ -313,11 +308,13 @@ unsafe fn init() {
         ..Default::default()
     };
     RegisterClassW(&wc);
-    let title: Vec<u16> = "旁译设置\0".encode_utf16().collect();
+    let title: Vec<u16> = "旁译 设置\0".encode_utf16().collect();
+    // 普通窗口：有标题栏、有关闭按钮，能正常关掉
     WND = CreateWindowExW(
-        WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE | WS_EX_TOPMOST,
-        PCWSTR(cls.as_ptr()), PCWSTR(title.as_ptr()), WS_POPUP,
-        0, 0, sc(340), sc(230), None, None, hinst, None);
+        WINDOW_EX_STYLE(0),
+        PCWSTR(cls.as_ptr()), PCWSTR(title.as_ptr()),
+        WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX,
+        0, 0, sc(340), sc(260), None, None, hinst, None);
 }
 /// 独立设置程序用：开一个带标题栏的普通窗口（可以从右上角关掉）。
 pub unsafe fn open_app() {
@@ -329,9 +326,7 @@ pub unsafe fn open_app() {
     let (_, _, bg, _) = colors();
     let _ = DeleteObject(BG);
     BG = CreateSolidBrush(bg);
-    let (w, h) = (sc(340), sc(230));
-    let rgn = CreateRoundRectRgn(0, 0, w + 1, h + 1, sc(16), sc(16));
-    let _ = SetWindowRgn(WND, rgn, TRUE);
+    let (w, h) = (sc(340), sc(260));
     let sw = GetSystemMetrics(SM_CXSCREEN);
     let sh = GetSystemMetrics(SM_CYSCREEN);
     let _ = SetWindowPos(WND, HWND_TOP, (sw - w) / 2, (sh - h) / 2, w, h, SWP_SHOWWINDOW);

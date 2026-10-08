@@ -215,7 +215,7 @@ unsafe fn gear_menu(h: HWND) {
     let Ok(menu) = CreatePopupMenu() else { return };
     let a = wide("关于旁译");
     let b = wide("恢复默认位置");
-    let c = wide("设置…");
+    let c = wide("打开设置");
     let _ = AppendMenuW(menu, MF_STRING, 1, PCWSTR(a.as_ptr()));
     let _ = AppendMenuW(menu, MF_STRING, 2, PCWSTR(b.as_ptr()));
     let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
@@ -238,7 +238,19 @@ unsafe fn gear_menu(h: HWND) {
             save_pos(h);
         }
         3 => {
-            crate::settings::toggle();
+            // 打开独立的设置程序（普通窗口，有标题栏和关闭按钮）
+            let exe = wide("C:\\Program Files\\Pangyi\\pangyi-settings.exe");
+            let verb = wide("open");
+            unsafe {
+                windows::Win32::UI::Shell::ShellExecuteW(
+                    HWND(0),
+                    PCWSTR(verb.as_ptr()),
+                    PCWSTR(exe.as_ptr()),
+                    PCWSTR::null(),
+                    PCWSTR::null(),
+                    SW_SHOWNORMAL,
+                );
+            }
         }
         _ => {}
     }
