@@ -8,7 +8,6 @@
 pub mod cand;
 pub mod dict;
 pub mod settings;
-pub mod status;
 
 use std::cell::{Cell, RefCell};
 use std::os::raw::c_void;
@@ -28,6 +27,9 @@ use windows::Win32::UI::TextServices::{
     ITfTextInputProcessorEx_Impl, ITfThreadMgrEventSink, ITfThreadMgrEventSink_Impl,
     ITfSource, ITfThreadMgr, TF_CONTEXT_EDIT_CONTEXT_FLAGS, TF_ES_READWRITE, TF_ES_SYNC, TF_SELECTION,
 };
+
+static SHIFT_DOWN_AT: AtomicU32 = AtomicU32::new(0);
+static SHIFT_DIRTY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 static PENDING_CAND: Mutex<Option<(i32, i32)>> = Mutex::new(None);
 
@@ -131,7 +133,7 @@ impl TextService {
 impl TextService {
     fn activate(&self, ptim: Option<&ITfThreadMgr>, tid: u32) -> Result<()> {
         log("Activate");
-        unsafe { settings::load(); status::init(); status::show(); }
+        unsafe { settings::load(); }
         // 后台把词典索引建好，避免第一次打字时卡一下
         std::thread::spawn(|| {
             let _ = dict::lookup("kaifa");
@@ -185,7 +187,7 @@ impl TextService {
 
     fn deactivate(&self) -> Result<()> {
         log("Deactivate");
-        unsafe { status::hide(); }
+
         // 关键：切走再切回来会重新 Activate，必须允许重新挂按键接收器。
         // 之前这里没复位，导致"切换回来后按键全部漏给应用"。
         self.advised.set(false);
@@ -211,11 +213,11 @@ impl ITfKeyEventSink_Impl for TextService {
 
     fn OnTestKeyDown(&self, _pic: Option<&ITfContext>, wparam: WPARAM, _lp: LPARAM) -> Result<BOOL> {
         let ch0 = wparam.0 as u8 as char;
-        if ch0.is_ascii_alphabetic() && status::english() {
+        if ch0.is_ascii_alphabetic() && crate::settings::english() {
             return Ok(BOOL(0));
         }
         let has_buf = !self.buf.borrow().is_empty();
-        let want = claim(wparam, has_buf, status::english());
+        let want = claim(wparam, has_buf, crate::settings::english());
         log(&format!("KeySink::OnTestKeyDown wparam={} 我要={want}", wparam.0));
         Ok(BOOL(want as i32))
     }
@@ -224,7 +226,14 @@ impl ITfKeyEventSink_Impl for TextService {
         Ok(BOOL(0))
     }
     fn OnKeyUp(&self, _pic: Option<&ITfContext>, w: WPARAM, _l: LPARAM) -> Result<BOOL> {
-        log(&format!("KeySink::OnKeyUp wparam={}", w.0));
+        // 单独按一下 Shift（没夹着别的键）= 切中/英
+        if w.0 == 0x10 {
+            let t0 = SHIFT_DOWN_AT.load(Ordering::Relaxed);
+            let dt = now_ms32().wrapping_sub(t0);
+            if !SHIFT_DIRTY.load(Ordering::Relaxed) && t0 != 0 && dt < 400 {
+                status_toggle_english();
+            }
+        }
         Ok(BOOL(0))
     }
     fn OnPreservedKey(&self, _pic: Option<&ITfContext>, g: *const GUID) -> Result<BOOL> {
@@ -236,9 +245,17 @@ impl ITfKeyEventSink_Impl for TextService {
         let ch = wparam.0 as u8 as char;
         log(&format!("KeySink::OnKeyDown wparam={} ch={ch:?}", wparam.0));
 
+        // 单独按一下 Shift = 切换中/英（没有状态条了，用这个切）
+        if wparam.0 == 0x10 {
+            SHIFT_DOWN_AT.store(now_ms32(), Ordering::Relaxed);
+            SHIFT_DIRTY.store(false, Ordering::Relaxed);
+            return Ok(BOOL(0));
+        }
+        SHIFT_DIRTY.store(true, Ordering::Relaxed);
+
         // 字母：进组合
         if ch.is_ascii_alphabetic() {
-            if status::english() { return Ok(BOOL(0)); }
+            if crate::settings::english() { return Ok(BOOL(0)); }
             self.buf.borrow_mut().push(ch.to_ascii_lowercase());
             let key = self.buf.borrow().clone();
             unsafe { cand::set_preedit(&key); }
@@ -351,6 +368,18 @@ fn is_punct_vk(vk: u32) -> bool {
 }
 
 /// 这个键要不要拦下来（有拼音时还要拦退格、数字、标点、回车等）
+fn now_ms32() -> u32 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| (d.as_millis() & 0xFFFF_FFFF) as u32)
+        .unwrap_or(0)
+}
+
+/// 切换中/英（原来由状态条上的按钮做）
+fn status_toggle_english() {
+    crate::settings::set_english(!crate::settings::english());
+}
+
 fn claim(wparam: WPARAM, has_buf: bool, english: bool) -> bool {
     let ch = wparam.0 as u8 as char;
     if ch.is_ascii_alphabetic() {

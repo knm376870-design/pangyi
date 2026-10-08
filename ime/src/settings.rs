@@ -11,6 +11,7 @@ use windows::Win32::UI::WindowsAndMessaging::*;
 static MAX_CANDS: AtomicUsize = AtomicUsize::new(9);
 static FONT_SCALE: AtomicI32 = AtomicI32::new(100);
 static HORIZONTAL: AtomicBool = AtomicBool::new(false);
+static ENGLISH: AtomicBool = AtomicBool::new(false);
 static THEME: AtomicI32 = AtomicI32::new(0); // 0 跟随系统 / 1 浅色 / 2 深色
 
 static STANDALONE: AtomicBool = AtomicBool::new(false);
@@ -58,12 +59,22 @@ pub fn save() {
         let _ = std::fs::create_dir_all(dir);
     }
     let body = format!(
-        "max={}\nscale={}\nlayout={}\ntheme={}\n",
+        "max={}\nscale={}\nlayout={}\ntheme={}\nenglish={}\n",
         max_cands(), font_scale(),
         if horizontal() { "h" } else { "v" },
-        THEME.load(Ordering::Relaxed)
+        THEME.load(Ordering::Relaxed),
+        if english() { 1 } else { 0 }
     );
     let _ = std::fs::write(path, body);
+}
+
+pub fn english() -> bool {
+    ENGLISH.load(Ordering::Relaxed)
+}
+
+pub fn set_english(v: bool) {
+    ENGLISH.store(v, Ordering::Relaxed);
+    save();
 }
 
 pub fn max_cands() -> usize {

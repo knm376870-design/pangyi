@@ -181,6 +181,30 @@ fn icacls_grant(dir: &str) {
     let _ = cmd.status();
 }
 
+/// 建快捷方式（开始菜单 + 公共桌面）
+unsafe fn make_shortcut(lnk: &str, target: &str, workdir: &str) {
+    // 用 WScript.Shell 建快捷方式，省得折腾 COM
+    let script = format!(
+        "$s=(New-Object -ComObject WScript.Shell).CreateShortcut('{}'); $s.TargetPath='{}'; $s.WorkingDirectory='{}'; $s.Description='旁译 · 中文→俄语输入法'; $s.Save()",
+        lnk, target, workdir
+    );
+    let mut cmd = std::process::Command::new("powershell.exe");
+    cmd.args(["-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", &script]);
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        cmd.creation_flags(0x0800_0000);
+    }
+    let _ = cmd.status();
+}
+
+unsafe fn shortcuts() {
+    let set = format!("{DIR}\\{SETTINGS_NAME}");
+    let common_start = r"C:\ProgramData\Microsoft\Windows\Start Menu\Programs\旁译 设置.lnk";
+    make_shortcut(common_start, &set, DIR);
+    let public_desktop = r"C:\Users\Public\Desktop\旁译 设置.lnk";
+    make_shortcut(public_desktop, &set, DIR);
+}
 fn install() {
     let dir = Path::new(DIR);
     if std::fs::create_dir_all(dir).is_err() {
@@ -255,6 +279,8 @@ fn install() {
         }
     }
 
+    unsafe { shortcuts(); }
+
     // 清掉用户级覆盖（会盖住 HKLM）
     let hkcu = format!("Software\\Classes\\CLSID\\{CLSID_STR}");
     reg_del_tree(HKEY_CURRENT_USER, &hkcu);
@@ -273,6 +299,8 @@ fn uninstall() {
     reg_del_tree(HKEY_LOCAL_MACHINE, &format!("SOFTWARE\\Microsoft\\CTF\\TIP\\{CLSID_STR}"));
     reg_del_tree(HKEY_LOCAL_MACHINE, "SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\Pangyi");
     reg_del_tree(HKEY_CURRENT_USER, &format!("Software\\Classes\\CLSID\\{CLSID_STR}"));
+    let _ = std::fs::remove_file(r"C:\ProgramData\Microsoft\Windows\Start Menu\Programs\旁译 设置.lnk");
+    let _ = std::fs::remove_file(r"C:\Users\Public\Desktop\旁译 设置.lnk");
     for f in [DLL64_NAME, DLL32_NAME, ICO_NAME, SETTINGS_NAME, "pangyi-setup.exe"] {
         let _ = std::fs::remove_file(dir.join(f));
     }
