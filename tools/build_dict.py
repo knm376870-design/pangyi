@@ -135,7 +135,7 @@ def read_cache(path):
                     d[c[0]] = c[1:6]
     return d
 rw    = read_cache(os.path.join(RAW, "ruwikt-zh-ru.tsv"))
-pivot = read_cache(os.path.join(RAW, "pivot-zh-ru.tsv"))
+pivot = read_cache(os.path.join(RAW, "pivot-zh-ru.tsv"))  # 兼容旧读法
 
 # ---------- 词频 ----------
 freq = {}
@@ -178,38 +178,51 @@ for title, (sim, tra, pint, pos, ru) in rw.items():
     g = [x for x in g if not x.startswith(("(", "†", "устар", "обл."))]
     if not g:
         continue
-    reads = [(e["a"], e["d"], e["trad"]) for e in by_simp.get(simp, [])]
     if pint:
+        # 直连来源自带读音 —— 只贴这一个读音，别污染别的读音
         pa, pd = parse_pinyin(pint)
-        if pa:
-            reads = [(pa, pd, tra or simp)] + [r for r in reads if r[0] != pa]
-    if not reads and len(simp) == 1:
-        reads = [(split_marks(k)[0], split_marks(k)[1], tra or simp) for k in kman.get(simp, [])]
+        reads = [(pa, pd, tra or simp)] if pa else []
+    else:
+        reads = [(e["a"], e["d"], e["trad"]) for e in by_simp.get(simp, [])]
+        if not reads and len(simp) == 1:
+            reads = [(split_marks(k)[0], split_marks(k)[1], tra or simp)
+                     for k in kman.get(simp, [])]
     for a, d, tr in reads:
         cur = emit(simp, tr, a, d, pos)
         if cur:
             cur["ru"] = g
+            cur["src"] = "pint" if pint else "rw"
 
-# 3) 枢轴兜底：只给多字词，且只补还没有俄语的
+# 3) 枢轴（中->英->俄），按读音：
+#    - 多字词：正常补
+#    - 单字：只有当这个字有多个读音时才用（用来区分读音，不做无中生有）
+pivot_by = {}
+pp = os.path.join(RAW, "pivot-zh-ru.tsv")
+if os.path.exists(pp):
+    with io.open(pp, encoding="utf-8") as f:
+        for line in f:
+            if line.startswith("#"):
+                continue
+            c = line.rstrip("\n").split("\t")
+            if len(c) < 6 or not c[1] or not c[3] or not c[5]:
+                continue
+            g = [x.strip() for x in c[5].split("|") if x.strip()]
+            g = [x for x in g if not x.startswith(("(", "†"))]
+            if g:
+                pivot_by[(c[1], c[3])] = g
+
 pivot_n = 0
-for title, (sim, tra, pint, pos, ru) in pivot.items():
-    simp = sim or title
-    if len(simp) < 2:
-        continue
-    g = [x.strip() for x in ru.split("|") if x.strip()]
-    g = [x for x in g if not x.startswith(("(", "†"))]
+for (simp, a), rec in rows.items():
+    if rec["ru"]:
+        continue          # 已有直连译词就不动：实测枢轴在单字上会出「эвен」这类
+                          # 更糟的结果，宁可留直连的，也不让它覆盖
+    g = pivot_by.get((simp, a))
     if not g:
         continue
-    for e in by_simp.get(simp, []):
-        key = (simp, e["a"])
-        cur = rows.get(key)
-        if cur is None:
-            cur = emit(simp, e["trad"], e["a"], e["d"])
-            pivot_n += 1
-        elif not cur["ru"]:
-            pivot_n += 1
-        if cur and not cur["ru"]:
-            cur["ru"] = g
+    if len(simp) >= 2 or len(by_simp.get(simp, [])) >= 2:
+        rec["ru"] = g
+        rec["src"] = "pivot"
+        pivot_n += 1
 
 print(f"CC-CEDICT {len(entries)}（去重读音） FreeDict {len(fd)}  RU-wikt {len(rw)}  枢轴补 {pivot_n}")
 
