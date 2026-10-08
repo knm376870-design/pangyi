@@ -31,9 +31,10 @@ unsafe fn show_cands() {
     let st = st.as_ref().unwrap();
     let h = HWND_CAND;
     if st.cands.is_empty() {
-        ShowWindow(h, SW_HIDE);
+        pangyi_ime::cand::hide();
         return;
     }
+    if st.buf.is_empty() { return; }
     // 定位到光标附近
     let mut gi = GUITHREADINFO::default();
     gi.cbSize = std::mem::size_of::<GUITHREADINFO>() as u32;
@@ -45,11 +46,8 @@ unsafe fn show_cands() {
             x = pt.x; y = pt.y + 24;
         }
     }
-    let n = st.cands.len().min(9);
-    let w = 560i32;
-    let hh = (n as i32) * 30 + 8;
-    SetWindowPos(h, HWND_TOPMOST, x, y, w, hh, SWP_NOACTIVATE | SWP_SHOWWINDOW).ok();
-    InvalidateRect(h, None, TRUE);
+    let _ = h;
+    pangyi_ime::cand::show_at(x, y);
 }
 
 unsafe fn tray_add(hwnd: HWND, first: bool) {
@@ -166,6 +164,9 @@ unsafe fn refresh() {
             (String::new(), Vec::new())
         } else {
             let hits = pangyi_ime::dict::lookup(&st.buf);
+            let items: Vec<pangyi_ime::cand::Item> = hits.iter().map(|h| pangyi_ime::cand::Item {
+                word: h.word.clone(), pinyin: h.pinyin.clone(), ru: h.ru.clone() }).collect();
+            pangyi_ime::cand::set_items(items);
             let v: Vec<(String, String)> = hits.into_iter().map(|h| (h.word, h.ru)).collect();
             st.cands = v.clone();
             (st.buf.clone(), v)
@@ -269,7 +270,7 @@ unsafe extern "system" fn cand_proc(h: HWND, msg: u32, w: WPARAM, l: LPARAM) -> 
 
 fn main() {
     unsafe {
-        *ST.lock().unwrap() = Some(State::default());
+        *ST.lock().unwrap() = Some(State::default());\n        pangyi_ime::cand::init();
 
         let hinst = GetModuleHandleW(None).unwrap();
         let cls = wide("PangyiCand");

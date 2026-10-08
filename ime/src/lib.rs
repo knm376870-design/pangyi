@@ -5,6 +5,7 @@
 
 #![allow(non_snake_case)]
 
+pub mod cand;
 pub mod dict;
 
 use std::cell::{Cell, RefCell};
@@ -177,7 +178,8 @@ impl ITfKeyEventSink_Impl for TextService {
             self.buf.borrow_mut().push(ch.to_ascii_lowercase());
             let key = self.buf.borrow().clone();
             let hits = dict::lookup(&key);
-            { *UI_CANDS.lock().unwrap() = hits.iter().map(|h| (h.word.clone(), h.ru.clone())).collect(); }
+            let items: Vec<cand::Item> = hits.iter().map(|h| cand::Item { word: h.word.clone(), pinyin: h.pinyin.clone(), ru: h.ru.clone() }).collect();
+            unsafe { cand::set_items(items); }
             if let Some(ctx) = pic {
                 let text: Vec<u16> = key.encode_utf16().collect();
                 let sink: ITfCompositionSink = match unsafe { self.cast() } { Ok(s) => s, Err(_) => return Ok(BOOL(1)) };
@@ -319,24 +321,24 @@ pub extern "system" fn DllUnregisterServer() -> HRESULT { E_FAIL }
 
 impl ITfThreadMgrEventSink_Impl for TextService {
     fn OnInitDocumentMgr(&self, _pdim: Option<&ITfDocumentMgr>) -> Result<()> {
-        log("ThreadMgr::OnInitDocumentMgr");
+        // 静音
         Ok(())
     }
     fn OnUninitDocumentMgr(&self, _pdim: Option<&ITfDocumentMgr>) -> Result<()> {
-        log("ThreadMgr::OnUninitDocumentMgr");
+        // 静音
         Ok(())
     }
     fn OnSetFocus(&self, _focus: Option<&ITfDocumentMgr>, _prev: Option<&ITfDocumentMgr>) -> Result<()> {
-        log("ThreadMgr::OnSetFocus -> 重挂按键接收器");
+        // 焦点变化非常频繁，不能每次都写日志（会把日志刷爆）
         self.advise_key_sink();
         Ok(())
     }
     fn OnPushContext(&self, _pic: Option<&ITfContext>) -> Result<()> {
-        log("ThreadMgr::OnPushContext");
+        // 静音
         Ok(())
     }
     fn OnPopContext(&self, _pic: Option<&ITfContext>) -> Result<()> {
-        log("ThreadMgr::OnPopContext");
+        // 静音
         Ok(())
     }
 }
@@ -379,6 +381,9 @@ unsafe extern "system" fn cand_proc(h: HWND, msg: u32, w: WPARAM, l: LPARAM) -> 
 }
 
 unsafe fn cand_init() {
+    cand::init();
+    return;
+    #[allow(unreachable_code)]
     let hinst = windows::Win32::System::LibraryLoader::GetModuleHandleW(None).unwrap();
     let cls: Vec<u16> = "PangyiCandW\0".encode_utf16().collect();
     let wc = WNDCLASSW {
@@ -398,21 +403,11 @@ unsafe fn cand_init() {
 
 unsafe fn cand_update(x: i32, y: i32) {
     if CAND_HWND.0 == 0 { return; }
-    let n = { UI_CANDS.lock().unwrap().len().min(9) };
-    if n == 0 {
-        let _ = ShowWindow(CAND_HWND, SW_HIDE);
-        return;
-    }
-    let h = (n as i32) * 32 + 10;
-    let _ = SetWindowPos(CAND_HWND, HWND_TOPMOST, x, y, 620, h, SWP_NOACTIVATE | SWP_SHOWWINDOW);
-    let _ = InvalidateRect(CAND_HWND, None, TRUE);
+    let _ = (x, y);
+    cand::show_at(x, y);
 }
 
-unsafe fn cand_hide() {
-    if CAND_HWND.0 != 0 {
-        let _ = ShowWindow(CAND_HWND, SW_HIDE);
-    }
-}
+unsafe fn cand_hide() { cand::hide(); }
 
 // ============================ 组合（拼音下划线）============================
 
