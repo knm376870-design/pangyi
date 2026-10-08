@@ -187,6 +187,8 @@ impl ITfKeyEventSink_Impl for TextService {
             if status::english() { return Ok(BOOL(0)); }
             self.buf.borrow_mut().push(ch.to_ascii_lowercase());
             let key = self.buf.borrow().clone();
+            unsafe { cand::set_preedit(&key); }
+            unsafe { cand::set_sentence(dict::complete(&key).map(|(w, _)| w)); }
             let hits = dict::lookup(&key);
             let items: Vec<cand::Item> = hits.iter().map(|h| cand::Item { word: h.word.clone(), pinyin: h.pinyin.clone(), ru: h.ru.clone(), fresh: false }).collect();
             unsafe { cand::set_items(items); }

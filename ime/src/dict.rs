@@ -96,3 +96,39 @@ pub fn lookup(ascii: &str) -> Vec<Hit> {
     out.truncate(16);
     out
 }
+/// 补全：在「拼音以 ascii 开头、且比它更长」的词条里，挑最高频的那个。
+/// 用在候选窗顶行右侧的整句/词语补全位（青简那儿是云联想）。
+pub fn complete(ascii: &str) -> Option<(String, String)> {
+    if ascii.is_empty() {
+        return None;
+    }
+    let idx = index();
+    let start = idx.keys.partition_point(|k| *k < ascii);
+    let mut best: Option<(u64, &'static str)> = None;
+    for key in idx.keys[start..].iter() {
+        if !key.starts_with(ascii) {
+            break;
+        }
+        if *key == ascii {
+            continue;
+        }
+        if let Some(lines) = idx.exact.get(key) {
+            for line in lines {
+                let c: Vec<&str> = line.split('\t').collect();
+                if c.len() < 7 {
+                    continue;
+                }
+                let freq: u64 = c[5].parse().unwrap_or(0);
+                let wlen = c[0].chars().count() as u64;
+                let score = freq * 10 + wlen;
+                if best.map(|(s, _)| score > s).unwrap_or(true) {
+                    best = Some((score, line));
+                }
+            }
+        }
+    }
+    best.map(|(_, line)| {
+        let c: Vec<&str> = line.split('\t').collect();
+        (c[0].to_string(), c[3].to_string())
+    })
+}

@@ -17,6 +17,7 @@ pub struct Item {
 
 static ITEMS: Mutex<Vec<Item>> = Mutex::new(Vec::new());
 static PREEDIT: Mutex<String> = Mutex::new(String::new());
+static SENTENCE: Mutex<Option<String>> = Mutex::new(None);
 static SEL: AtomicUsize = AtomicUsize::new(0);
 static DARK: AtomicBool = AtomicBool::new(true);
 static HORIZONTAL: AtomicBool = AtomicBool::new(false);
@@ -30,6 +31,7 @@ struct Palette {
     gloss: COLORREF,
     index: COLORREF,
     fresh: COLORREF,
+    cloud: COLORREF,
     background: COLORREF,
     highlight: COLORREF,
 }
@@ -45,6 +47,7 @@ fn palette(dark: bool) -> Palette {
             gloss: rgb(0xae, 0xae, 0xb2),
             index: rgb(0x8e, 0x8e, 0x93),
             fresh: rgb(0xff, 0x9f, 0x0a),
+            cloud: rgb(0x40, 0xc8, 0xe0),
             background: rgb(0x2a, 0x2a, 0x2c),
             highlight: rgb(0x2f, 0x4d, 0x72),
         }
@@ -54,6 +57,7 @@ fn palette(dark: bool) -> Palette {
             gloss: rgb(0x6b, 0x6b, 0x70),
             index: rgb(0xa0, 0xa0, 0xa6),
             fresh: rgb(0xff, 0x95, 0x00),
+            cloud: rgb(0x30, 0xb0, 0xc7),
             background: rgb(0xf8, 0xf8, 0xf8),
             highlight: rgb(0xcf, 0xe4, 0xf9),
         }
@@ -207,7 +211,16 @@ unsafe fn compute_layout(dc: HDC, items: &[Item]) -> Layout {
     }
 
     let pre = PREEDIT.lock().unwrap().clone();
-    let pre_h = if pre.is_empty() { 0 } else { measure(dc, f_anno, "x").1 + sc(ROW_PAD) * 2 };
+    let sent = SENTENCE.lock().unwrap().clone();
+    let has_top = !pre.is_empty() || sent.is_some();
+    let top_w = if !has_top { 0 } else {
+        let mut w = if pre.is_empty() { 0 } else { measure(dc, f_anno, &pre).0 };
+        if let Some(s) = sent.as_ref() {
+            w += gap + measure(dc, f_anno, "☁").0 + gap / 2 + measure(dc, f_anno, s).0;
+        }
+        w
+    };
+    let pre_h = if !has_top { 0 } else { measure(dc, f_anno, "x").1 + sc(ROW_PAD) * 2 };
 
     let (width, height) = if HORIZONTAL.load(Ordering::Relaxed) {
         let inset = sc(PAD) / 2;
@@ -217,9 +230,9 @@ unsafe fn compute_layout(dc: HDC, items: &[Item]) -> Layout {
             w += iw;
         }
         let h = pad * 2 + pre_h + row_h + if anno_h > 0 { anno_h } else { 0 };
-        (w.max(pad * 2 + anno_w).max(sc(120)), h)
+        (w.max(pad * 2 + anno_w).max(pad * 2 + top_w).max(sc(120)), h)
     } else {
-        let w = pad * 2 + index_w + gap + word_w + gap + pinyin_w + gap + ru_w;
+        let w = (pad * 2 + index_w + gap + word_w + gap + pinyin_w + gap + ru_w).max(pad * 2 + top_w);
         let h = pad * 2 + pre_h + (nth as i32) * row_h;
         (w, h)
     };
@@ -276,13 +289,30 @@ unsafe extern "system" fn proc_cand(h: HWND, msg: u32, w: WPARAM, l: LPARAM) -> 
             let gap = sc(GAP);
             let mut y = pad;
 
+            // 顶行：左边是正在输入的拼音，右边是「☁ 补全」（照青简的整句补全位）
             let pre = PREEDIT.lock().unwrap().clone();
-            if !pre.is_empty() {
+            let sent = SENTENCE.lock().unwrap().clone();
+            if !pre.is_empty() || sent.is_some() {
                 let (_, ph) = measure(dc, f_anno, "x");
+                let ty = y + sc(ROW_PAD);
                 SelectObject(dc, f_anno);
-                SetTextColor(dc, p.gloss);
-                let s: Vec<u16> = pre.encode_utf16().collect();
-                TextOutW(dc, pad, y + sc(ROW_PAD), &s);
+                let mut tx = pad;
+                if !pre.is_empty() {
+                    SetTextColor(dc, p.gloss);
+                    let s: Vec<u16> = pre.encode_utf16().collect();
+                    TextOutW(dc, tx, ty, &s);
+                    tx += measure(dc, f_anno, &pre).0;
+                }
+                if let Some(s) = sent.as_ref() {
+                    tx += gap;
+                    SetTextColor(dc, p.cloud);
+                    let c: Vec<u16> = "☁".encode_utf16().collect();
+                    TextOutW(dc, tx, ty, &c);
+                    tx += measure(dc, f_anno, "☁").0 + gap / 2;
+                    SetTextColor(dc, p.gloss);
+                    let g: Vec<u16> = s.encode_utf16().collect();
+                    TextOutW(dc, tx, ty, &g);
+                }
                 y += ph + sc(ROW_PAD) * 2;
             }
 
@@ -397,6 +427,8 @@ pub unsafe fn set_items(items: Vec<Item>) {
 }
 
 pub unsafe fn set_preedit(s: &str) { *PREEDIT.lock().unwrap() = s.to_string(); }
+
+pub unsafe fn set_sentence(s: Option<String>) { *SENTENCE.lock().unwrap() = s; }
 
 pub unsafe fn select(i: usize) {
     let n = ITEMS.lock().unwrap().len();
