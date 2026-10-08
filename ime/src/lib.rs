@@ -86,9 +86,56 @@ impl ITfTextInputProcessorEx_Impl for TextService {
 }
 
 impl TextService {
+    /// 把某个词上屏（换掉当前组合）
+    fn commit_word(&self, pic: Option<&ITfContext>, word: &str) {
+        if let Some(ctx) = pic {
+            let session: ITfEditSession = DoneSession {
+                ctx: ctx.clone(),
+                text: word.encode_utf16().collect(),
+            }
+            .into();
+            let flags = TF_CONTEXT_EDIT_CONTEXT_FLAGS(TF_ES_SYNC.0 | TF_ES_READWRITE.0);
+            let _ = unsafe { ctx.RequestEditSession(self.client_id.get(), &session, flags) };
+        }
+    }
+
+    /// 更新组合内容为当前的拼音串（用于退格）
+    fn refresh_composition(&self, pic: Option<&ITfContext>) {
+        let key = self.buf.borrow().clone();
+        if key.is_empty() {
+            unsafe { COMPOSITION = None; }
+            unsafe { cand_hide(); }
+            return;
+        }
+        unsafe { cand::set_preedit(&key); }
+        unsafe { cand::set_sentence(dict::complete(&key).map(|(w, _)| w)); }
+        let hits = dict::lookup(&key);
+        let items: Vec<cand::Item> = hits
+            .iter()
+            .map(|h| cand::Item { word: h.word.clone(), pinyin: h.pinyin.clone(), ru: h.ru.clone(), fresh: false })
+            .collect();
+        unsafe { cand::set_items(items); }
+        {
+            let mut g = UI_CANDS.lock().unwrap();
+            g.clear();
+            g.extend(hits.iter().map(|h| (h.word.clone(), h.ru.clone())));
+        }
+        if let Some(ctx) = pic {
+            let s: ITfEditSession = UpdateSession { text: key.encode_utf16().collect() }.into();
+            let flags = TF_CONTEXT_EDIT_CONTEXT_FLAGS(TF_ES_SYNC.0 | TF_ES_READWRITE.0);
+            let _ = unsafe { ctx.RequestEditSession(self.client_id.get(), &s, flags) };
+        }
+    }
+}
+
+impl TextService {
     fn activate(&self, ptim: Option<&ITfThreadMgr>, tid: u32) -> Result<()> {
         log("Activate");
         unsafe { settings::load(); status::init(); status::show(); }
+        // 后台把词典索引建好，避免第一次打字时卡一下
+        std::thread::spawn(|| {
+            let _ = dict::lookup("kaifa");
+        });
         if let Some(tm) = ptim {
             unsafe {
                 self.tid.set(tid);
@@ -155,7 +202,10 @@ impl ITfCompositionSink_Impl for TextService {
 
 impl ITfKeyEventSink_Impl for TextService {
     fn OnSetFocus(&self, fg: BOOL) -> Result<()> {
-        log(&format!("KeySink::OnSetFocus fg={}", fg.as_bool()));
+        if !fg.as_bool() {
+            // 只收候选窗；不要动组合——实测清组合会让上屏丢字
+            unsafe { cand_hide(); }
+        }
         Ok(())
     }
 
@@ -164,7 +214,8 @@ impl ITfKeyEventSink_Impl for TextService {
         if ch0.is_ascii_alphabetic() && status::english() {
             return Ok(BOOL(0));
         }
-        let want = handleable(wparam);
+        let has_buf = !self.buf.borrow().is_empty();
+        let want = claim(wparam, has_buf, status::english());
         log(&format!("KeySink::OnTestKeyDown wparam={} 我要={want}", wparam.0));
         Ok(BOOL(want as i32))
     }
@@ -184,6 +235,8 @@ impl ITfKeyEventSink_Impl for TextService {
     fn OnKeyDown(&self, pic: Option<&ITfContext>, wparam: WPARAM, _lp: LPARAM) -> Result<BOOL> {
         let ch = wparam.0 as u8 as char;
         log(&format!("KeySink::OnKeyDown wparam={} ch={ch:?}", wparam.0));
+
+        // 字母：进组合
         if ch.is_ascii_alphabetic() {
             if status::english() { return Ok(BOOL(0)); }
             self.buf.borrow_mut().push(ch.to_ascii_lowercase());
@@ -193,6 +246,11 @@ impl ITfKeyEventSink_Impl for TextService {
             let hits = dict::lookup(&key);
             let items: Vec<cand::Item> = hits.iter().map(|h| cand::Item { word: h.word.clone(), pinyin: h.pinyin.clone(), ru: h.ru.clone(), fresh: false }).collect();
             unsafe { cand::set_items(items); }
+            {
+                let mut g = UI_CANDS.lock().unwrap();
+                g.clear();
+                g.extend(hits.iter().map(|h| (h.word.clone(), h.ru.clone())));
+            }
             if let Some(ctx) = pic {
                 let text: Vec<u16> = key.encode_utf16().collect();
                 let sink: ITfCompositionSink = match unsafe { self.cast() } { Ok(s) => s, Err(_) => return Ok(BOOL(1)) };
@@ -200,50 +258,114 @@ impl ITfKeyEventSink_Impl for TextService {
                 let flags = TF_CONTEXT_EDIT_CONTEXT_FLAGS(TF_ES_SYNC.0 | TF_ES_READWRITE.0);
                 let _ = unsafe { ctx.RequestEditSession(self.client_id.get(), &s, flags) };
             }
-            // 窗口操作放在编辑会话之外，否则会干扰上屏
             if let Some((x, y)) = *PENDING_CAND.lock().unwrap() {
                 unsafe { cand_update(x, y); }
             }
             return Ok(BOOL(1));
         }
-        if wparam.0 == 0x20 {
-            let key = self.buf.borrow().clone();
-            if key.is_empty() {
-                return Ok(BOOL(0));
-            }
-            self.buf.borrow_mut().clear();
-            let hits = dict::lookup(&key);
-            log(&format!("上屏 key={key} 候选={}", hits.len()));
-            unsafe { cand_hide(); }
-            if let (Some(h), Some(ctx)) = (hits.first(), pic) {
-                // TSF 规定：改文本必须包在编辑会话里，否则 SetText 会被拒
-                let session: ITfEditSession = DoneSession {
-                    ctx: ctx.clone(),
-                    text: h.word.encode_utf16().collect(),
-                }
-                .into();
-                let flags = TF_CONTEXT_EDIT_CONTEXT_FLAGS(TF_ES_SYNC.0 | TF_ES_READWRITE.0);
-                match unsafe { ctx.RequestEditSession(self.client_id.get(), &session, flags) } {
-                    Ok(hr) => log(&format!("上屏会话 -> {hr:?}")),
-                    Err(e) => log(&format!("上屏会话失败 {e:?}")),
-                }
+
+        let has_buf = !self.buf.borrow().is_empty();
+
+        // 退格：删拼音
+        if wparam.0 == 0x08 {
+            if !has_buf { return Ok(BOOL(0)); }
+            self.buf.borrow_mut().pop();
+            self.refresh_composition(pic);
+            return Ok(BOOL(1));
+        }
+
+        // 数字 1-9：直接选第几个候选
+        if (0x31..=0x39).contains(&(wparam.0 as u32)) {
+            if !has_buf { return Ok(BOOL(0)); }
+            let idx = (wparam.0 as usize) - 0x31;
+            let word = UI_CANDS.lock().unwrap().get(idx).map(|(w, _)| w.clone());
+            if let Some(w) = word {
+                self.buf.borrow_mut().clear();
+                UI_CANDS.lock().unwrap().clear();
+                unsafe { cand_hide(); }
+                self.commit_word(pic, &w);
             }
             return Ok(BOOL(1));
         }
+
+        // 方向键 / Tab：在候选里移动
+        if matches!(wparam.0 as u32, 0x26 | 0x28 | 0x09) {
+            if !has_buf { return Ok(BOOL(0)); }
+            let n = UI_CANDS.lock().unwrap().len().min(9);
+            if n == 0 { return Ok(BOOL(1)); }
+            let cur = unsafe { cand::current_index() };
+            let next = if (wparam.0 as u32) == 0x26 { (cur + n - 1) % n } else { (cur + 1) % n };
+            unsafe { cand::select(next); }
+            return Ok(BOOL(1));
+        }
+
+        // 回车 / 空格：上屏当前选中的候选
+        if wparam.0 == 0x0D || wparam.0 == 0x20 {
+            if !has_buf { return Ok(BOOL(0)); }
+            let w = unsafe { cand::current() }
+                .or_else(|| UI_CANDS.lock().unwrap().first().map(|(w, _)| w.clone()));
+            self.buf.borrow_mut().clear();
+            UI_CANDS.lock().unwrap().clear();
+            unsafe { cand_hide(); }
+            log(&format!("上屏 word={:?}", w));
+            if let Some(w) = w { self.commit_word(pic, &w); }
+            return Ok(BOOL(1));
+        }
+
+        // ESC：取消这次输入
         if wparam.0 == 0x1B {
+            if !has_buf { return Ok(BOOL(0)); }
             self.buf.borrow_mut().clear();
             UI_CANDS.lock().unwrap().clear();
             unsafe { cand_hide(); }
             unsafe { COMPOSITION = None; }
             return Ok(BOOL(1));
         }
+
+        // PageUp / PageDown：先吃掉，别把拼音留在组合里
+        if matches!(wparam.0 as u32, 0x21 | 0x22) {
+            if !has_buf { return Ok(BOOL(0)); }
+            return Ok(BOOL(1));
+        }
+
+        // 标点：先把当前候选上屏，再放行让标点正常输入
+        if has_buf && is_punct_vk(wparam.0 as u32) {
+            let w = unsafe { cand::current() }
+                .or_else(|| UI_CANDS.lock().unwrap().first().map(|(w, _)| w.clone()));
+            self.buf.borrow_mut().clear();
+            UI_CANDS.lock().unwrap().clear();
+            unsafe { cand_hide(); }
+            if let Some(w) = w { self.commit_word(pic, &w); }
+            return Ok(BOOL(0));
+        }
+
         Ok(BOOL(0))
-    }
+    }}
+
+/// 标点键（TSF 传进来的是虚拟键码，不是字符）
+fn is_punct_vk(vk: u32) -> bool {
+    matches!(
+        vk,
+        0xBA | 0xBB | 0xBC | 0xBD | 0xBE | 0xBF | 0xC0 | 0xDB | 0xDC | 0xDD | 0xDE
+    )
 }
 
-fn handleable(wparam: WPARAM) -> bool {
+/// 这个键要不要拦下来（有拼音时还要拦退格、数字、标点、回车等）
+fn claim(wparam: WPARAM, has_buf: bool, english: bool) -> bool {
     let ch = wparam.0 as u8 as char;
-    ch.is_ascii_alphabetic() || wparam.0 == 0x20 || wparam.0 == 0x1B
+    if ch.is_ascii_alphabetic() {
+        return !english;
+    }
+    if !has_buf {
+        return false;
+    }
+    match wparam.0 as u32 {
+        0x20 | 0x1B | 0x08 | 0x0D | 0x09 => true, // 空格 / ESC / 退格 / 回车 / Tab
+        0x31..=0x39 => true,                      // 数字选词
+        0x25..=0x28 => true,                      // 方向键选词
+        0x21 | 0x22 => true,                      // PageUp / PageDown
+        _ => is_punct_vk(wparam.0 as u32),
+    }
 }
 
 /// 编辑会话：在 TSF 允许的时机把文本写进文档。
@@ -527,6 +649,24 @@ impl ITfEditSession_Impl for DoneSession {
     }
 }
 
+/// 只更新组合里的文字（退格时用），不结束组合
+#[implement(ITfEditSession)]
+struct UpdateSession {
+    text: Vec<u16>,
+}
+
+impl ITfEditSession_Impl for UpdateSession {
+    fn DoEditSession(&self, ec: u32) -> Result<()> {
+        unsafe {
+            if let Some(comp) = COMPOSITION.as_ref() {
+                if let Ok(r) = comp.GetRange() {
+                    let _ = r.SetText(ec, 0, &self.text);
+                }
+            }
+        }
+        Ok(())
+    }
+}
 /// 结束组合：单独一次编辑会话。以前和“换字”挤在同一次会话里，会出现上屏成拼音或干脆不上屏。
 #[implement(ITfEditSession)]
 struct EndSession {

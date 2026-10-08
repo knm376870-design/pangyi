@@ -424,6 +424,8 @@ pub unsafe fn select(i: usize) {
     }
 }
 
+pub unsafe fn current_index() -> usize { SEL.load(Ordering::Relaxed) }
+
 pub unsafe fn current() -> Option<String> {
     let g = ITEMS.lock().unwrap();
     let i = SEL.load(Ordering::Relaxed);
@@ -449,15 +451,23 @@ pub unsafe fn show_at(x: i32, y: i32) {
         ch = lay.height;
         let _ = ReleaseDC(WND, dc);
     }
+    // 夹进屏幕：右边超出就左移，下方放不下就翻到光标上方
+    let sw = GetSystemMetrics(SM_CXSCREEN);
+    let sh = GetSystemMetrics(SM_CYSCREEN);
+    let mut px = x;
+    let mut py = y;
+    if px + cw > sw - 4 { px = (sw - cw - 4).max(0); }
+    if py + ch > sh - 4 { py = (y - ch - sc(30)).max(0); }
+    if py < 0 { py = 0; }
     let rgn = CreateRoundRectRgn(0, 0, cw + 1, ch + 1, sc(RADIUS) * 2, sc(RADIUS) * 2);
     let _ = SetWindowRgn(WND, rgn, TRUE);
     // 只在“从隐藏变显示”的那一次抬高到置顶带的最前面（保证能盖住置顶窗口），
     // 后续按键只挪位置、不动 z 序——每次按键都抢顶层会让某些宿主丢焦点、上屏失败。
     let was_visible = IsWindowVisible(WND).as_bool();
     if was_visible {
-        let _ = SetWindowPos(WND, HWND(0), x, y, cw, ch, SWP_NOZORDER | SWP_NOACTIVATE | SWP_SHOWWINDOW);
+        let _ = SetWindowPos(WND, HWND(0), px, py, cw, ch, SWP_NOZORDER | SWP_NOACTIVATE | SWP_SHOWWINDOW);
     } else {
-        let _ = SetWindowPos(WND, HWND_TOPMOST, x, y, cw, ch, SWP_NOACTIVATE | SWP_SHOWWINDOW);
+        let _ = SetWindowPos(WND, HWND_TOPMOST, px, py, cw, ch, SWP_NOACTIVATE | SWP_SHOWWINDOW);
     }
     let _ = InvalidateRect(WND, None, TRUE);
 }
