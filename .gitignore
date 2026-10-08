@@ -7,3 +7,5 @@ dist/
 tools/llvm-mingw/
 tools/llvm-mingw.zip
 ime/build/*.o
+data/*.log
+data/*.err
