@@ -149,7 +149,30 @@ for title, (sim, tra, pint, pos, ru) in rw.items():
     g = [x.strip() for x in ru.split("|") if x.strip()]
     put(key, tra or key, a, d, pos, g)
 
-print(f"CC-CEDICT {len(ced)}  FreeDict {len(fd)}  RU-wikt {len(rw)}  ->  合并 {len(rows)} 条")
+# ---------- 枢轴兜底（中->英->俄）: 只补还没有俄语的词 ----------
+pivot_n = 0
+pp = os.path.join(RAW, "pivot-zh-ru.tsv")
+if os.path.exists(pp):
+    with io.open(pp, encoding="utf-8") as f:
+        for line in f:
+            if line.startswith("#"):
+                continue
+            c = line.rstrip("\n").split("\t")
+            if len(c) < 6 or not c[1] or not c[5]:
+                continue
+            simp, trad, ru = c[1], c[2], c[5]
+            g = [x.strip() for x in ru.split("|") if x.strip()]
+            cur = rows.get(simp)
+            if cur is None:
+                src = ced.get(simp) or ced.get("=" + simp) or (ced.get(trad) if trad else None)
+                a, d = (src[1], src[2]) if src else ("", "")
+                rows[simp] = {"trad": trad or simp, "a": a, "d": d, "pos": "", "ru": g}
+                pivot_n += 1
+            elif not cur["ru"]:
+                cur["ru"] = g
+                pivot_n += 1
+
+print(f"CC-CEDICT {len(ced)}  FreeDict {len(fd)}  RU-wikt {len(rw)}  枢轴 {pivot_n}  ->  合并 {len(rows)} 条")
 
 out_rows = []
 for simp, r in rows.items():
