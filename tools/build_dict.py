@@ -196,6 +196,17 @@ for title, (sim, tra, pint, pos, ru) in rw.items():
 # 3) 枢轴（中->英->俄），按读音：
 #    - 多字词：正常补
 #    - 单字：只有当这个字有多个读音时才用（用来区分读音，不做无中生有）
+# 最常用的 3000 个词（含单字），用于放宽单字枢轴
+TOP_COMMON = set()
+with io.open(os.path.join(RAW, "jieba_dict.txt"), encoding="utf-8") as f:
+    _ws = []
+    for line in f:
+        c = line.split()
+        if len(c) >= 2 and c[1].isdigit() and CJK.match(c[0]):
+            _ws.append((c[0], int(c[1])))
+_ws.sort(key=lambda x: -x[1])
+TOP_COMMON = {w for w, _ in _ws[:3000]}
+
 pivot_by = {}
 pp = os.path.join(RAW, "pivot-zh-ru.tsv")
 if os.path.exists(pp):
@@ -219,6 +230,9 @@ for (simp, a), rec in rows.items():
     g = pivot_by.get((simp, a))
     if not g:
         continue
+    # 只收多字词、以及有多个读音的单字。
+    # 试过给常用单字也放宽，实测质量不行（的→яркий、开→кипеть、喝→крик 都是错的），
+    # 错译比没有更糟，所以回退。
     if len(simp) >= 2 or len(by_simp.get(simp, [])) >= 2:
         rec["ru"] = g
         rec["src"] = "pivot"
