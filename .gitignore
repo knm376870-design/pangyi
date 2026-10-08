@@ -1,0 +1,4 @@
+# 原始数据体积大，不入库；用 tools/build_dict.py 重新下载生成
+data/raw/
+__pycache__/
+*.pyc
