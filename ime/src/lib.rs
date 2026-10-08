@@ -11,12 +11,17 @@ use std::cell::{Cell, RefCell};
 use std::os::raw::c_void;
 use std::sync::atomic::{AtomicU32, Ordering};
 
-use windows::core::{implement, ComInterface, Interface, Result, GUID, HRESULT};
-use windows::Win32::Foundation::{BOOL, CLASS_E_NOAGGREGATION, E_FAIL, E_POINTER, LPARAM, S_OK, WPARAM};
+use std::sync::Mutex;
+use windows::core::{implement, ComInterface, Interface, PCWSTR, Result, GUID, HRESULT};
+use windows::Win32::Foundation::RECT;
+use windows::Win32::Graphics::Gdi::*;
+use windows::Win32::UI::WindowsAndMessaging::*;
+use windows::Win32::Foundation::{BOOL, CLASS_E_NOAGGREGATION, E_FAIL, E_POINTER, COLORREF, HWND, LPARAM, LRESULT, POINT, S_OK, TRUE, WPARAM};
 use windows::Win32::System::Com::{IClassFactory, IClassFactory_Impl};
 use windows::Win32::UI::TextServices::{
     ITfContext, ITfKeyEventSink, ITfKeyEventSink_Impl, ITfKeystrokeMgr, ITfTextInputProcessor_Impl,
-    ITfClientId, ITfDocumentMgr, ITfEditSession, ITfEditSession_Impl, ITfTextInputProcessorEx,
+    ITfClientId, ITfComposition, ITfCompositionSink, ITfCompositionSink_Impl, ITfContextComposition,
+    ITfDocumentMgr, ITfEditSession, ITfEditSession_Impl, ITfTextInputProcessorEx,
     ITfTextInputProcessorEx_Impl, ITfThreadMgrEventSink, ITfThreadMgrEventSink_Impl,
     ITfSource, ITfThreadMgr, TF_CONTEXT_EDIT_CONTEXT_FLAGS, TF_ES_READWRITE, TF_ES_SYNC, TF_SELECTION,
 };
@@ -25,6 +30,9 @@ pub const CLSID_PANGYI: GUID = GUID::from_u128(0xB4E8F2A1_7C3D_4E5F_9A21_8D6C4B3
 pub const GUID_PROFILE: GUID = GUID::from_u128(0x5A7C9E12_3D4B_4F8A_B6E1_2C9D7A5E8F34);
 
 static LIVE: AtomicU32 = AtomicU32::new(0);
+static mut COMPOSITION: Option<ITfComposition> = None;
+static mut CAND_HWND: HWND = HWND(0);
+static UI_CANDS: Mutex<Vec<(String, String)>> = Mutex::new(Vec::new());
 const S_FALSE_HR: HRESULT = HRESULT(1);
 const CLASS_E_CLASSNOTAVAILABLE_HR: HRESULT = HRESULT(0x80040111u32 as i32);
 
@@ -42,7 +50,7 @@ fn log(msg: &str) {
 
 // ============================ 文本服务 ============================
 
-#[implement(ITfTextInputProcessorEx, ITfKeyEventSink, ITfThreadMgrEventSink)]
+#[implement(ITfTextInputProcessorEx, ITfKeyEventSink, ITfThreadMgrEventSink, ITfCompositionSink)]
 struct TextService {
     client_id: Cell<u32>,
     tid: Cell<u32>,
@@ -97,6 +105,7 @@ impl TextService {
                     Err(e) => log(&format!("拿不到 ITfSource: {e:?}")),
                 }
                 self.advise_key_sink();
+                if CAND_HWND.0 == 0 { cand_init(); }
             }
         }
         Ok(())
@@ -130,6 +139,13 @@ impl TextService {
     }
 }
 
+impl ITfCompositionSink_Impl for TextService {
+    fn OnCompositionTerminated(&self, _ec: u32, _c: Option<&ITfComposition>) -> Result<()> {
+        unsafe { COMPOSITION = None; }
+        Ok(())
+    }
+}
+
 impl ITfKeyEventSink_Impl for TextService {
     fn OnSetFocus(&self, fg: BOOL) -> Result<()> {
         log(&format!("KeySink::OnSetFocus fg={}", fg.as_bool()));
@@ -159,6 +175,16 @@ impl ITfKeyEventSink_Impl for TextService {
         log(&format!("KeySink::OnKeyDown wparam={} ch={ch:?}", wparam.0));
         if ch.is_ascii_alphabetic() {
             self.buf.borrow_mut().push(ch.to_ascii_lowercase());
+            let key = self.buf.borrow().clone();
+            let hits = dict::lookup(&key);
+            { *UI_CANDS.lock().unwrap() = hits.iter().map(|h| (h.word.clone(), h.ru.clone())).collect(); }
+            if let Some(ctx) = pic {
+                let text: Vec<u16> = key.encode_utf16().collect();
+                let sink: ITfCompositionSink = match unsafe { self.cast() } { Ok(s) => s, Err(_) => return Ok(BOOL(1)) };
+                let s: ITfEditSession = CompSession { ctx: ctx.clone(), text, sink }.into();
+                let flags = TF_CONTEXT_EDIT_CONTEXT_FLAGS(TF_ES_SYNC.0 | TF_ES_READWRITE.0);
+                let _ = unsafe { ctx.RequestEditSession(self.client_id.get(), &s, flags) };
+            }
             return Ok(BOOL(1));
         }
         if wparam.0 == 0x20 {
@@ -169,9 +195,10 @@ impl ITfKeyEventSink_Impl for TextService {
             self.buf.borrow_mut().clear();
             let hits = dict::lookup(&key);
             log(&format!("上屏 key={key} 候选={}", hits.len()));
+            unsafe { cand_hide(); }
             if let (Some(h), Some(ctx)) = (hits.first(), pic) {
                 // TSF 规定：改文本必须包在编辑会话里，否则 SetText 会被拒
-                let session: ITfEditSession = CommitSession {
+                let session: ITfEditSession = DoneSession {
                     ctx: ctx.clone(),
                     text: h.word.encode_utf16().collect(),
                 }
@@ -186,6 +213,9 @@ impl ITfKeyEventSink_Impl for TextService {
         }
         if wparam.0 == 0x1B {
             self.buf.borrow_mut().clear();
+            UI_CANDS.lock().unwrap().clear();
+            unsafe { cand_hide(); }
+            unsafe { COMPOSITION = None; }
             return Ok(BOOL(1));
         }
         Ok(BOOL(0))
@@ -308,5 +338,160 @@ impl ITfThreadMgrEventSink_Impl for TextService {
     fn OnPopContext(&self, _pic: Option<&ITfContext>) -> Result<()> {
         log("ThreadMgr::OnPopContext");
         Ok(())
+    }
+}
+// ============================ 候选窗 ============================
+
+unsafe extern "system" fn cand_proc(h: HWND, msg: u32, w: WPARAM, l: LPARAM) -> LRESULT {
+    match msg {
+        WM_PAINT => {
+            let mut ps = PAINTSTRUCT::default();
+            let dc = BeginPaint(h, &mut ps);
+            let mut rc = RECT::default();
+            let _ = GetClientRect(h, &mut rc);
+            let bg = CreateSolidBrush(COLORREF(0x00342a1e));
+            FillRect(dc, &rc, bg);
+            let _ = DeleteObject(bg);
+            SetBkMode(dc, TRANSPARENT);
+            let font = CreateFontW(-20, 0, 0, 0, 500, 0, 0, 0, 134, 0, 0, 0, 0,
+                windows::core::w!("Microsoft YaHei UI"));
+            let old = SelectObject(dc, font);
+            let list = UI_CANDS.lock().unwrap();
+            for (i, (word, ru)) in list.iter().take(9).enumerate() {
+                let y = 5 + (i as i32) * 32;
+                SetTextColor(dc, COLORREF(0x0066a2f7));
+                let a: Vec<u16> = format!("{}", i + 1).encode_utf16().collect();
+                TextOutW(dc, 12, y, &a);
+                SetTextColor(dc, COLORREF(0x00f0e9e9));
+                let bw: Vec<u16> = word.encode_utf16().collect();
+                TextOutW(dc, 40, y, &bw);
+                SetTextColor(dc, COLORREF(0x00ffa6c3));
+                let br: Vec<u16> = ru.replace('|', "·").encode_utf16().collect();
+                TextOutW(dc, 160, y, &br);
+            }
+            let _ = SelectObject(dc, old);
+            let _ = DeleteObject(font);
+            let _ = EndPaint(h, &ps);
+            LRESULT(0)
+        }
+        _ => DefWindowProcW(h, msg, w, l),
+    }
+}
+
+unsafe fn cand_init() {
+    let hinst = windows::Win32::System::LibraryLoader::GetModuleHandleW(None).unwrap();
+    let cls: Vec<u16> = "PangyiCandW\0".encode_utf16().collect();
+    let wc = WNDCLASSW {
+        lpfnWndProc: Some(cand_proc),
+        lpszClassName: PCWSTR(cls.as_ptr()),
+        hInstance: hinst.into(),
+        hbrBackground: HBRUSH(6isize),
+        ..Default::default()
+    };
+    RegisterClassW(&wc);
+    let title: Vec<u16> = "旁译\0".encode_utf16().collect();
+    CAND_HWND = CreateWindowExW(
+        WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE | WS_EX_TOPMOST,
+        PCWSTR(cls.as_ptr()), PCWSTR(title.as_ptr()), WS_POPUP,
+        0, 0, 620, 320, None, None, hinst, None);
+}
+
+unsafe fn cand_update(x: i32, y: i32) {
+    if CAND_HWND.0 == 0 { return; }
+    let n = { UI_CANDS.lock().unwrap().len().min(9) };
+    if n == 0 {
+        let _ = ShowWindow(CAND_HWND, SW_HIDE);
+        return;
+    }
+    let h = (n as i32) * 32 + 10;
+    let _ = SetWindowPos(CAND_HWND, HWND_TOPMOST, x, y, 620, h, SWP_NOACTIVATE | SWP_SHOWWINDOW);
+    let _ = InvalidateRect(CAND_HWND, None, TRUE);
+}
+
+unsafe fn cand_hide() {
+    if CAND_HWND.0 != 0 {
+        let _ = ShowWindow(CAND_HWND, SW_HIDE);
+    }
+}
+
+// ============================ 组合（拼音下划线）============================
+
+#[implement(ITfEditSession)]
+struct CompSession {
+    ctx: ITfContext,
+    text: Vec<u16>,
+    sink: ITfCompositionSink,
+}
+
+impl ITfEditSession_Impl for CompSession {
+    fn DoEditSession(&self, ec: u32) -> Result<()> {
+        unsafe {
+            let mut sel = [TF_SELECTION::default()];
+            let mut n = 0u32;
+            self.ctx.GetSelection(ec, 0, &mut sel, &mut n)?;
+            if n == 0 { return Ok(()); }
+
+            let have = COMPOSITION.as_ref().is_some();
+            let range = if have {
+                match COMPOSITION.as_ref().unwrap().GetRange() {
+                    Ok(r) => r,
+                    Err(_) => return Ok(()),
+                }
+            } else {
+                match (&*sel[0].range).as_ref() { Some(r) => r.clone(), None => return Ok(()) }
+            };
+
+            if !have {
+                if let Ok(cc) = self.ctx.cast::<ITfContextComposition>() {
+                    if let Ok(comp) = cc.StartComposition(ec, &range, &self.sink) {
+                        COMPOSITION = Some(comp);
+                    }
+                }
+            }
+            if let Some(comp) = COMPOSITION.as_ref() {
+                if let Ok(r) = comp.GetRange() {
+                    let _ = r.SetText(ec, 0, &self.text);
+                }
+            }
+
+            // 把候选窗放到光标下方
+            if let Ok(view) = self.ctx.GetActiveView() {
+                let mut rc = RECT::default();
+                let mut clipped = BOOL(0);
+                let r2 = COMPOSITION.as_ref().and_then(|c| c.GetRange().ok()).unwrap_or(range);
+                if view.GetTextExt(ec, &r2, &mut rc, &mut clipped).is_ok() {
+                    cand_update(rc.left, rc.bottom + 6);
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+/// 上屏：把 composition 的文字换成最终的中文，然后结束组合
+#[implement(ITfEditSession)]
+struct DoneSession {
+    ctx: ITfContext,
+    text: Vec<u16>,
+}
+
+impl ITfEditSession_Impl for DoneSession {
+    fn DoEditSession(&self, ec: u32) -> Result<()> {
+        unsafe {
+            if let Some(comp) = COMPOSITION.take() {
+                if let Ok(r) = comp.GetRange() {
+                    let _ = r.SetText(ec, 0, &self.text);
+                }
+                let _ = comp.EndComposition(ec);
+            }
+        }
+        Ok(())
+    }
+}
+
+unsafe fn end_composition() {
+    if COMPOSITION.is_some() {
+        // 用一个空内容的上屏会话把它收掉
+        COMPOSITION = None;
     }
 }
