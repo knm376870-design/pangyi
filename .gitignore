@@ -2,3 +2,4 @@
 data/raw/
 __pycache__/
 *.pyc
+ime/target/
