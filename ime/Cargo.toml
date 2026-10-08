@@ -1,6 +1,6 @@
 [package]
 name = "pangyi_ime"
-version = "0.1.0"
+version = "1.0.0"
 edition = "2021"
 
 [lib]
@@ -11,4 +11,4 @@ panic = "abort"
 opt-level = "z"
 
 [dependencies]
-windows = { version = "0.52", features = ["Win32_Foundation", "Win32_System_Com", "Win32_UI_TextServices", "Win32_UI_Input_KeyboardAndMouse", "Win32_System_LibraryLoader", "Win32_UI_WindowsAndMessaging", "Win32_System_Registry", "implement", "Win32_Graphics", "Win32_Graphics_Gdi", "Win32_UI_Shell"] }
+windows = { version = "0.52", features = ["Win32_Foundation", "Win32_System_Com", "Win32_UI_TextServices", "Win32_UI_Input_KeyboardAndMouse", "Win32_System_LibraryLoader", "Win32_UI_WindowsAndMessaging", "Win32_System_Registry", "Win32_Security", "implement", "Win32_Graphics", "Win32_Graphics_Gdi", "Win32_UI_Shell"] }

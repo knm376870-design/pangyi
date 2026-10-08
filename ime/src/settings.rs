@@ -13,6 +13,7 @@ static FONT_SCALE: AtomicI32 = AtomicI32::new(100);
 static HORIZONTAL: AtomicBool = AtomicBool::new(false);
 static THEME: AtomicI32 = AtomicI32::new(0); // 0 跟随系统 / 1 浅色 / 2 深色
 
+static STANDALONE: AtomicBool = AtomicBool::new(false);
 static mut WND: HWND = HWND(0);
 static mut BG: HBRUSH = HBRUSH(0);
 
@@ -245,6 +246,9 @@ unsafe extern "system" fn proc_settings(h: HWND, msg: u32, wp: WPARAM, lp: LPARA
         }
         WM_DESTROY => {
             WND = HWND(0);
+            if STANDALONE.load(Ordering::Relaxed) {
+                PostQuitMessage(0);
+            }
             LRESULT(0)
         }
         _ => DefWindowProcW(h, msg, wp, lp),
@@ -314,4 +318,22 @@ unsafe fn init() {
         WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE | WS_EX_TOPMOST,
         PCWSTR(cls.as_ptr()), PCWSTR(title.as_ptr()), WS_POPUP,
         0, 0, sc(340), sc(230), None, None, hinst, None);
+}
+/// 独立设置程序用：开一个带标题栏的普通窗口（可以从右上角关掉）。
+pub unsafe fn open_app() {
+    STANDALONE.store(true, Ordering::Relaxed);
+    init();
+    if WND.0 == 0 {
+        return;
+    }
+    let (_, _, bg, _) = colors();
+    let _ = DeleteObject(BG);
+    BG = CreateSolidBrush(bg);
+    let (w, h) = (sc(340), sc(230));
+    let rgn = CreateRoundRectRgn(0, 0, w + 1, h + 1, sc(16), sc(16));
+    let _ = SetWindowRgn(WND, rgn, TRUE);
+    let sw = GetSystemMetrics(SM_CXSCREEN);
+    let sh = GetSystemMetrics(SM_CYSCREEN);
+    let _ = SetWindowPos(WND, HWND_TOP, (sw - w) / 2, (sh - h) / 2, w, h, SWP_SHOWWINDOW);
+    let _ = InvalidateRect(WND, None, TRUE);
 }
