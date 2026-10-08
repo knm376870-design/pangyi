@@ -11,13 +11,14 @@ use std::cell::{Cell, RefCell};
 use std::os::raw::c_void;
 use std::sync::atomic::{AtomicU32, Ordering};
 
-use windows::core::{implement, ComInterface, Result, GUID, HRESULT};
+use windows::core::{implement, ComInterface, Interface, Result, GUID, HRESULT};
 use windows::Win32::Foundation::{BOOL, CLASS_E_NOAGGREGATION, E_FAIL, E_POINTER, LPARAM, S_OK, WPARAM};
 use windows::Win32::System::Com::{IClassFactory, IClassFactory_Impl};
 use windows::Win32::UI::TextServices::{
     ITfContext, ITfKeyEventSink, ITfKeyEventSink_Impl, ITfKeystrokeMgr, ITfTextInputProcessor_Impl,
-    ITfEditSession, ITfEditSession_Impl, ITfTextInputProcessorEx, ITfTextInputProcessorEx_Impl,
-    ITfThreadMgr, TF_CONTEXT_EDIT_CONTEXT_FLAGS, TF_ES_READWRITE, TF_ES_SYNC, TF_SELECTION,
+    ITfDocumentMgr, ITfEditSession, ITfEditSession_Impl, ITfTextInputProcessorEx,
+    ITfTextInputProcessorEx_Impl, ITfThreadMgrEventSink, ITfThreadMgrEventSink_Impl,
+    ITfSource, ITfThreadMgr, TF_CONTEXT_EDIT_CONTEXT_FLAGS, TF_ES_READWRITE, TF_ES_SYNC, TF_SELECTION,
 };
 
 pub const CLSID_PANGYI: GUID = GUID::from_u128(0xB4E8F2A1_7C3D_4E5F_9A21_8D6C4B3E1F07);
@@ -35,22 +36,23 @@ fn log(msg: &str) {
         .append(true)
         .open(r"C:\ProgramData\Pangyi\ime.log")
     {
-        let _ = writeln!(f, "{msg}");
+        let _ = writeln!(f, "[pid {}] {msg}", std::process::id());
     }
 }
 
 // ============================ 文本服务 ============================
 
-#[implement(ITfTextInputProcessorEx, ITfKeyEventSink)]
+#[implement(ITfTextInputProcessorEx, ITfKeyEventSink, ITfThreadMgrEventSink)]
 struct TextService {
     client_id: Cell<u32>,
     tid: Cell<u32>,
+    tm: Cell<*mut c_void>,
     buf: RefCell<String>,
 }
 
 impl TextService {
     fn new() -> Self {
-        Self { client_id: Cell::new(0), tid: Cell::new(0), buf: RefCell::new(String::new()) }
+        Self { client_id: Cell::new(0), tid: Cell::new(0), tm: Cell::new(std::ptr::null_mut()), buf: RefCell::new(String::new()) }
     }
 }
 
@@ -76,15 +78,34 @@ impl TextService {
             unsafe {
                 self.client_id.set(tid);
                 self.tid.set(tid);
-                let ks: ITfKeystrokeMgr = tm.cast()?;
-                let sink: ITfKeyEventSink = self.cast()?;
-                match ks.AdviseKeyEventSink(tid, &sink, BOOL(1)) {
-                    Ok(()) => log(&format!("AdviseKeyEventSink ok tid={tid}")),
-                    Err(e) => log(&format!("AdviseKeyEventSink 失败 {e:?}")),
+                self.tm.set(tm.as_raw());
+                let tmsink: ITfThreadMgrEventSink = self.cast()?;
+                match tm.cast::<ITfSource>() {
+                    Ok(src) => match src.AdviseSink(&ITfThreadMgrEventSink::IID, &tmsink) {
+                        Ok(cookie) => log(&format!("AdviseSink(ThreadMgrEventSink) ok cookie={cookie}")),
+                        Err(e) => log(&format!("AdviseSink 调用失败 {e:?}")),
+                    },
+                    Err(e) => log(&format!("拿不到 ITfSource: {e:?}")),
                 }
+                self.advise_key_sink();
             }
         }
         Ok(())
+    }
+
+    /// 挂（或重挂）按键接收器。焦点变化时会再调一次。
+    fn advise_key_sink(&self) {
+        let raw = self.tm.get();
+        if raw.is_null() { return; }
+        unsafe {
+            let tm = std::mem::ManuallyDrop::new(ITfThreadMgr::from_raw(raw));
+            let Ok(ks) = tm.cast::<ITfKeystrokeMgr>() else { return };
+            let Ok(sink) = self.cast::<ITfKeyEventSink>() else { return };
+            match ks.AdviseKeyEventSink(self.tid.get(), &sink, BOOL(1)) {
+                Ok(()) => log("AdviseKeyEventSink ok"),
+                Err(e) => log(&format!("AdviseKeyEventSink 失败 {e:?}")),
+            }
+        }
     }
 
     fn deactivate(&self) -> Result<()> {
@@ -248,3 +269,27 @@ pub extern "system" fn DllRegisterServer() -> HRESULT { E_FAIL }
 
 #[no_mangle]
 pub extern "system" fn DllUnregisterServer() -> HRESULT { E_FAIL }
+
+impl ITfThreadMgrEventSink_Impl for TextService {
+    fn OnInitDocumentMgr(&self, _pdim: Option<&ITfDocumentMgr>) -> Result<()> {
+        log("ThreadMgr::OnInitDocumentMgr");
+        Ok(())
+    }
+    fn OnUninitDocumentMgr(&self, _pdim: Option<&ITfDocumentMgr>) -> Result<()> {
+        log("ThreadMgr::OnUninitDocumentMgr");
+        Ok(())
+    }
+    fn OnSetFocus(&self, _focus: Option<&ITfDocumentMgr>, _prev: Option<&ITfDocumentMgr>) -> Result<()> {
+        log("ThreadMgr::OnSetFocus -> 重挂按键接收器");
+        self.advise_key_sink();
+        Ok(())
+    }
+    fn OnPushContext(&self, _pic: Option<&ITfContext>) -> Result<()> {
+        log("ThreadMgr::OnPushContext");
+        Ok(())
+    }
+    fn OnPopContext(&self, _pic: Option<&ITfContext>) -> Result<()> {
+        log("ThreadMgr::OnPopContext");
+        Ok(())
+    }
+}
