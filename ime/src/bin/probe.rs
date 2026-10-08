@@ -1,5 +1,5 @@
 //! 问 TSF：我们的输入法到底注册进去了没有？
-use windows::core::{Result, GUID};
+use windows::core::{Result, GUID, IUnknown};
 use windows::Win32::System::Com::{
     CoCreateInstance, CoInitializeEx, CLSCTX_INPROC_SERVER, COINIT_APARTMENTTHREADED,
 };
@@ -43,6 +43,12 @@ fn main() -> Result<()> {
             );
         }
         println!("共 {n} 个中文(简体)输入法；我们的在里面吗: {found}");
+
+        println!("\n--- 直接按 CLSID 创建我们的对象（验证 COM 注册）---");
+        match CoCreateInstance::<_, IUnknown>(&OUR_CLSID, None, CLSCTX_INPROC_SERVER) {
+            Ok(_) => println!("[ok] CoCreateInstance(我们的 CLSID) 成功 —— COM 注册有效"),
+            Err(e) => println!("[FAIL] CoCreateInstance 失败: {e:?}  (0x{:08X})", e.code().0 as u32),
+        }
 
         match profiles.ActivateLanguageProfile(&OUR_CLSID, LANG_ZH_CN, &OUR_PROFILE) {
             Ok(()) => println!("\n[ok] ActivateLanguageProfile(我们的) 成功 —— TSF 认识我们"),

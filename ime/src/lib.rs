@@ -47,12 +47,13 @@ struct TextService {
     client_id: Cell<u32>,
     tid: Cell<u32>,
     tm: Cell<*mut c_void>,
+    advised: Cell<bool>,
     buf: RefCell<String>,
 }
 
 impl TextService {
     fn new() -> Self {
-        Self { client_id: Cell::new(0), tid: Cell::new(0), tm: Cell::new(std::ptr::null_mut()), buf: RefCell::new(String::new()) }
+        Self { client_id: Cell::new(0), tid: Cell::new(0), tm: Cell::new(std::ptr::null_mut()), advised: Cell::new(false), buf: RefCell::new(String::new()) }
     }
 }
 
@@ -103,6 +104,9 @@ impl TextService {
 
     /// 挂（或重挂）按键接收器。焦点变化时会再调一次。
     fn advise_key_sink(&self) {
+        if self.advised.get() {
+            return;   // 已经挂过就不重复挂：TSF 对同一 sink 二次 Advise 会返回 0x80040201
+        }
         let raw = self.tm.get();
         if raw.is_null() { return; }
         unsafe {
@@ -111,7 +115,7 @@ impl TextService {
             let Ok(sink) = self.cast::<ITfKeyEventSink>() else { return };
             let cid = self.client_id.get();
             match ks.AdviseKeyEventSink(cid, &sink, BOOL(1)) {
-                Ok(()) => log(&format!("AdviseKeyEventSink ok (TfClientId={cid})")),
+                Ok(()) => { log(&format!("AdviseKeyEventSink ok (TfClientId={cid})")); self.advised.set(true); }
                 Err(e) => log(&format!("AdviseKeyEventSink 失败 cid={cid} {e:?}")),
             }
         }
