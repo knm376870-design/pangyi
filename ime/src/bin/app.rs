@@ -7,6 +7,7 @@
 #![allow(non_snake_case)]
 
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use windows::core::*;
 use windows::Win32::Foundation::*;
 use windows::Win32::Graphics::Gdi::*;
@@ -93,10 +94,46 @@ unsafe fn set_autostart(on: bool) {
     let _ = RegCloseKey(h);
 }
 
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+static OUR_PID: AtomicU32 = AtomicU32::new(0);
+static LAST_TSF_PANEL: AtomicU64 = AtomicU64::new(0);
+
+unsafe extern "system" fn enum_panel(h: HWND, l: LPARAM) -> BOOL {
+    let _ = l;
+    let mut cls = [0u16; 64];
+    let n = GetClassNameW(h, &mut cls);
+    if n > 0 && String::from_utf16_lossy(&cls[..n as usize]) == "PangyiCandModern" && IsWindowVisible(h).as_bool() {
+        let mut pid = 0u32;
+        GetWindowThreadProcessId(h, Some(&mut pid));
+        if pid != 0 && pid != OUR_PID.load(Ordering::Relaxed) {
+            LAST_TSF_PANEL.store(now_ms(), Ordering::Relaxed);
+            return BOOL(0);
+        }
+    }
+    BOOL(1)
+}
+
+// 如果别处（旁译输入法自己）已经弹了候选窗，助手就让位，避免出现两个框
+unsafe fn tsf_panel_recent() -> bool {
+    let _ = EnumWindows(Some(enum_panel), LPARAM(0));
+    let t = LAST_TSF_PANEL.load(Ordering::Relaxed);
+    t != 0 && now_ms().saturating_sub(t) < 3000
+}
+
 unsafe fn show_cands() {
     let st = ST.lock().unwrap();
     let st = st.as_ref().unwrap();
     if st.cands.is_empty() || st.buf.is_empty() {
+        pangyi_ime::cand::hide();
+        return;
+    }
+    if tsf_panel_recent() {
         pangyi_ime::cand::hide();
         return;
     }
@@ -389,6 +426,7 @@ unsafe extern "system" fn cand_proc(h: HWND, msg: u32, w: WPARAM, l: LPARAM) -> 
 
 fn main() {
     unsafe {
+        OUR_PID.store(std::process::id(), Ordering::Relaxed);
         let mut st = State::default();
         st.companion = true;
         *ST.lock().unwrap() = Some(st);
