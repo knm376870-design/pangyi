@@ -159,6 +159,11 @@ pub fn lookup(ascii: &str) -> Vec<Hit> {
 
     out.truncate(16);
 
+    // 自定义短语优先（dz → 电子邮箱）
+    if let Some(h) = phrase(ascii) {
+        out.insert(0, h);
+    }
+
     // 整句候选放最前面（打字长的拼音时）
     // 整句切词现在只用词典词频，效果不稳（会出错的句子），先不进候选；
     // 等接上真正的语料 bigram 语言模型再打开。
@@ -179,6 +184,50 @@ pub fn lookup(ascii: &str) -> Vec<Hit> {
         });
     }
     out
+}
+
+
+// ---------------- 自定义短语（讯飞那种"打几个字母出长句"） ----------------
+//
+// 文件：%LOCALAPPDATA%\Pangyi\phrases.txt
+// 每行：触发字母 <TAB> 中文 <TAB> 俄语(可省)
+fn phrases_file() -> String {
+    let base = std::env::var("LOCALAPPDATA").unwrap_or_else(|_| ".".into());
+    format!("{base}\\Pangyi\\phrases.txt")
+}
+
+fn ensure_phrases_file() {
+    let path = phrases_file();
+    if std::path::Path::new(&path).exists() {
+        return;
+    }
+    if let Some(dir) = std::path::Path::new(&path).parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    let demo = "# 自定义短语：每行「触发字母 TAB 中文 TAB 俄语(可省)」\n# 打 dz 第一个就是「电子邮箱」。改完保存立刻生效。\ndz\t电子邮箱\tэлектронная почта\nwxh\t微信号\tWeChat ID\n";
+    let _ = std::fs::write(path, demo);
+}
+
+/// 精确匹配用户自定义短语
+pub fn phrase(trigger: &str) -> Option<Hit> {
+    ensure_phrases_file();
+    let s = std::fs::read_to_string(phrases_file()).ok()?;
+    for line in s.lines() {
+        let line = line.trim_end();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let c: Vec<&str> = line.split('\t').collect();
+        if c.len() < 2 {
+            continue;
+        }
+        if c[0].trim().eq_ignore_ascii_case(trigger) {
+            let word = c[1].trim().to_string();
+            let ru = c.get(2).map(|x| x.trim().to_string()).unwrap_or_default();
+            return Some(Hit { word, pinyin: trigger.to_string(), ru });
+        }
+    }
+    None
 }
 
 /// 补全：在「拼音以 ascii 开头、且比它更长」的词条里，挑最高频的那个。
@@ -222,6 +271,11 @@ static LM_RAW: &str = include_str!("lm.tsv");
 static LM_UNI_RAW: &str = include_str!("lm_uni.tsv");
 
 type UniMap = std::collections::HashMap<&'static str, u32>;
+
+fn lm_uni_total() -> f64 {
+    static T: OnceLock<f64> = OnceLock::new();
+    *T.get_or_init(|| lm_uni().values().map(|v| *v as f64).sum::<f64>().max(1.0))
+}
 
 fn lm_uni() -> &'static UniMap {
     static U: OnceLock<UniMap> = OnceLock::new();
@@ -306,7 +360,7 @@ pub fn sentence(pinyin: &str) -> Option<Vec<Hit>> {
             // 交给动态规划按上下文挑最好的，而不是这里就定死。
             let mut alts: Vec<&'static str> = lines.clone();
             alts.sort_by_key(|l| std::cmp::Reverse(line_freq(l)));
-            for line in alts.into_iter().take(3) {
+            for line in alts.into_iter().take(6) {
             let freq = line_freq(line).max(1) as f64;
             let wlen = line_word(line).chars().count() as f64;
             // 打分（离线词模型：词频 + 长度先验 + 单字惩罚）
@@ -314,22 +368,28 @@ pub fn sentence(pinyin: &str) -> Option<Vec<Hit>> {
             //   + 12*(字数-1) —— 长词强偏好
             //   - 8（单字）   —— 单字词频被"作为字的频率"抬高了，必须压一压，
             //                    否则 jintiantianqihenhao 会被切成"进/提/按..."
-            // 语言模型：P(词 | 上一个词)，没见过的搭配回退到词自身概率。
+            // 语言模型（log 空间，避免两个概率分布量纲不一致）：
+            //   log P(词)  = 0.75*log(词典频率占比) + 0.25*log(语料频率占比)
+            //   log P(词|上一个词) = 0.8*log(搭配概率) + 0.2*log P(词)（没见过搭配再打折）
             let prev = cur.1.last().map(|l| line_word(l)).unwrap_or("");
             let word = line_word(line);
-            let p_uni = (freq / idx.total_freq).max(1e-12);
-            let p = if prev.is_empty() {
-                p_uni
+            let cu = lm_uni().get(word).copied().unwrap_or(0) as f64;
+            let log_dict = (freq / idx.total_freq).max(1e-12).ln();
+            let log_corpus = if cu > 0.0 { (cu / lm_uni_total()).max(1e-12).ln() } else { log_dict - 3.0 };
+            let log_p_uni = 0.9 * log_dict + 0.1 * log_corpus;
+            let log_p = if prev.is_empty() {
+                log_p_uni
             } else {
-                let u = lm_uni().get(prev).copied().unwrap_or(0);
-                let b = bigram_count(prev, word);
-                if u > 0 && b > 0 {
-                    0.75 * (b as f64 / u as f64) + 0.25 * p_uni
+                let u = lm_uni().get(prev).copied().unwrap_or(0) as f64;
+                let b = bigram_count(prev, word) as f64;
+                if u > 0.0 && b > 0.0 {
+                    0.8 * (b / u).ln() + 0.2 * log_p_uni
                 } else {
-                    p_uni * 0.02 // 语料里没见过这两个词连用：打折
+                    log_p_uni - 3.0
                 }
             };
-            let score = cur.0 + p.ln() + 2.5 * (wlen - 1.0)
+            let score = cur.0 + log_p
+                + 2.5 * (wlen - 1.0)
                 - if wlen <= 1.0 { 5.0 } else { 0.0 }
                 - if freq < 120.0 { 6.0 } else { 0.0 };
             let end = i + len;

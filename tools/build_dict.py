@@ -271,10 +271,14 @@ for (simp, a), rec in rows.items():
 
 print(f"CC-CEDICT {len(entries)}（去重读音） FreeDict {len(fd)}  RU-wikt {len(rw)}  枢轴补 {pivot_n}  人工补 {manual_n}")
 
+# 现代常用词加权：jieba 词频对这几个字/词低估（古典语料里反而是另一些更常见），手工校正
+FREQ_BOOST = {"帮": 8.0, "给": 2.0, "让": 2.0, "请": 1.5, "邦": 0.15, "浜": 0.05}
+
 out = []
 for (simp, a), r in rows.items():
     if r["ru"]:
-        out.append((simp, r["trad"], a, r["d"], r["pos"], freq.get(simp, 0), " | ".join(r["ru"][:4]), r.get("ini", "")))
+        _f = int(freq.get(simp, 0) * FREQ_BOOST.get(simp, 1.0))
+        out.append((simp, r["trad"], a, r["d"], r["pos"], _f, " | ".join(r["ru"][:4]), r.get("ini", "")))
 out.sort(key=lambda x: (-x[5], len(x[0]), x[2]))
 with io.open(OUT, "w", encoding="utf-8", newline="\n") as f:
     f.write("#simplified\ttraditional\tpinyin_ascii\tpinyin_display\tpos\tfreq\tru\tinitials\n")
