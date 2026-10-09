@@ -283,26 +283,78 @@ fn ensure_phrases_file() {
     let _ = std::fs::write(path, demo);
 }
 
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+/// 自定义短语的缓存。
+///
+/// 老实现是「每敲一个键就读一遍短语文件」——还带 env::var 取路径、exists() 探测、
+/// 每次读写文件。这一项就占了每次按键 0.42ms 里的绝大部分，而且是无谓的磁盘 I/O。
+/// 现在改成内存缓存：每 1 秒最多查一次文件是否被改过，改了自动重载，
+/// 按键路径上完全不碰磁盘。
+struct PhraseCache {
+    path: String,
+    stamp: Option<std::time::SystemTime>,
+    loaded: bool,
+    last_check_ms: u64,
+    entries: Vec<(String, String, String)>, // 触发词, 中文, 俄语
+}
+static PHRASES: OnceLock<Mutex<PhraseCache>> = OnceLock::new();
+
 /// 精确匹配用户自定义短语
 pub fn phrase(trigger: &str) -> Option<Hit> {
-    ensure_phrases_file();
-    let s = std::fs::read_to_string(phrases_file()).ok()?;
-    for line in s.lines() {
-        let line = line.trim_end();
-        if line.is_empty() || line.starts_with('#') {
-            continue;
-        }
-        let c: Vec<&str> = line.split('\t').collect();
-        if c.len() < 2 {
-            continue;
-        }
-        if c[0].trim().eq_ignore_ascii_case(trigger) {
-            let word = c[1].trim().to_string();
-            let ru = c.get(2).map(|x| x.trim().to_string()).unwrap_or_default();
-            return Some(Hit { word, pinyin: trigger.to_string(), ru });
+    let cell = PHRASES.get_or_init(|| {
+        Mutex::new(PhraseCache {
+            path: phrases_file(),
+            stamp: None,
+            loaded: false,
+            last_check_ms: 0,
+            entries: Vec::new(),
+        })
+    });
+    let mut g = cell.lock().unwrap();
+
+    // 1 秒最多查一次文件有没有被改过；按键路径上不做任何 I/O
+    let now = now_ms();
+    let need_check = !g.loaded || now.saturating_sub(g.last_check_ms) >= 1000;
+    if need_check {
+        g.last_check_ms = now;
+        let stamp = std::fs::metadata(&g.path).and_then(|m| m.modified()).ok();
+        if !g.loaded || g.stamp != stamp {
+            ensure_phrases_file();
+            g.entries.clear();
+            if let Ok(s) = std::fs::read_to_string(&g.path) {
+                for line in s.lines() {
+                    let line = line.trim_end();
+                    if line.is_empty() || line.starts_with('#') {
+                        continue;
+                    }
+                    let c: Vec<&str> = line.split('\t').collect();
+                    if c.len() < 2 {
+                        continue;
+                    }
+                    let t = c[0].trim().to_string();
+                    if t.is_empty() {
+                        continue;
+                    }
+                    let word = c[1].trim().to_string();
+                    let ru = c.get(2).map(|x| x.trim().to_string()).unwrap_or_default();
+                    g.entries.push((t, word, ru));
+                }
+            }
+            g.stamp = std::fs::metadata(&g.path).and_then(|m| m.modified()).ok();
+            g.loaded = true;
         }
     }
-    None
+
+    g.entries
+        .iter()
+        .find(|(t, _, _)| t.eq_ignore_ascii_case(trigger))
+        .map(|(_, w, r)| Hit { word: w.clone(), pinyin: trigger.to_string(), ru: r.clone() })
 }
 
 /// 补全：在「拼音以 ascii 开头、且比它更长」的词条里，挑最高频的那个。

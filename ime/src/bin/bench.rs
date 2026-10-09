@@ -31,11 +31,15 @@ fn main() {
     println!("预热后 工作集 {:.1} MB / 私有 {:.1} MB", ws_mb(), priv_mb());
     println!();
     println!("{:>7}  {:>14}  {:>12}", "前缀", "平均每次", "候选数");
-    for p in ["z", "zh", "k", "n", "w", "woaini"] {
+    for p in ["z", "zh", "k", "n", "w", "woaini",
+              "womenshizhongguoren", "jintiantianqihenhao",
+              "womenshizhonghuarenmingongheguo",
+              "qingnibangwomenkanyixiazhegedianying"] {
         let t = std::time::Instant::now();
         let mut n = 0usize;
-        for _ in 0..200 { n += pangyi_ime::dict::lookup(p).len(); let _ = pangyi_ime::dict::complete(p); }
+        let iters: usize = if p.len() > 12 { 20 } else { 200 };
+        for _ in 0..iters { n += pangyi_ime::dict::lookup(p).len(); let _ = pangyi_ime::dict::complete(p); }
         let d = t.elapsed();
-        println!("{p:>7}  {:>14?}  {:>12}", d / 200, n / 200);
+        println!("{p:>36}  {:>14?}  {:>4}", d / iters as u32, n / iters);
     }
 }
