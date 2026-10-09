@@ -11,3 +11,5 @@ ime/build/*.o
 data/*.log
 data/*.err
 ime/payload/
+tools/pylibs/
+/pangyi-setup.exe

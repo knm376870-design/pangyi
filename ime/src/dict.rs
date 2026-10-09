@@ -431,7 +431,11 @@ pub fn sentence_hit(pinyin: &str) -> Option<Hit> {
     }
     Some(Hit { word, pinyin: pinyin.to_string(), ru: rus.join(" | ") })
 }
-/// (词库条数, 语言模型 bigram 条数)，给设置面板显示用
+/// (词库条数, 语言模型 bigram 条数)，给设置面板显示用。
+/// 结果缓存一次：设置面板每次重绘都会问，别每帧都扫 6MB 字符串。
 pub fn stats() -> (usize, usize) {
-    (RAW.lines().count().saturating_sub(1), LM_RAW.lines().count())
+    static S: OnceLock<(usize, usize)> = OnceLock::new();
+    *S.get_or_init(|| {
+        (RAW.lines().count().saturating_sub(1), LM_RAW.lines().count())
+    })
 }

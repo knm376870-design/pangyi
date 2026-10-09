@@ -233,16 +233,6 @@ fn install() {
     let set = dir.join(SETTINGS_NAME);
     let _ = std::fs::write(&ico, ICO);
     let _ = std::fs::write(&set, SETTINGS64);
-    // 清掉以前按版本命名的旧组件（它们锁在已开的程序里就跳过）
-    if let Ok(rd) = std::fs::read_dir(dir) {
-        for e in rd.flatten() {
-            let name = e.file_name().to_string_lossy().to_string();
-            if name.starts_with("pangyi_ime-") && name.ends_with(".dll") {
-                let _ = std::fs::remove_file(e.path());
-            }
-        }
-    }
-
     unsafe { shortcuts(); }
 
     let d64s = write_or_versioned(dir, DLL64_NAME, DLL64);
@@ -258,6 +248,24 @@ fn install() {
     let d64s = d64.to_string_lossy().to_string();
     let d32s = d32.to_string_lossy().to_string();
     let icos = ico.to_string_lossy().to_string();
+
+    // 清理历史版本的残留 DLL：只保留这一轮注册表将要指向的那两个。
+    // 关键点是放在「写完新文件之后」——这样任何时刻注册表指向的文件都在，
+    // 不会出现先删旧、后写新中间那个空窗。
+    // 仍被运行中程序占用的文件删不掉，跳过即可，下一次安装会再收一遍。
+    if let Ok(rd) = std::fs::read_dir(dir) {
+        for e in rd.flatten() {
+            let name = e.file_name().to_string_lossy().to_string();
+            if !name.starts_with("pangyi_ime") || !name.ends_with(".dll") {
+                continue;
+            }
+            let full = e.path().to_string_lossy().to_string();
+            if full.eq_ignore_ascii_case(&d64s) || full.eq_ignore_ascii_case(&d32s) {
+                continue;
+            }
+            let _ = std::fs::remove_file(e.path());
+        }
+    }
 
     // COM 注册（64 位 + 32 位）
     let clsid_key = format!("SOFTWARE\\Classes\\CLSID\\{CLSID_STR}");

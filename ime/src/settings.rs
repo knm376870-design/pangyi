@@ -225,7 +225,21 @@ unsafe extern "system" fn proc_settings(h: HWND, msg: u32, wp: WPARAM, lp: LPARA
                 }
                 y += sc(ROW_H);
             }
-            // 底部「关闭」按钮`n            let label = "关闭";`n            let (lw, lh) = measure(dc, f_text, label);`n            let bx = sc(340) - sc(PAD) - lw - sc(20);`n            let by = y + sc(6);`n            let br = RECT { left: bx, top: by, right: bx + lw + sc(20), bottom: by + lh + sc(8) };`n            let rb = CreateSolidBrush(hl);`n            let rgn = CreateRoundRectRgn(br.left, br.top, br.right, br.bottom, sc(8), sc(8));`n            FillRgn(dc, rgn, rb);`n            let _ = DeleteObject(rgn);`n            let _ = DeleteObject(rb);`n            draw(dc, f_text, text, bx + sc(10), by + sc(4), label);
+            // 底部一行：左边是词库/语言模型统计，右边是「关闭」按钮
+            let (dict_n, lm_n) = crate::dict::stats();
+            let stat = format!("词库 {dict_n} 条 · 语言模型 {lm_n} 条搭配");
+            draw(dc, f_text, faint, sc(PAD), y + sc(10), &stat);
+            let label = "关闭";
+            let (lw, lh) = measure(dc, f_text, label);
+            let bx = sc(340) - sc(PAD) - lw - sc(20);
+            let by = y + sc(6);
+            let br = RECT { left: bx, top: by, right: bx + lw + sc(20), bottom: by + lh + sc(8) };
+            let rb = CreateSolidBrush(hl);
+            let rgn = CreateRoundRectRgn(br.left, br.top, br.right, br.bottom, sc(8), sc(8));
+            FillRgn(dc, rgn, rb);
+            let _ = DeleteObject(rgn);
+            let _ = DeleteObject(rb);
+            draw(dc, f_text, text, bx + sc(10), by + sc(4), label);
             let _ = DeleteObject(f_title);
             let _ = DeleteObject(f_text);
             let _ = EndPaint(h, &ps);

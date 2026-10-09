@@ -259,6 +259,37 @@ if os.path.exists(mp):
             if len(c) >= 3 and c[0] and c[1] and c[2]:
                 manual[(c[0], c[1])] = [x.strip() for x in c[2].split(";") if x.strip()]
 manual_n = 0
+
+# 人工表里若出现 CEDICT/维基都没有的词（或读音写法对不上），也照样建行 ——
+# 人工表是权威来源，不能被静默丢掉。
+rows_by_simp = {}
+for (s, _a) in rows:
+    rows_by_simp.setdefault(s, []).append((s, _a))
+manual_only = 0
+for (simp, a), g in manual.items():
+    if not CJK.match(simp):
+        continue
+    if (simp, a) in rows:
+        continue
+    cand = rows_by_simp.get(simp, [])
+    if len(cand) == 1:
+        # 读音写法不一致（如 jie vs jie2），挂到词典已有的那个读音上
+        k = cand[0]
+        if not rows[k]["ru"]:
+            rows[k]["ru"] = list(g)
+            rows[k]["src"] = "manual"
+            manual_only += 1
+        continue
+    d = a
+    for e in by_simp.get(simp, []):
+        if e["a"] == a:
+            d = e["d"]
+            break
+    rows[(simp, a)] = {"trad": simp, "d": d, "pos": "", "ru": list(g),
+                       "src": "manual", "ini": ""}
+    manual_only += 1
+
+manual_n = 0
 for (simp, a), rec in rows.items():
     g = manual.get((simp, a))
     if not g:
@@ -269,7 +300,7 @@ for (simp, a), rec in rows.items():
     rec["src"] = "manual"
     manual_n += 1
 
-print(f"CC-CEDICT {len(entries)}（去重读音） FreeDict {len(fd)}  RU-wikt {len(rw)}  枢轴补 {pivot_n}  人工补 {manual_n}")
+print(f"CC-CEDICT {len(entries)}（去重读音） FreeDict {len(fd)}  RU-wikt {len(rw)}  枢轴补 {pivot_n}  人工补 {manual_n}（另新建 {manual_only}）")
 
 # 现代常用词加权：jieba 词频对这几个字/词低估（古典语料里反而是另一些更常见），手工校正
 FREQ_BOOST = {"帮": 8.0, "给": 2.0, "让": 2.0, "请": 1.5, "邦": 0.15, "浜": 0.05}
