@@ -44,7 +44,7 @@ def clean_ru(g):
         x = WIKI.sub(' ', x)          # 去掉维基标记 [[..]] {{..}} 和 HTML 实体
         x = re.sub(r'[\[\]{}<>]', ' ', x)
         x = re.sub(r'\s+', ' ', x).strip()
-        x = x.strip(' ,;:|·-–—')
+        x = x.strip(' ,;:|·—-–')
         if not x or DOMAIN.match(x): continue
         if not CYR.search(x): continue          # 纯转写/英文/梵文丢掉
         if x.startswith(('(', '†', 'устар', 'обл.', 'перен.')): continue

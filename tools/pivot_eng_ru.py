@@ -28,7 +28,23 @@ def clean(t):
     t = re.sub(r"<[^>]+>", "", t)
     return re.sub(r"\s+", " ", t).strip()
 
+# 英俄词典：先用 Wikdict（9.5 万词条，基于维基词典，新），再用 FreeDict 兜底
 er = {}
+n_wk = 0
+wk = os.path.join(RAW, "wikdict-en-ru.tsv")
+if os.path.exists(wk):
+    with io.open(wk, encoding="utf-8") as f:
+        for line in f:
+            if line.startswith("#"):
+                continue
+            c = line.rstrip("\n").split("\t")
+            if len(c) >= 2 and c[0] and c[1]:
+                g = [x.strip() for x in c[1].split("|") if x.strip()]
+                if g:
+                    er[c[0]] = g
+                    n_wk += 1
+
+n_fd = 0
 s = io.open(os.path.join(RAW, "eng-rus", "eng-rus.tei"), encoding="utf-8").read()
 for blk in ENTRY.findall(s):
     om = ORTH.search(blk)
@@ -37,11 +53,10 @@ for blk in ENTRY.findall(s):
     head = clean(om.group(1)).lower()
     g = [clean(q) for q in QUOTE.findall(blk)]
     g = [x for x in g if x and not x.startswith("(")]
-    if g:
-        er.setdefault(head, [])
-        for x in g:
-            if x not in er[head]:
-                er[head].append(x)
+    if g and head not in er:      # Wikdict 有的就不覆盖
+        er[head] = g
+        n_fd += 1
+print(f"英俄词典: Wikdict {n_wk} + FreeDict {n_fd} = {len(er)}")
 
 line_re = re.compile(r"^(\S+)\s+(\S+)\s+\[([^\]]*)\]\s+/(.*)/\s*$")
 STOP = re.compile(r"\([^)]*\)")
