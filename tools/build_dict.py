@@ -364,6 +364,73 @@ for (simp, a), rec in rows.items():
     rec["src"] = "english"
     eng_n += 1
 
+# ---------- Wikdict 中->俄（直连，人工编纂，质量高于机器枢轴） ----------
+# 来源：Wikdict（CC-BY-SA），从维基词典抽取的中俄翻译，15.5 万词条（已转简体）
+wik = {}
+wik_py = {}
+wp = os.path.join(RAW, "wikdict-zh-ru.tsv")
+if os.path.exists(wp):
+    with io.open(wp, encoding="utf-8") as f:
+        for line in f:
+            if line.startswith("#"):
+                continue
+            c = line.rstrip("\n").split("\t")
+            # written  pinyin  ru  score
+            if len(c) >= 3 and c[0] and c[1] and c[2]:
+                g = [x.strip() for x in c[2].split("|") if x.strip()]
+                if g:
+                    wik[c[0]] = g
+                    wik_py[c[0]] = c[1]
+print(f"Wikdict 中->俄词条: {len(wik)}")
+
+# Wikdict 是按【词】给的，不区分读音。多音字（说 shuō/shuì、重 chóng/zhòng）
+# 直接套上去会张冠李戴（说 shuì 被填成"голос"），所以只用于单音词。
+from collections import Counter as _Counter
+_reading_count = _Counter(s for (s, _a) in rows)
+
+# 只填【谁都翻不出来】的空缺：直连语料、枢轴、英文兜底都已经试过了。
+# 这样已有译文一条都不会被动，Wikdict 纯粹是净增。
+wik_n = 0
+for (simp, a), rec in rows.items():
+    if rec["ru"]:
+        continue
+    if _reading_count[simp] > 1:
+        continue          # 多音字交给读音感知的数据源
+    g = wik.get(simp)
+    if not g:
+        continue
+    rec["ru"] = g[:4]
+    rec["src"] = "wikdict"
+    wik_n += 1
+
+# Wikdict 里有、我们【完全没有】的词：直接建行
+# （拼音是导出时用 pypinyin 预生成的，build_dict 不用额外依赖）
+existing_words = {s for (s, _a) in rows}
+wik_new = 0
+for w, g in wik.items():
+    if w in existing_words:
+        continue
+    py = wik_py.get(w)
+    if not py:
+        continue
+    rows[(w, py)] = {"trad": w, "d": py, "pos": "", "ru": g[:4],
+                     "src": "wikdict-new", "ini": ""}
+    wik_new += 1
+
+# ---------- 用 Wikdict 升级机器翻的词 ----------
+# 机器枢轴(pivot/pivot-ext)和英文兜底(english)都不可靠；
+# 只要 Wikdict 有这个词，就换成人工编纂的译文。
+wik_up = 0
+for (simp, a), rec in rows.items():
+    if rec.get("src") != "english":
+        continue          # 只把"英文释义"换成俄语，别动枢轴/直连的结果
+    g = wik.get(simp)
+    if not g:
+        continue
+    rec["ru"] = g[:4]
+    rec["src"] = "wikdict-up"
+    wik_up += 1
+
 manual_n = 0
 for (simp, a), rec in rows.items():
     g = manual.get((simp, a))
@@ -375,7 +442,7 @@ for (simp, a), rec in rows.items():
     rec["src"] = "manual"
     manual_n += 1
 
-print(f"CC-CEDICT {len(entries)}（去重读音） FreeDict {len(fd)}  RU-wikt {len(rw)}  枢轴补 {pivot_n}  扩展枢轴兜底 {pivot_ext_n}  英文兜底 {eng_n}  人工补 {manual_n}（另新建 {manual_only}）")
+print(f"CC-CEDICT {len(entries)}（去重读音） FreeDict {len(fd)}  RU-wikt {len(rw)}  Wikdict直连 {wik_n}  Wikdict新建 {wik_new}  枢轴补 {pivot_n}  扩展枢轴兜底 {pivot_ext_n}  英文兜底 {eng_n}  Wikdict升级 {wik_up}  人工补 {manual_n}（另新建 {manual_only}）")
 
 # 现代常用词加权：jieba 词频对这几个字/词低估（古典语料里反而是另一些更常见），手工校正
 FREQ_BOOST = {"帮": 8.0, "给": 2.0, "让": 2.0, "请": 1.5, "邦": 0.15, "浜": 0.05}
