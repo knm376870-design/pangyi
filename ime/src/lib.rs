@@ -11,7 +11,7 @@ pub mod settings;
 
 use std::cell::{Cell, RefCell};
 use std::os::raw::c_void;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 
 use std::sync::Mutex;
 use windows::core::{implement, ComInterface, Interface, PCWSTR, Result, GUID, HRESULT};
@@ -40,6 +40,10 @@ static LIVE: AtomicU32 = AtomicU32::new(0);
 static mut COMPOSITION: Option<ITfComposition> = None;
 static mut CAND_HWND: HWND = HWND(0);
 static UI_CANDS: Mutex<Vec<(String, String)>> = Mutex::new(Vec::new());
+/// 全部候选（翻页用）以及当前页号
+static ALL_CANDS: Mutex<Vec<(String, String, String)>> = Mutex::new(Vec::new());
+static PAGE: AtomicUsize = AtomicUsize::new(0);
+const PAGE_SIZE: usize = 9;
 const S_FALSE_HR: HRESULT = HRESULT(1);
 const CLASS_E_CLASSNOTAVAILABLE_HR: HRESULT = HRESULT(0x80040111u32 as i32);
 
@@ -87,9 +91,37 @@ impl ITfTextInputProcessorEx_Impl for TextService {
     }
 }
 
+
+/// 记下这一轮的全部候选，回到第一页
+fn set_all_cands(hits: &[dict::Hit]) {
+    let mut g = ALL_CANDS.lock().unwrap();
+    g.clear();
+    g.extend(hits.iter().map(|h| (h.word.clone(), h.pinyin.clone(), h.ru.clone())));
+    PAGE.store(0, std::sync::atomic::Ordering::Relaxed);
+    refresh_page();
+}
+
+/// 把当前页的候选交给候选窗
+fn refresh_page() {
+    let all = ALL_CANDS.lock().unwrap();
+    let page = PAGE.load(std::sync::atomic::Ordering::Relaxed);
+    let start = (page * PAGE_SIZE).min(all.len());
+    let end = (start + PAGE_SIZE).min(all.len());
+    let slice = &all[start..end];
+    let items: Vec<cand::Item> = slice
+        .iter()
+        .map(|(w, p, r)| cand::Item { word: w.clone(), pinyin: p.clone(), ru: r.clone(), fresh: false })
+        .collect();
+    unsafe { cand::set_items(items); }
+    let mut ui = UI_CANDS.lock().unwrap();
+    ui.clear();
+    ui.extend(slice.iter().map(|(w, _p, r)| (w.clone(), r.clone())));
+}
+
 impl TextService {
     /// 把某个词上屏（换掉当前组合）
     fn commit_word(&self, pic: Option<&ITfContext>, word: &str) {
+        dict::note_choice(word); // 自学习：下次把这个词排前面
         if let Some(ctx) = pic {
             let session: ITfEditSession = DoneSession {
                 ctx: ctx.clone(),
@@ -112,16 +144,7 @@ impl TextService {
         unsafe { cand::set_preedit(&key); }
         unsafe { cand::set_sentence(dict::complete(&key).map(|(w, _)| w)); }
         let hits = dict::lookup(&key);
-        let items: Vec<cand::Item> = hits
-            .iter()
-            .map(|h| cand::Item { word: h.word.clone(), pinyin: h.pinyin.clone(), ru: h.ru.clone(), fresh: false })
-            .collect();
-        unsafe { cand::set_items(items); }
-        {
-            let mut g = UI_CANDS.lock().unwrap();
-            g.clear();
-            g.extend(hits.iter().map(|h| (h.word.clone(), h.ru.clone())));
-        }
+        set_all_cands(&hits);
         if let Some(ctx) = pic {
             let s: ITfEditSession = UpdateSession { text: key.encode_utf16().collect() }.into();
             let flags = TF_CONTEXT_EDIT_CONTEXT_FLAGS(TF_ES_SYNC.0 | TF_ES_READWRITE.0);
@@ -261,13 +284,7 @@ impl ITfKeyEventSink_Impl for TextService {
             unsafe { cand::set_preedit(&key); }
             unsafe { cand::set_sentence(dict::complete(&key).map(|(w, _)| w)); }
             let hits = dict::lookup(&key);
-            let items: Vec<cand::Item> = hits.iter().map(|h| cand::Item { word: h.word.clone(), pinyin: h.pinyin.clone(), ru: h.ru.clone(), fresh: false }).collect();
-            unsafe { cand::set_items(items); }
-            {
-                let mut g = UI_CANDS.lock().unwrap();
-                g.clear();
-                g.extend(hits.iter().map(|h| (h.word.clone(), h.ru.clone())));
-            }
+            set_all_cands(&hits);
             if let Some(ctx) = pic {
                 let text: Vec<u16> = key.encode_utf16().collect();
                 let sink: ITfCompositionSink = match unsafe { self.cast() } { Ok(s) => s, Err(_) => return Ok(BOOL(1)) };
@@ -339,9 +356,21 @@ impl ITfKeyEventSink_Impl for TextService {
             return Ok(BOOL(1));
         }
 
-        // PageUp / PageDown：先吃掉，别把拼音留在组合里
+        // PageUp / PageDown：翻页
         if matches!(wparam.0 as u32, 0x21 | 0x22) {
             if !has_buf { return Ok(BOOL(0)); }
+            let total = ALL_CANDS.lock().unwrap().len();
+            let pages = (total + PAGE_SIZE - 1) / PAGE_SIZE;
+            let cur = PAGE.load(std::sync::atomic::Ordering::Relaxed);
+            let next = if (wparam.0 as u32) == 0x21 {
+                cur.saturating_sub(1)
+            } else {
+                (cur + 1).min(pages.saturating_sub(1))
+            };
+            if next != cur {
+                PAGE.store(next, std::sync::atomic::Ordering::Relaxed);
+                refresh_page();
+            }
             return Ok(BOOL(1));
         }
 

@@ -46,9 +46,11 @@ def tone_mark(syl, tone):
 
 
 def parse_pinyin(num):
-    """'kai1fa1' / 'kai1 fa1' -> ('kaifa', 'kāifā')"""
-    disp = [tone_mark(s, int(d)) for s, d in re.findall(r"([A-Za-zü:ê]+)([1-5])", num or "")]
-    return "".join(PLAIN.get(c, c) for c in "".join(disp)), "".join(disp)
+    """'kai1fa1' / 'kai1 fa1' -> ('kaifa', 'kāifā', 'kf')"""
+    pairs = re.findall(r"([A-Za-zü:ê]+)([1-5])", num or "")
+    disp = [tone_mark(s, int(d)) for s, d in pairs]
+    ini = "".join((s.replace("u:", "ü")[:1]).lower() for s, _ in pairs)
+    return "".join(PLAIN.get(c, c) for c in "".join(disp)), "".join(disp), ini
 
 
 def split_marks(s):
@@ -80,7 +82,7 @@ with gzip.open(os.path.join(RAW, "cedict.txt.gz"), "rt", encoding="utf-8") as f:
         if not m:
             continue
         trad, simp, num, defs = m.group(1), m.group(2), m.group(3), m.group(4)
-        a, d = parse_pinyin(num)
+        a, d, ini = parse_pinyin(num)
         if not a:
             continue
         k = (simp, a)
@@ -91,10 +93,10 @@ with gzip.open(os.path.join(RAW, "cedict.txt.gz"), "rt", encoding="utf-8") as f:
             cur = entries[i]
             pref = set(kman.get(simp, []))
             if d in pref and cur["d"] not in pref:
-                entries[i] = {"simp": simp, "trad": trad, "a": a, "d": d, "def": defs}
+                entries[i] = {"simp": simp, "trad": trad, "a": a, "d": d, "ini": ini, "def": defs}
             continue
         seen[k] = len(entries)
-        entries.append({"simp": simp, "trad": trad, "a": a, "d": d, "def": defs})
+        entries.append({"simp": simp, "trad": trad, "a": a, "d": d, "ini": ini, "def": defs})
 by_simp = {}
 for e in entries:
     by_simp.setdefault(e["simp"], []).append(e)
@@ -149,13 +151,13 @@ with io.open(os.path.join(RAW, "jieba_dict.txt"), encoding="utf-8") as f:
 rows = {}
 
 
-def emit(simp, trad, a, d, pos="", ru=None):
+def emit(simp, trad, a, d, pos="", ru=None, ini=""):
     if not simp or not a or not CJK.match(simp):
         return
     key = (simp, a)
     cur = rows.get(key)
     if cur is None:
-        rows[key] = {"trad": trad or simp, "d": d, "pos": pos, "ru": list(ru or [])}
+        rows[key] = {"trad": trad or simp, "d": d, "pos": pos, "ru": list(ru or []), "ini": ini}
         return cur if cur else rows[key]
     if pos and not cur["pos"]:
         cur["pos"] = pos
@@ -167,7 +169,7 @@ def emit(simp, trad, a, d, pos="", ru=None):
 # 1) CC-CEDICT 每个读音一条 + FreeDict 直连
 for e in entries:
     f = fd.get(e["trad"])
-    emit(e["simp"], e["trad"], e["a"], e["d"], f[0] if f else "", f[1] if f else [])
+    emit(e["simp"], e["trad"], e["a"], e["d"], f[0] if f else "", f[1] if f else [], e.get("ini", ""))
 
 # 2) 俄语维基（直连）—— 覆盖到该词的每个读音上
 for title, (sim, tra, pint, pos, ru) in rw.items():
@@ -180,7 +182,7 @@ for title, (sim, tra, pint, pos, ru) in rw.items():
         continue
     if pint:
         # 直连来源自带读音 —— 只贴这一个读音，别污染别的读音
-        pa, pd = parse_pinyin(pint)
+        pa, pd, _pi = parse_pinyin(pint)
         reads = [(pa, pd, tra or simp)] if pa else []
     else:
         reads = [(e["a"], e["d"], e["trad"]) for e in by_simp.get(simp, [])]
@@ -265,10 +267,10 @@ print(f"CC-CEDICT {len(entries)}（去重读音） FreeDict {len(fd)}  RU-wikt {
 out = []
 for (simp, a), r in rows.items():
     if r["ru"]:
-        out.append((simp, r["trad"], a, r["d"], r["pos"], freq.get(simp, 0), " | ".join(r["ru"][:4])))
+        out.append((simp, r["trad"], a, r["d"], r["pos"], freq.get(simp, 0), " | ".join(r["ru"][:4]), r.get("ini", "")))
 out.sort(key=lambda x: (-x[5], len(x[0]), x[2]))
 with io.open(OUT, "w", encoding="utf-8", newline="\n") as f:
-    f.write("#simplified\ttraditional\tpinyin_ascii\tpinyin_display\tpos\tfreq\tru\n")
+    f.write("#simplified\ttraditional\tpinyin_ascii\tpinyin_display\tpos\tfreq\tru\tinitials\n")
     for r in out:
         f.write("\t".join(str(x) for x in r) + "\n")
 print(f"写出 {OUT}: {len(out)} 条")
