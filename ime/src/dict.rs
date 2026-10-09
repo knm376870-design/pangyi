@@ -90,6 +90,12 @@ fn index() -> &'static Index {
                 continue;
             }
             exact.push((py, line));
+            // ü 的替代拼法：中文输入法里一律用 v 打 ü（nv→女、lvxing→旅行、falv→法律）。
+            // 词典里存的是 ü，不建这条别名的话这 500 多个词永远敲不出来。
+            if py.contains('ü') {
+                let alt: &'static str = Box::leak(py.replace('ü', "v").into_boxed_str());
+                exact.push((alt, line));
+            }
             total_freq += line_freq(line) as f64;
             if !ini_key.is_empty() {
                 ini.push((ini_key, line));

@@ -13,7 +13,6 @@ use windows::Win32::System::LibraryLoader::LoadLibraryW;
 use windows::Win32::UI::Input::KeyboardAndMouse::*;
 use windows::Win32::UI::TextServices::*;
 use windows::Win32::UI::WindowsAndMessaging::*;
-use windows::Win32::System::Threading::GetCurrentThreadId;
 
 const OUR_CLSID: GUID = GUID::from_u128(0xB4E8F2A1_7C3D_4E5F_9A21_8D6C4B3E1F07);
 const OUR_PROFILE: GUID = GUID::from_u128(0x5A7C9E12_3D4B_4F8A_B6E1_2C9D7A5E8F34);
@@ -30,6 +29,16 @@ static mut QUEUE: Vec<u16> = Vec::new();
 static mut LOG: String = String::new();
 static mut PROFILES: Option<ITfInputProcessorProfiles> = None;
 static mut R1: String = String::new();
+/// 截图模式：打完字后原地停住（消息循环照常跑，候选窗能正常绘制）
+static mut HOLD: bool = false;
+static mut HOLD_UNTIL: u64 = 0;
+
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
 
 fn wide(s: &str) -> Vec<u16> { s.encode_utf16().chain(std::iter::once(0)).collect() }
 fn logline(s: &str) { unsafe { LOG.push_str(s); LOG.push('\n'); } }
@@ -43,25 +52,18 @@ unsafe fn clear_edit() {
     let e = wide("");
     SendMessageW(EDIT, WM_SETTEXT, WPARAM(0), LPARAM(e.as_ptr() as isize));
 }
-/// 抢前台。直接 SetForegroundWindow 经常被系统的"前台锁定"拒掉，
-/// 标准做法是先把自己的输入队列挂到当前前台线程上。
+/// 抢前台（先抬到顶层再设焦点，多试几次）
 unsafe fn focus_ours() {
-    for _ in 0..12 {
+    for _ in 0..8 {
         if GetForegroundWindow() == MAIN { break; }
-        let fg = GetForegroundWindow();
-        let tid_fg = if fg.0 == 0 { 0 } else { GetWindowThreadProcessId(fg, None) };
-        let tid_me = GetCurrentThreadId();
-        if tid_fg != 0 && tid_fg != tid_me {
-            let _ = AttachThreadInput(tid_me, tid_fg, true);
-            let _ = SetForegroundWindow(MAIN);
-            let _ = AttachThreadInput(tid_me, tid_fg, false);
-        } else {
-            let _ = SetForegroundWindow(MAIN);
-        }
+        let _ = SetWindowPos(MAIN, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW);
+        let _ = SetForegroundWindow(MAIN);
         let _ = BringWindowToTop(MAIN);
         SetFocus(EDIT);
         std::thread::sleep(std::time::Duration::from_millis(120));
     }
+    let _ = SetWindowPos(MAIN, HWND_NOTOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE);
+    SetFocus(EDIT);
 }
 
 unsafe fn send_one(vk: u16) {
@@ -90,6 +92,7 @@ unsafe fn activate(clsid: &GUID, profile: &GUID, who: &str) {
 unsafe fn tick(h: HWND) {
     let qlen = QUEUE.len();
     if (PHASE == 1 || PHASE == 5) && QI < qlen {
+        // 最后一个键发完再多等一拍，让候选窗完成绘制
         let vk = QUEUE[QI];
         QI += 1;
         if QI == 1 { focus_ours(); }
@@ -113,9 +116,26 @@ unsafe fn tick(h: HWND) {
             PHASE = 1;
             logline("--- 第 1 轮：真实按键 kaifa + 空格 ---");
         }
+        9 => {
+            // 截图模式：保持候选窗可见，等外部截完图
+            if now_ms() < HOLD_UNTIL {
+                return;
+            }
+            let t = text_of();
+            logline(&format!("截图模式结果: [{t}]"));
+            std::fs::write(OUT, LOG.as_bytes()).ok();
+            DestroyWindow(h);
+        }
         1 => {
             R1 = text_of();
             logline(&format!("第 1 轮结果: [{R1}]  出字={}", R1.contains('开')));
+            if HOLD {
+                // 留着候选窗，先别切走
+                HOLD_UNTIL = now_ms() + 25000;
+                PHASE = 9;
+                logline("截图模式：候选窗保持显示 25 秒");
+                return;
+            }
             activate(&MS_CLSID, &MS_PROFILE, "微软拼音");
             PHASE = 3;
         }
@@ -152,6 +172,7 @@ extern "system" fn wndproc(h: HWND, msg: u32, w: WPARAM, l: LPARAM) -> LRESULT {
 
 fn main() -> Result<()> {
     unsafe {
+        HOLD = std::env::args().any(|a| a == "hold");
         let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
         let md = wide("Msftedit.dll");
         let _ = LoadLibraryW(PCWSTR(md.as_ptr()));
