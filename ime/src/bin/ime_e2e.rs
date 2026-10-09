@@ -13,6 +13,7 @@ use windows::Win32::System::LibraryLoader::LoadLibraryW;
 use windows::Win32::UI::Input::KeyboardAndMouse::*;
 use windows::Win32::UI::TextServices::*;
 use windows::Win32::UI::WindowsAndMessaging::*;
+use windows::Win32::System::Threading::GetCurrentThreadId;
 
 const OUR_CLSID: GUID = GUID::from_u128(0xB4E8F2A1_7C3D_4E5F_9A21_8D6C4B3E1F07);
 const OUR_PROFILE: GUID = GUID::from_u128(0x5A7C9E12_3D4B_4F8A_B6E1_2C9D7A5E8F34);
@@ -42,7 +43,26 @@ unsafe fn clear_edit() {
     let e = wide("");
     SendMessageW(EDIT, WM_SETTEXT, WPARAM(0), LPARAM(e.as_ptr() as isize));
 }
-unsafe fn focus_ours() { SetForegroundWindow(MAIN); SetFocus(EDIT); }
+/// 抢前台。直接 SetForegroundWindow 经常被系统的"前台锁定"拒掉，
+/// 标准做法是先把自己的输入队列挂到当前前台线程上。
+unsafe fn focus_ours() {
+    for _ in 0..12 {
+        if GetForegroundWindow() == MAIN { break; }
+        let fg = GetForegroundWindow();
+        let tid_fg = if fg.0 == 0 { 0 } else { GetWindowThreadProcessId(fg, None) };
+        let tid_me = GetCurrentThreadId();
+        if tid_fg != 0 && tid_fg != tid_me {
+            let _ = AttachThreadInput(tid_me, tid_fg, true);
+            let _ = SetForegroundWindow(MAIN);
+            let _ = AttachThreadInput(tid_me, tid_fg, false);
+        } else {
+            let _ = SetForegroundWindow(MAIN);
+        }
+        let _ = BringWindowToTop(MAIN);
+        SetFocus(EDIT);
+        std::thread::sleep(std::time::Duration::from_millis(120));
+    }
+}
 
 unsafe fn send_one(vk: u16) {
     let mut ins = [INPUT::default(); 2];
