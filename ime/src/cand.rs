@@ -2,7 +2,7 @@
 //! 同一套配色/字体/间距/圆角；竖排为「序号 中文 拼音 俄语」四列对齐，
 //! 横排为「序号 中文」一行排开、当前项的拼音与俄语另起一行。
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicIsize, AtomicUsize, Ordering};
 use windows::core::{PCWSTR, w};
 use windows::Win32::Foundation::*;
 use windows::Win32::Graphics::Gdi::*;
@@ -21,9 +21,27 @@ static SENTENCE: Mutex<Option<String>> = Mutex::new(None);
 static SEL: AtomicUsize = AtomicUsize::new(0);
 static DARK: AtomicBool = AtomicBool::new(true);
 static HORIZONTAL: AtomicBool = AtomicBool::new(false);
-static mut WND: HWND = HWND(0);
-static mut DPI: i32 = 96;
-static mut BG: HBRUSH = HBRUSH(0);
+// 句柄和 DPI 是全进程共享的（同一进程里可能有好几个线程在用输入法），
+// 原来用 static mut 属于数据竞争 —— 换成原子量。
+static WND: AtomicIsize = AtomicIsize::new(0);
+static DPI: AtomicI32 = AtomicI32::new(96);
+
+fn hwnd() -> HWND {
+    HWND(WND.load(Ordering::Relaxed))
+}
+
+fn set_hwnd(h: HWND) {
+    WND.store(h.0, Ordering::Relaxed);
+}
+
+/// 窗口还活着吗？
+/// 关键：候选窗是在「第一次激活输入法」的那个线程上创建的，
+/// 那个线程一退出，窗口就被销毁，但句柄还留在全局变量里 ——
+/// 这就是"切过去候选窗再也不出现"的原因。所以每次用之前都要验一次。
+pub unsafe fn alive() -> bool {
+    let h = hwnd();
+    h.0 != 0 && IsWindow(h).as_bool()
+}
 
 // ---- 青简配色（palette.rs 一字不差）----
 struct Palette {
@@ -68,8 +86,9 @@ pub fn is_dark() -> bool {
     DARK.load(Ordering::Relaxed)
 }
 
-pub unsafe fn dpi() -> i32 {
-    if DPI <= 0 { 96 } else { DPI }
+pub fn dpi() -> i32 {
+    let d = DPI.load(Ordering::Relaxed);
+    if d <= 0 { 96 } else { d }
 }
 
 pub fn horizontal() -> bool {
@@ -83,14 +102,13 @@ pub unsafe fn set_horizontal(v: bool) {
 
 /// 设置改了以后让候选窗按新配置重画/重新量尺寸。
 pub unsafe fn refresh_settings() {
-    if WND.0 != 0 {
-        let _ = InvalidateRect(WND, None, TRUE);
+    if alive() {
+        let _ = InvalidateRect(hwnd(), None, TRUE);
     }
 }
 
 fn sc(px: i32) -> i32 {
-    let d = unsafe { if DPI <= 0 { 96 } else { DPI } };
-    (px * d) / 96
+    (px * dpi()) / 96
 }
 
 fn font(px: i32) -> HFONT {
@@ -246,15 +264,22 @@ pub unsafe fn detect_theme() {
     }
     let dc = GetDC(None);
     if dc.0 != 0 {
-        DPI = GetDeviceCaps(dc, LOGPIXELSY);
+        DPI.store(GetDeviceCaps(dc, LOGPIXELSY), Ordering::Relaxed);
         let _ = ReleaseDC(None, dc);
     }
-    if DPI <= 0 { DPI = 96; }
+    if DPI.load(Ordering::Relaxed) <= 0 { DPI.store(96, Ordering::Relaxed); }
     crate::settings::load();
 }
 
 unsafe extern "system" fn proc_cand(h: HWND, msg: u32, w: WPARAM, l: LPARAM) -> LRESULT {
     match msg {
+        // 我们自己把整块客户区画满，不让系统擦背景，避免闪一下白
+        WM_ERASEBKGND => LRESULT(1),
+        // 窗口被销毁（宿主线程退出等）：把句柄清掉，下次要显示时会重建
+        WM_DESTROY | WM_NCDESTROY => {
+            if hwnd().0 == h.0 { set_hwnd(HWND(0)); }
+            LRESULT(0)
+        }
         WM_PAINT => {
             let mut ps = PAINTSTRUCT::default();
             let dc = BeginPaint(h, &mut ps);
@@ -388,24 +413,29 @@ unsafe extern "system" fn proc_cand(h: HWND, msg: u32, w: WPARAM, l: LPARAM) -> 
 }
 
 pub unsafe fn init() {
-    if WND.0 != 0 { return; }
+    if alive() { return; }
+    // 句柄已经失效（建窗线程没了）：清掉重新建
+    if WND.load(Ordering::Relaxed) != 0 { set_hwnd(HWND(0)); }
     detect_theme();
-    let p = palette(crate::settings::dark(DARK.load(Ordering::Relaxed)));
-    BG = CreateSolidBrush(p.background);
     let hinst = windows::Win32::System::LibraryLoader::GetModuleHandleW(None).unwrap();
     let cls: Vec<u16> = "PangyiCandModern\0".encode_utf16().collect();
     let wc = WNDCLASSW {
         lpfnWndProc: Some(proc_cand),
         lpszClassName: PCWSTR(cls.as_ptr()),
         hInstance: hinst.into(),
-        hbrBackground: BG,
+        // 背景全部由 WM_PAINT 自己画；类背景给空刷子，再吃掉 WM_ERASEBKGND，避免闪白
+        hbrBackground: HBRUSH(0),
         ..Default::default()
     };
-    let hr = RegisterClassW(&wc);    let title: Vec<u16> = "旁译候选\0".encode_utf16().collect();
-    WND = CreateWindowExW(
+    // 同一个进程里重复注册会失败，无所谓，类已经在了
+    let _ = RegisterClassW(&wc);
+    let title: Vec<u16> = "旁译候选\0".encode_utf16().collect();
+    let h = CreateWindowExW(
         WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE | WS_EX_TOPMOST,
         PCWSTR(cls.as_ptr()), PCWSTR(title.as_ptr()), WS_POPUP,
-        0, 0, sc(400), sc(40), None, None, hinst, None);}
+        0, 0, sc(400), sc(40), None, None, hinst, None);
+    set_hwnd(h);
+}
 
 pub unsafe fn set_items(items: Vec<Item>) {
     { let mut g = ITEMS.lock().unwrap(); *g = items; }
@@ -420,7 +450,7 @@ pub unsafe fn select(i: usize) {
     let n = ITEMS.lock().unwrap().len();
     if n > 0 {
         SEL.store(i.min(n - 1), Ordering::Relaxed);
-        if WND.0 != 0 { let _ = InvalidateRect(WND, None, TRUE); }
+        if alive() { let _ = InvalidateRect(hwnd(), None, TRUE); }
     }
 }
 
@@ -440,16 +470,21 @@ pub unsafe fn at(i: usize) -> Option<String> {
 pub unsafe fn count() -> usize { ITEMS.lock().unwrap().len() }
 
 pub unsafe fn show_at(x: i32, y: i32) {
-    if WND.0 == 0 { return; }
-    let n = ITEMS.lock().unwrap().len().min(crate::settings::max_cands());    if n == 0 { hide(); return; }
-    let dc = GetDC(WND);
+    // 每次显示前都确认窗口还在：宿主进程换了线程、原来的窗口没了就重建一个，
+    // 而不是直接 return（那会让候选窗永久消失）
+    if !alive() { init(); }
+    if !alive() { return; }
+    let h = hwnd();
+    let n = ITEMS.lock().unwrap().len().min(crate::settings::max_cands());
+    if n == 0 { hide(); return; }
+    let dc = GetDC(h);
     let (mut cw, mut ch) = (sc(400), sc(40));
     if dc.0 != 0 {
         let items = ITEMS.lock().unwrap();
         let lay = compute_layout(dc, &items);
         cw = lay.width;
         ch = lay.height;
-        let _ = ReleaseDC(WND, dc);
+        let _ = ReleaseDC(h, dc);
     }
     // 夹进屏幕：右边超出就左移，下方放不下就翻到光标上方
     let sw = GetSystemMetrics(SM_CXSCREEN);
@@ -460,16 +495,16 @@ pub unsafe fn show_at(x: i32, y: i32) {
     if py + ch > sh - 4 { py = (y - ch - sc(30)).max(0); }
     if py < 0 { py = 0; }
     let rgn = CreateRoundRectRgn(0, 0, cw + 1, ch + 1, sc(RADIUS) * 2, sc(RADIUS) * 2);
-    let _ = SetWindowRgn(WND, rgn, TRUE);
+    let _ = SetWindowRgn(h, rgn, TRUE);
     // 只在“从隐藏变显示”的那一次抬高到置顶带的最前面（保证能盖住置顶窗口），
     // 后续按键只挪位置、不动 z 序——每次按键都抢顶层会让某些宿主丢焦点、上屏失败。
-    let was_visible = IsWindowVisible(WND).as_bool();
+    let was_visible = IsWindowVisible(h).as_bool();
     if was_visible {
-        let _ = SetWindowPos(WND, HWND(0), px, py, cw, ch, SWP_NOZORDER | SWP_NOACTIVATE | SWP_SHOWWINDOW);
+        let _ = SetWindowPos(h, HWND(0), px, py, cw, ch, SWP_NOZORDER | SWP_NOACTIVATE | SWP_SHOWWINDOW);
     } else {
-        let _ = SetWindowPos(WND, HWND_TOPMOST, px, py, cw, ch, SWP_NOACTIVATE | SWP_SHOWWINDOW);
+        let _ = SetWindowPos(h, HWND_TOPMOST, px, py, cw, ch, SWP_NOACTIVATE | SWP_SHOWWINDOW);
     }
-    let _ = InvalidateRect(WND, None, TRUE);
+    let _ = InvalidateRect(h, None, TRUE);
 }
 
-pub unsafe fn hide() { if WND.0 != 0 { let _ = ShowWindow(WND, SW_HIDE); } }
+pub unsafe fn hide() { if alive() { let _ = ShowWindow(hwnd(), SW_HIDE); } }

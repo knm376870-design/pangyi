@@ -14,11 +14,11 @@ use std::os::raw::c_void;
 use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 
 use std::sync::Mutex;
-use windows::core::{implement, ComInterface, Interface, PCWSTR, Result, GUID, HRESULT};
+use windows::core::{implement, ComInterface, Result, GUID, HRESULT};
 use windows::Win32::Foundation::RECT;
 use windows::Win32::Graphics::Gdi::*;
 use windows::Win32::UI::WindowsAndMessaging::*;
-use windows::Win32::Foundation::{BOOL, CLASS_E_NOAGGREGATION, E_FAIL, E_POINTER, COLORREF, HWND, LPARAM, LRESULT, POINT, S_OK, TRUE, WPARAM};
+use windows::Win32::Foundation::{BOOL, CLASS_E_NOAGGREGATION, E_FAIL, E_POINTER, LPARAM, POINT, S_OK, WPARAM};
 use windows::Win32::System::Com::{IClassFactory, IClassFactory_Impl};
 use windows::Win32::UI::TextServices::{
     ITfContext, ITfKeyEventSink, ITfKeyEventSink_Impl, ITfKeystrokeMgr, ITfTextInputProcessor_Impl,
@@ -37,8 +37,21 @@ pub const CLSID_PANGYI: GUID = GUID::from_u128(0xB4E8F2A1_7C3D_4E5F_9A21_8D6C4B3
 pub const GUID_PROFILE: GUID = GUID::from_u128(0x5A7C9E12_3D4B_4F8A_B6E1_2C9D7A5E8F34);
 
 static LIVE: AtomicU32 = AtomicU32::new(0);
-static mut COMPOSITION: Option<ITfComposition> = None;
-static mut CAND_HWND: HWND = HWND(0);
+/// 当前活动组合。一个进程里可能有好几个线程在用输入法，这块是进程级状态，
+/// 原来写成 static mut 属于数据竞争 —— 改成互斥量。
+///
+/// ITfComposition 是 Apartment 模型的 COM 对象，windows-rs 没给它实现 Send，
+/// 但它只会在创建它的那个线程（TSF 的编辑会话回调线程）上被使用，
+/// 真正的并发安全由里面的 Mutex 保证，所以这里包一层放行编译器。
+struct CompSlot(Mutex<Option<ITfComposition>>);
+unsafe impl Send for CompSlot {}
+unsafe impl Sync for CompSlot {}
+impl CompSlot {
+    fn lock(&self) -> std::sync::LockResult<std::sync::MutexGuard<'_, Option<ITfComposition>>> {
+        self.0.lock()
+    }
+}
+static COMPOSITION: CompSlot = CompSlot(Mutex::new(None));
 static UI_CANDS: Mutex<Vec<(String, String)>> = Mutex::new(Vec::new());
 /// 全部候选（翻页用）以及当前页号
 static ALL_CANDS: Mutex<Vec<(String, String, String)>> = Mutex::new(Vec::new());
@@ -47,16 +60,37 @@ const PAGE_SIZE: usize = 9;
 const S_FALSE_HR: HRESULT = HRESULT(1);
 const CLASS_E_CLASSNOTAVAILABLE_HR: HRESULT = HRESULT(0x80040111u32 as i32);
 
+/// 写诊断日志。默认关闭 —— 每敲一个键都写文件会明显拖慢输入。
+/// 需要排查时在 %LOCALAPPDATA%\Pangyi\settings.txt 里加一行 debug=1。
 fn log(msg: &str) {
+    if !crate::settings::debug() {
+        return;
+    }
     use std::io::Write;
+    let path = r"C:\ProgramData\Pangyi\ime.log";
     let _ = std::fs::create_dir_all(r"C:\ProgramData\Pangyi");
+    // 别让它无限长：超过 4MB 就重新开一个
+    if let Ok(m) = std::fs::metadata(path) {
+        if m.len() > 4 * 1024 * 1024 {
+            let _ = std::fs::remove_file(path);
+        }
+    }
     if let Ok(mut f) = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
-        .open(r"C:\ProgramData\Pangyi\ime.log")
+        .open(path)
     {
         let _ = writeln!(f, "[pid {}] {msg}", std::process::id());
     }
+}
+
+/// 热路径（每次按键）上用的日志：关掉时连字符串都不拼，零开销。
+macro_rules! dlog {
+    ($($arg:tt)*) => {
+        if crate::settings::debug() {
+            log(&format!($($arg)*));
+        }
+    };
 }
 
 // ============================ 文本服务 ============================
@@ -65,14 +99,33 @@ fn log(msg: &str) {
 struct TextService {
     client_id: Cell<u32>,
     tid: Cell<u32>,
-    tm: Cell<*mut c_void>,
+    /// 保持线程管理器 / 按键管理器的引用计数，别存裸指针
+    tm: RefCell<Option<ITfThreadMgr>>,
+    keystroke: RefCell<Option<ITfKeystrokeMgr>>,
+    /// ITfThreadMgrEventSink 的订阅 cookie，Deactivate 时必须撤掉
+    tmsink_cookie: Cell<u32>,
     advised: Cell<bool>,
+    /// 是否处于 Activate..Deactivate 之间。只有为真才允许挂按键接收器。
+    active: Cell<bool>,
+    /// 上一次尝试挂接收器的时间（毫秒）。用时间节流代替"重试 N 次就放弃"：
+    /// 连接点被占满时我们要一直有机会重试，但不能每来一次焦点事件就猛打一次。
+    last_advise_ms: Cell<u32>,
     buf: RefCell<String>,
 }
 
 impl TextService {
     fn new() -> Self {
-        Self { client_id: Cell::new(0), tid: Cell::new(0), tm: Cell::new(std::ptr::null_mut()), advised: Cell::new(false), buf: RefCell::new(String::new()) }
+        Self {
+            client_id: Cell::new(0),
+            tid: Cell::new(0),
+            tm: RefCell::new(None),
+            keystroke: RefCell::new(None),
+            tmsink_cookie: Cell::new(0),
+            advised: Cell::new(false),
+            active: Cell::new(false),
+            last_advise_ms: Cell::new(0),
+            buf: RefCell::new(String::new()),
+        }
     }
 }
 
@@ -92,30 +145,42 @@ impl ITfTextInputProcessorEx_Impl for TextService {
 }
 
 
-/// 记下这一轮的全部候选，回到第一页
+/// 记下这一轮的全部候选，回到第一页。
+///
+/// 注意：这里必须先把 ALL_CANDS 的锁放掉再调 refresh_page()。
+/// 之前是「持着锁直接调 refresh_page()」，而 refresh_page 也要锁 ALL_CANDS ——
+/// std::sync::Mutex 不可重入，于是敲第一个字母就把输入线程锁死，
+/// 表现就是"切到旁译之后打不出字，得重新开一个程序才行"。
 fn set_all_cands(hits: &[dict::Hit]) {
-    let mut g = ALL_CANDS.lock().unwrap();
-    g.clear();
-    g.extend(hits.iter().map(|h| (h.word.clone(), h.pinyin.clone(), h.ru.clone())));
+    {
+        let mut g = ALL_CANDS.lock().unwrap();
+        g.clear();
+        g.extend(hits.iter().map(|h| (h.word.clone(), h.pinyin.clone(), h.ru.clone())));
+    }
     PAGE.store(0, std::sync::atomic::Ordering::Relaxed);
     refresh_page();
 }
 
-/// 把当前页的候选交给候选窗
+/// 把当前页的候选交给候选窗。
+/// 先在锁里把这一页拷出来，出了锁再去动 UI / 窗口，避免任何嵌套加锁。
 fn refresh_page() {
-    let all = ALL_CANDS.lock().unwrap();
-    let page = PAGE.load(std::sync::atomic::Ordering::Relaxed);
-    let start = (page * PAGE_SIZE).min(all.len());
-    let end = (start + PAGE_SIZE).min(all.len());
-    let slice = &all[start..end];
-    let items: Vec<cand::Item> = slice
-        .iter()
-        .map(|(w, p, r)| cand::Item { word: w.clone(), pinyin: p.clone(), ru: r.clone(), fresh: false })
-        .collect();
+    let (items, ui) = {
+        let all = ALL_CANDS.lock().unwrap();
+        let page = PAGE.load(std::sync::atomic::Ordering::Relaxed);
+        let start = (page * PAGE_SIZE).min(all.len());
+        let end = (start + PAGE_SIZE).min(all.len());
+        let slice = &all[start..end];
+        let items: Vec<cand::Item> = slice
+            .iter()
+            .map(|(w, p, r)| cand::Item { word: w.clone(), pinyin: p.clone(), ru: r.clone(), fresh: false })
+            .collect();
+        let ui: Vec<(String, String)> = slice.iter().map(|(w, _p, r)| (w.clone(), r.clone())).collect();
+        (items, ui)
+    };
     unsafe { cand::set_items(items); }
-    let mut ui = UI_CANDS.lock().unwrap();
-    ui.clear();
-    ui.extend(slice.iter().map(|(w, _p, r)| (w.clone(), r.clone())));
+    let mut u = UI_CANDS.lock().unwrap();
+    u.clear();
+    u.extend(ui);
 }
 
 impl TextService {
@@ -137,7 +202,7 @@ impl TextService {
     fn refresh_composition(&self, pic: Option<&ITfContext>) {
         let key = self.buf.borrow().clone();
         if key.is_empty() {
-            unsafe { COMPOSITION = None; }
+            *COMPOSITION.lock().unwrap() = None;
             unsafe { cand_hide(); }
             return;
         }
@@ -155,79 +220,171 @@ impl TextService {
 
 impl TextService {
     fn activate(&self, ptim: Option<&ITfThreadMgr>, tid: u32) -> Result<()> {
-        log("Activate");
+        // TSF 有时会连着发两次 Activate；重复挂 sink 必定失败，第二次直接忽略
+        if self.active.get() {
+            return Ok(());
+        }
+        // 先读设置：log() 要靠 settings::debug() 决定要不要写，顺序不能反
         unsafe { settings::load(); }
-        // 后台把词典索引建好，避免第一次打字时卡一下
-        std::thread::spawn(|| {
-            let _ = dict::lookup("kaifa");
+        log("Activate");
+
+        // 后台预热词典索引，避免第一次打字时卡一下（只跑一次）
+        static WARMED: std::sync::Once = std::sync::Once::new();
+        WARMED.call_once(|| {
+            std::thread::spawn(|| {
+                let _ = dict::lookup("kaifa");
+            });
         });
-        if let Some(tm) = ptim {
-            unsafe {
-                self.tid.set(tid);
-                // TSF 要的是 TfClientId（用 CLSID 换），不是线程 ID。
-                // 传错会导致 AdviseKeyEventSink 返回 0x80040201（事件无法调用任何订户）。
-                match tm.cast::<ITfClientId>() {
-                    Ok(ci) => match ci.GetClientId(&CLSID_PANGYI) {
-                        Ok(cid) => { self.client_id.set(cid); log(&format!("TfClientId={cid}")); }
-                        Err(e) => log(&format!("GetClientId 失败 {e:?}")),
-                    },
-                    Err(e) => log(&format!("拿不到 ITfClientId: {e:?}")),
+
+        // 新会话开始：把上一次留下的状态清干净，否则上一个窗口的拼音串会漏进来
+        self.buf.borrow_mut().clear();
+        UI_CANDS.lock().unwrap().clear();
+        ALL_CANDS.lock().unwrap().clear();
+        PAGE.store(0, Ordering::Relaxed);
+        *COMPOSITION.lock().unwrap() = None;
+        unsafe { cand_hide(); }
+
+        let Some(tm) = ptim else {
+            log("Activate: 没拿到 ITfThreadMgr，按键接收器挂不上");
+            return Ok(());
+        };
+        self.tid.set(tid);
+
+        // TSF 要的是 TfClientId（用 CLSID 换），不是线程 ID。
+        // 传错会导致 AdviseKeyEventSink 返回 0x80040201（事件无法调用任何订户）。
+        match tm.cast::<ITfClientId>() {
+            Ok(ci) => match unsafe { ci.GetClientId(&CLSID_PANGYI) } {
+                Ok(cid) => {
+                    self.client_id.set(cid);
+                    dlog!("TfClientId={cid}");
                 }
-                self.tm.set(tm.as_raw());
-                let tmsink: ITfThreadMgrEventSink = self.cast()?;
-                match tm.cast::<ITfSource>() {
-                    Ok(src) => match src.AdviseSink(&ITfThreadMgrEventSink::IID, &tmsink) {
-                        Ok(cookie) => log(&format!("AdviseSink(ThreadMgrEventSink) ok cookie={cookie}")),
-                        Err(e) => log(&format!("AdviseSink 调用失败 {e:?}")),
-                    },
-                    Err(e) => log(&format!("拿不到 ITfSource: {e:?}")),
+                Err(e) => dlog!("GetClientId 失败 {e:?}"),
+            },
+            Err(e) => dlog!("拿不到 ITfClientId: {e:?}"),
+        }
+
+        // 订阅线程管理器事件（焦点变化）。cookie 要留着，Deactivate 必须撤掉，
+        // 否则停用之后焦点事件还会打到我们身上。
+        if let Ok(tmsink) = unsafe { self.cast::<ITfThreadMgrEventSink>() } {
+            if let Ok(src) = tm.cast::<ITfSource>() {
+                match unsafe { src.AdviseSink(&ITfThreadMgrEventSink::IID, &tmsink) } {
+                    Ok(cookie) => {
+                        self.tmsink_cookie.set(cookie);
+                        dlog!("AdviseSink(ThreadMgrEventSink) ok cookie={cookie}");
+                    }
+                    Err(e) => dlog!("AdviseSink 调用失败 {e:?}"),
                 }
-                self.advise_key_sink();
-                if CAND_HWND.0 == 0 { cand_init(); }
             }
         }
+
+        *self.tm.borrow_mut() = Some(tm.clone());
+        if let Ok(ks) = tm.cast::<ITfKeystrokeMgr>() {
+            *self.keystroke.borrow_mut() = Some(ks);
+        }
+
+        self.active.set(true);
+        self.advised.set(false);
+        self.last_advise_ms.set(0);
+        // 按键接收器只在这里挂 —— 这是 TSF 规定唯一正确的时机
+        self.advise_key_sink();
+        unsafe { cand_init(); }
         Ok(())
     }
 
-    /// 挂（或重挂）按键接收器。焦点变化时会再调一次。
+    /// 挂按键接收器。
+    ///
+    /// 这里必须严格区分「已激活」和「只是焦点变了」：
+    /// 老代码在 Deactivate 之后仍然会走到这里（`advised` 被重置成 false 却没真的
+    /// Unadvise），于是每次焦点变化都去挂一次、每次都被 TSF 拒绝
+    /// （0x80040201 = 事件无法调用任何订户），日志被刷了 1700 多条；
+    /// 而且一旦某次挂载失败，这个进程里的按键就再也进不来 —— 表现就是
+    /// 「输入法切过去了但打不出字，得重新开一个程序才行」。
     fn advise_key_sink(&self) {
-        if self.advised.get() {
-            return;   // 已经挂过就不重复挂：TSF 对同一 sink 二次 Advise 会返回 0x80040201
+        if !self.active.get() || self.advised.get() { return; }
+        if self.client_id.get() == 0 { return; }
+        // 节流 300ms：焦点事件可能来得很密，别每个都真去挂一遍
+        let now = now_ms32();
+        if self.last_advise_ms.get() != 0 && now.wrapping_sub(self.last_advise_ms.get()) < 300 {
+            return;
         }
-        let raw = self.tm.get();
-        if raw.is_null() { return; }
-        unsafe {
-            let tm = std::mem::ManuallyDrop::new(ITfThreadMgr::from_raw(raw));
-            let Ok(ks) = tm.cast::<ITfKeystrokeMgr>() else { return };
-            let Ok(sink) = self.cast::<ITfKeyEventSink>() else { return };
-            let cid = self.client_id.get();
-            match ks.AdviseKeyEventSink(cid, &sink, BOOL(1)) {
-                Ok(()) => { log(&format!("AdviseKeyEventSink ok (TfClientId={cid})")); self.advised.set(true); }
-                Err(e) => log(&format!("AdviseKeyEventSink 失败 cid={cid} {e:?}")),
+        self.last_advise_ms.set(now);
+
+        let ks = self.keystroke.borrow();
+        let Some(ks) = ks.as_ref() else { return };
+        let Ok(sink) = (unsafe { self.cast::<ITfKeyEventSink>() }) else { return };
+        let cid = self.client_id.get();
+
+        let mut attempt = unsafe { ks.AdviseKeyEventSink(cid, &sink, BOOL(1)) };
+        if let Err(e) = &attempt {
+            // 0x80040201 = CONNECT_E_ADVISELIMIT：连接点已经被占满了。
+            // 实测第一次挂载经常就是这个 —— 说明有上一次没撤干净的订阅还占着槽位
+            // （老版本 Deactivate 从来不清订阅，所以这里会一直挂不上，
+            //   该进程的按键就再也进不来 —— 也就是"切过去了但打不出字"）。
+            // 对策：先用同一个 clientId 撤一次，再挂。
+            dlog!("AdviseKeyEventSink 被占满，先撤再挂 cid={cid} {e:?}");
+            let _ = unsafe { ks.UnadviseKeyEventSink(cid) };
+            attempt = unsafe { ks.AdviseKeyEventSink(cid, &sink, BOOL(1)) };
+        }
+        match attempt {
+            Ok(()) => {
+                dlog!("AdviseKeyEventSink ok (TfClientId={cid})");
+                self.advised.set(true);
             }
+            Err(e) => dlog!("AdviseKeyEventSink 失败 cid={cid} {e:?}"),
         }
     }
 
     fn deactivate(&self) -> Result<()> {
         log("Deactivate");
+        // 先落闸：之后任何焦点事件都不允许再挂接收器
+        self.active.set(false);
 
-        // 关键：切走再切回来会重新 Activate，必须允许重新挂按键接收器。
-        // 之前这里没复位，导致"切换回来后按键全部漏给应用"。
-        self.advised.set(false);
+        // 1) 撤按键接收器。老版本只把 advised 置回 false 却不撤，
+        //    TSF 那边的订阅还留着，切回来时行为就不确定了。
+        if self.advised.get() {
+            if let Some(ks) = self.keystroke.borrow().as_ref() {
+                let _ = unsafe { ks.UnadviseKeyEventSink(self.client_id.get()) };
+            }
+            self.advised.set(false);
+        }
+
+        // 2) 撤线程管理器事件订阅，否则停用后焦点变化还会打进来
+        let cookie = self.tmsink_cookie.replace(0);
+        if cookie != 0 {
+            if let Some(tm) = self.tm.borrow().as_ref() {
+                if let Ok(src) = tm.cast::<ITfSource>() {
+                    let _ = unsafe { src.UnadviseSink(cookie) };
+                }
+            }
+        }
+
+        // 3) 释放引用、清会话状态
+        self.keystroke.borrow_mut().take();
+        self.tm.borrow_mut().take();
+        self.buf.borrow_mut().clear();
+        UI_CANDS.lock().unwrap().clear();
+        ALL_CANDS.lock().unwrap().clear();
+        PAGE.store(0, Ordering::Relaxed);
+        *COMPOSITION.lock().unwrap() = None;
+        unsafe { cand_hide(); }
         Ok(())
     }
 }
 
 impl ITfCompositionSink_Impl for TextService {
     fn OnCompositionTerminated(&self, _ec: u32, _c: Option<&ITfComposition>) -> Result<()> {
-        unsafe { COMPOSITION = None; }
+        *COMPOSITION.lock().unwrap() = None;
         Ok(())
     }
 }
 
 impl ITfKeyEventSink_Impl for TextService {
     fn OnSetFocus(&self, fg: BOOL) -> Result<()> {
-        if !fg.as_bool() {
+        if fg.as_bool() {
+            // 焦点回来了：只在「已激活但接收器没挂上」时补挂一次（自愈）。
+            // 已经挂好就是空操作 —— 老代码在这里无条件重挂，是失败刷屏的来源。
+            self.advise_key_sink();
+        } else {
             // 只收候选窗；不要动组合——实测清组合会让上屏丢字
             unsafe { cand_hide(); }
         }
@@ -241,11 +398,11 @@ impl ITfKeyEventSink_Impl for TextService {
         }
         let has_buf = !self.buf.borrow().is_empty();
         let want = claim(wparam, has_buf, crate::settings::english());
-        log(&format!("KeySink::OnTestKeyDown wparam={} 我要={want}", wparam.0));
+        dlog!("KeySink::OnTestKeyDown wparam={} 我要={want}", wparam.0);
         Ok(BOOL(want as i32))
     }
     fn OnTestKeyUp(&self, _pic: Option<&ITfContext>, w: WPARAM, _l: LPARAM) -> Result<BOOL> {
-        log(&format!("KeySink::OnTestKeyUp wparam={}", w.0));
+        dlog!("KeySink::OnTestKeyUp wparam={}", w.0);
         Ok(BOOL(0))
     }
     fn OnKeyUp(&self, _pic: Option<&ITfContext>, w: WPARAM, _l: LPARAM) -> Result<BOOL> {
@@ -260,13 +417,13 @@ impl ITfKeyEventSink_Impl for TextService {
         Ok(BOOL(0))
     }
     fn OnPreservedKey(&self, _pic: Option<&ITfContext>, g: *const GUID) -> Result<BOOL> {
-        log(&format!("KeySink::OnPreservedKey guid={g:?}"));
+        dlog!("KeySink::OnPreservedKey guid={g:?}");
         Ok(BOOL(0))
     }
 
     fn OnKeyDown(&self, pic: Option<&ITfContext>, wparam: WPARAM, _lp: LPARAM) -> Result<BOOL> {
         let ch = wparam.0 as u8 as char;
-        log(&format!("KeySink::OnKeyDown wparam={} ch={ch:?}", wparam.0));
+        dlog!("KeySink::OnKeyDown wparam={} ch={ch:?}", wparam.0);
 
         // 单独按一下 Shift = 切换中/英（没有状态条了，用这个切）
         if wparam.0 == 0x10 {
@@ -341,7 +498,7 @@ impl ITfKeyEventSink_Impl for TextService {
             self.buf.borrow_mut().clear();
             UI_CANDS.lock().unwrap().clear();
             unsafe { cand_hide(); }
-            log(&format!("上屏 word={:?}", w));
+            dlog!("上屏 word={:?}", w);
             if let Some(w) = w { self.commit_word(pic, &w); }
             return Ok(BOOL(1));
         }
@@ -352,7 +509,7 @@ impl ITfKeyEventSink_Impl for TextService {
             self.buf.borrow_mut().clear();
             UI_CANDS.lock().unwrap().clear();
             unsafe { cand_hide(); }
-            unsafe { COMPOSITION = None; }
+            *COMPOSITION.lock().unwrap() = None;
             return Ok(BOOL(1));
         }
 
@@ -447,8 +604,8 @@ impl ITfEditSession_Impl for CommitSession {
                 None => return Ok(()),
             };
             match range.SetText(ec, 0, &self.text) {
-                Ok(()) => log(&format!("DoEditSession 上屏成功 {} 字", self.text.len())),
-                Err(e) => log(&format!("DoEditSession SetText 失败 {e:?}")),
+                Ok(()) => dlog!("DoEditSession 上屏成功 {} 字", self.text.len()),
+                Err(e) => dlog!("DoEditSession SetText 失败 {e:?}"),
             }
         }
         Ok(())
@@ -526,7 +683,8 @@ impl ITfThreadMgrEventSink_Impl for TextService {
         Ok(())
     }
     fn OnSetFocus(&self, _focus: Option<&ITfDocumentMgr>, _prev: Option<&ITfDocumentMgr>) -> Result<()> {
-        // 焦点变化非常频繁，不能每次都写日志（会把日志刷爆）
+        // 焦点变化非常频繁，不能写日志（会把日志刷爆）。
+        // 注意：这里的重挂只在 active && !advised 时才会真的发生，见 advise_key_sink。
         self.advise_key_sink();
         Ok(())
     }
@@ -541,61 +699,9 @@ impl ITfThreadMgrEventSink_Impl for TextService {
 }
 // ============================ 候选窗 ============================
 
-unsafe extern "system" fn cand_proc(h: HWND, msg: u32, w: WPARAM, l: LPARAM) -> LRESULT {
-    match msg {
-        WM_PAINT => {
-            let mut ps = PAINTSTRUCT::default();
-            let dc = BeginPaint(h, &mut ps);
-            let mut rc = RECT::default();
-            let _ = GetClientRect(h, &mut rc);
-            let bg = CreateSolidBrush(COLORREF(0x00342a1e));
-            FillRect(dc, &rc, bg);
-            let _ = DeleteObject(bg);
-            SetBkMode(dc, TRANSPARENT);
-            let font = CreateFontW(-20, 0, 0, 0, 500, 0, 0, 0, 134, 0, 0, 0, 0,
-                windows::core::w!("Microsoft YaHei UI"));
-            let old = SelectObject(dc, font);
-            let list = UI_CANDS.lock().unwrap();
-            for (i, (word, ru)) in list.iter().take(9).enumerate() {
-                let y = 5 + (i as i32) * 32;
-                SetTextColor(dc, COLORREF(0x0066a2f7));
-                let a: Vec<u16> = format!("{}", i + 1).encode_utf16().collect();
-                TextOutW(dc, 12, y, &a);
-                SetTextColor(dc, COLORREF(0x00f0e9e9));
-                let bw: Vec<u16> = word.encode_utf16().collect();
-                TextOutW(dc, 40, y, &bw);
-                SetTextColor(dc, COLORREF(0x00ffa6c3));
-                let br: Vec<u16> = ru.replace('|', "·").encode_utf16().collect();
-                TextOutW(dc, 160, y, &br);
-            }
-            let _ = SelectObject(dc, old);
-            let _ = DeleteObject(font);
-            let _ = EndPaint(h, &ps);
-            LRESULT(0)
-        }
-        _ => DefWindowProcW(h, msg, w, l),
-    }
-}
-
+/// 候选窗实现已经全部搬进 cand 模块；这里只留一个入口。
 unsafe fn cand_init() {
     cand::init();
-    return;
-    #[allow(unreachable_code)]
-    let hinst = windows::Win32::System::LibraryLoader::GetModuleHandleW(None).unwrap();
-    let cls: Vec<u16> = "PangyiCandW\0".encode_utf16().collect();
-    let wc = WNDCLASSW {
-        lpfnWndProc: Some(cand_proc),
-        lpszClassName: PCWSTR(cls.as_ptr()),
-        hInstance: hinst.into(),
-        hbrBackground: HBRUSH(6isize),
-        ..Default::default()
-    };
-    RegisterClassW(&wc);
-    let title: Vec<u16> = "旁译\0".encode_utf16().collect();
-    CAND_HWND = CreateWindowExW(
-        WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE | WS_EX_TOPMOST,
-        PCWSTR(cls.as_ptr()), PCWSTR(title.as_ptr()), WS_POPUP,
-        0, 0, 620, 320, None, None, hinst, None);
 }
 
 unsafe fn cand_update(x: i32, y: i32) {
@@ -623,9 +729,10 @@ impl ITfEditSession_Impl for CompSession {
             self.ctx.GetSelection(ec, 0, &mut sel, &mut n)?;
             if n == 0 { return Ok(()); }
 
-            let have = COMPOSITION.as_ref().is_some();
+            let have = COMPOSITION.lock().unwrap().is_some();
             let range = if have {
-                match COMPOSITION.as_ref().unwrap().GetRange() {
+                let g = COMPOSITION.lock().unwrap();
+                match g.as_ref().unwrap().GetRange() {
                     Ok(r) => r,
                     Err(_) => return Ok(()),
                 }
@@ -636,13 +743,16 @@ impl ITfEditSession_Impl for CompSession {
             if !have {
                 if let Ok(cc) = self.ctx.cast::<ITfContextComposition>() {
                     if let Ok(comp) = cc.StartComposition(ec, &range, &self.sink) {
-                        COMPOSITION = Some(comp);
+                        *COMPOSITION.lock().unwrap() = Some(comp);
                     }
                 }
             }
-            if let Some(comp) = COMPOSITION.as_ref() {
-                if let Ok(r) = comp.GetRange() {
-                    let _ = r.SetText(ec, 0, &self.text);
+            {
+                let g = COMPOSITION.lock().unwrap();
+                if let Some(comp) = g.as_ref() {
+                    if let Ok(r) = comp.GetRange() {
+                        let _ = r.SetText(ec, 0, &self.text);
+                    }
                 }
             }
 
@@ -651,9 +761,9 @@ impl ITfEditSession_Impl for CompSession {
             if let Ok(view) = self.ctx.GetActiveView() {
                 let mut rc = RECT::default();
                 let mut clipped = BOOL(0);
-                let r2 = COMPOSITION.as_ref().and_then(|c| c.GetRange().ok()).unwrap_or(range);
+                let r2 = COMPOSITION.lock().unwrap().as_ref().and_then(|c| c.GetRange().ok()).unwrap_or(range);
                 if view.GetTextExt(ec, &r2, &mut rc, &mut clipped).is_ok() {
-                    log(&format!("候选窗定位: 文本范围 {} ,{}", rc.left, rc.bottom));
+                    dlog!("候选窗定位: 文本范围 {} ,{}", rc.left, rc.bottom);
                     *PENDING_CAND.lock().unwrap() = Some((rc.left, rc.bottom + 6));
                     placed = true;
                 } else {
@@ -672,7 +782,7 @@ impl ITfEditSession_Impl for CompSession {
                         y = pt.y + 26;
                     }
                 }
-                log(&format!("候选窗定位: 光标 {x},{y}"));
+                dlog!("候选窗定位: 光标 {x},{y}");
                 *PENDING_CAND.lock().unwrap() = Some((x, y));
             }
         }
@@ -692,12 +802,12 @@ impl ITfEditSession_Impl for DoneSession {
         unsafe {
             // 换字 + 结束组合放在同一次会话里（拆成两次会让某些宿主把文字丢掉）
             let mut wrote = false;
-            if let Some(comp) = COMPOSITION.take() {
+            if let Some(comp) = COMPOSITION.lock().unwrap().take() {
                 if let Ok(r) = comp.GetRange() {
                     wrote = r.SetText(ec, 0, &self.text).is_ok();
                 }
                 let hr = comp.EndComposition(ec);
-                log(&format!("上屏: SetText={wrote} EndComposition -> {hr:?}"));
+                dlog!("上屏: SetText={wrote} EndComposition -> {hr:?}");
             } else {
                 log("上屏: 没有活动组合");
             }
@@ -716,7 +826,8 @@ struct UpdateSession {
 impl ITfEditSession_Impl for UpdateSession {
     fn DoEditSession(&self, ec: u32) -> Result<()> {
         unsafe {
-            if let Some(comp) = COMPOSITION.as_ref() {
+            let g = COMPOSITION.lock().unwrap();
+            if let Some(comp) = g.as_ref() {
                 if let Ok(r) = comp.GetRange() {
                     let _ = r.SetText(ec, 0, &self.text);
                 }
@@ -734,10 +845,11 @@ struct EndSession {
 impl ITfEditSession_Impl for EndSession {
     fn DoEditSession(&self, ec: u32) -> Result<()> {
         unsafe {
-            log(&format!("EndSession: 有组合={}", COMPOSITION.as_ref().is_some()));
-            if let Some(comp) = COMPOSITION.take() {
+            let mut g = COMPOSITION.lock().unwrap();
+            dlog!("EndSession: 有组合={}", g.is_some());
+            if let Some(comp) = g.take() {
                 let hr = comp.EndComposition(ec);
-                log(&format!("EndSession: EndComposition -> {hr:?}"));
+                dlog!("EndSession: EndComposition -> {hr:?}");
             }
         }
         Ok(())
@@ -745,8 +857,5 @@ impl ITfEditSession_Impl for EndSession {
 }
 
 unsafe fn end_composition() {
-    if COMPOSITION.is_some() {
-        // 用一个空内容的上屏会话把它收掉
-        COMPOSITION = None;
-    }
+    *COMPOSITION.lock().unwrap() = None;
 }

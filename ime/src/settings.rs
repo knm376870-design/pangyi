@@ -13,6 +13,8 @@ static FONT_SCALE: AtomicI32 = AtomicI32::new(100);
 static HORIZONTAL: AtomicBool = AtomicBool::new(false);
 static ENGLISH: AtomicBool = AtomicBool::new(false);
 static THEME: AtomicI32 = AtomicI32::new(0); // 0 跟随系统 / 1 浅色 / 2 深色
+/// 调试日志开关。默认关 —— 开着的话每敲一个键都要写一次文件，会明显拖慢输入。
+static DEBUG: AtomicBool = AtomicBool::new(false);
 
 static STANDALONE: AtomicBool = AtomicBool::new(false);
 static mut WND: HWND = HWND(0);
@@ -47,6 +49,7 @@ pub fn load() {
                 "theme" => if let Ok(n) = v.parse::<i32>() {
                     THEME.store(n.clamp(0, 2), Ordering::Relaxed);
                 },
+                "debug" => DEBUG.store(v == "1" || v.eq_ignore_ascii_case("true"), Ordering::Relaxed),
                 _ => {}
             }
         }
@@ -59,13 +62,19 @@ pub fn save() {
         let _ = std::fs::create_dir_all(dir);
     }
     let body = format!(
-        "max={}\nscale={}\nlayout={}\ntheme={}\nenglish={}\n",
+        "max={}\nscale={}\nlayout={}\ntheme={}\nenglish={}\ndebug={}\n",
         max_cands(), font_scale(),
         if horizontal() { "h" } else { "v" },
         THEME.load(Ordering::Relaxed),
-        if english() { 1 } else { 0 }
+        if english() { 1 } else { 0 },
+        if debug() { 1 } else { 0 }
     );
     let _ = std::fs::write(path, body);
+}
+
+/// 是否写调试日志（排查问题时把 settings.txt 里 debug 改成 1）
+pub fn debug() -> bool {
+    DEBUG.load(Ordering::Relaxed)
 }
 
 pub fn english() -> bool {

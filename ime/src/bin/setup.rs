@@ -303,9 +303,10 @@ fn install() {
     reg_set_dword(HKEY_LOCAL_MACHINE, &un, "NoModify", 1);
     reg_set_dword(HKEY_LOCAL_MACHINE, &un, "NoRepair", 1);
 
-    // 清掉用户级覆盖（会盖住 HKLM）
-    let hkcu = format!("Software\\Classes\\CLSID\\{CLSID_STR}");
-    reg_del_tree(HKEY_CURRENT_USER, &hkcu);
+    // 清掉用户级覆盖（会盖住 HKLM）——64 位和 32 位两处都要清
+    reg_del_tree(HKEY_CURRENT_USER, &format!("Software\\Classes\\CLSID\\{CLSID_STR}"));
+    reg_del_tree(HKEY_CURRENT_USER, &format!("Software\\Classes\\WOW6432Node\\CLSID\\{CLSID_STR}"));
+    reg_del_tree(HKEY_CURRENT_USER, &format!("Software\\Classes\\WOW6432Node\\CLSID\\{CLSID_STR}"));
 
     msg(
         "旁译 安装完成",
