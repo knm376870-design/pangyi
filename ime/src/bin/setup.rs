@@ -205,24 +205,50 @@ unsafe fn shortcuts() {
     let public_desktop = r"C:\Users\Public\Desktop\旁译 设置.lnk";
     make_shortcut(public_desktop, &set, DIR);
 }
+
+/// 写组件；如果目标文件被正在运行的程序占用，就换个带时间戳的名字写，
+/// 再把注册表指过去（否则升级会"装了个寂寞"）。
+fn write_or_versioned(dir: &Path, name: &str, data: &[u8]) -> String {
+    let p = dir.join(name);
+    if std::fs::write(&p, data).is_ok() {
+        return p.to_string_lossy().to_string();
+    }
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let stem = name.trim_end_matches(".dll");
+    let alt = dir.join(format!("{stem}-{stamp}.dll"));
+    let _ = std::fs::write(&alt, data);
+    alt.to_string_lossy().to_string()
+}
+
 fn install() {
     let dir = Path::new(DIR);
     if std::fs::create_dir_all(dir).is_err() {
         msg("旁译 安装失败", "无法创建安装目录。");
         return;
     }
-    let d64 = dir.join(DLL64_NAME);
-    let d32 = dir.join(DLL32_NAME);
     let ico = dir.join(ICO_NAME);
     let set = dir.join(SETTINGS_NAME);
-    if std::fs::write(&d64, DLL64).is_err()
-        || std::fs::write(&d32, DLL32).is_err()
-        || std::fs::write(&ico, ICO).is_err()
-        || std::fs::write(&set, SETTINGS64).is_err()
-    {
-        msg("旁译 安装失败", "复制组件失败。");
-        return;
+    let _ = std::fs::write(&ico, ICO);
+    let _ = std::fs::write(&set, SETTINGS64);
+    // 清掉以前按版本命名的旧组件（它们锁在已开的程序里就跳过）
+    if let Ok(rd) = std::fs::read_dir(dir) {
+        for e in rd.flatten() {
+            let name = e.file_name().to_string_lossy().to_string();
+            if name.starts_with("pangyi_ime-") && name.ends_with(".dll") {
+                let _ = std::fs::remove_file(e.path());
+            }
+        }
     }
+
+    unsafe { shortcuts(); }
+
+    let d64s = write_or_versioned(dir, DLL64_NAME, DLL64);
+    let d32s = write_or_versioned(dir, DLL32_NAME, DLL32);
+    let d64 = std::path::PathBuf::from(&d64s);
+    let d32 = std::path::PathBuf::from(&d32s);
     // 把自己也放进安装目录，卸载时用得上
     if let Ok(me) = std::env::current_exe() {
         let _ = std::fs::copy(me, dir.join("pangyi-setup.exe"));
@@ -268,18 +294,6 @@ fn install() {
     reg_set(HKEY_LOCAL_MACHINE, &un, "UninstallString", &uninstall_cmd);
     reg_set_dword(HKEY_LOCAL_MACHINE, &un, "NoModify", 1);
     reg_set_dword(HKEY_LOCAL_MACHINE, &un, "NoRepair", 1);
-
-    // 清掉以前按版本命名的旧组件（它们锁在已开的程序里就跳过）
-    if let Ok(rd) = std::fs::read_dir(dir) {
-        for e in rd.flatten() {
-            let name = e.file_name().to_string_lossy().to_string();
-            if name.starts_with("pangyi_ime-") && name.ends_with(".dll") {
-                let _ = std::fs::remove_file(e.path());
-            }
-        }
-    }
-
-    unsafe { shortcuts(); }
 
     // 清掉用户级覆盖（会盖住 HKLM）
     let hkcu = format!("Software\\Classes\\CLSID\\{CLSID_STR}");

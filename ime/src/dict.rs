@@ -19,6 +19,7 @@ struct Index {
     initials: HashMap<&'static str, Vec<&'static str>>,
     ini_keys: Vec<&'static str>,
     learned: Mutex<HashMap<String, u32>>,
+    total_freq: f64,
 }
 
 fn learned_file() -> String {
@@ -63,6 +64,7 @@ pub fn note_choice(word: &str) {
 fn index() -> &'static Index {
     static IDX: OnceLock<Index> = OnceLock::new();
     IDX.get_or_init(|| {
+        let mut total_freq = 0.0f64;
         let mut exact: HashMap<&'static str, Vec<&'static str>> = HashMap::new();
         let mut initials: HashMap<&'static str, Vec<&'static str>> = HashMap::new();
         for line in RAW.lines().skip(1) {
@@ -75,6 +77,7 @@ fn index() -> &'static Index {
                 continue;
             }
             exact.entry(py).or_default().push(line);
+            total_freq += line_freq(line) as f64;
             if let Some(ini) = c.get(7) {
                 if !ini.is_empty() {
                     initials.entry(ini).or_default().push(line);
@@ -85,7 +88,7 @@ fn index() -> &'static Index {
         keys.sort_unstable();
         let mut ini_keys: Vec<&'static str> = initials.keys().copied().collect();
         ini_keys.sort_unstable();
-        Index { exact, keys, initials, ini_keys, learned: Mutex::new(load_learned()) }
+        Index { exact, keys, initials, ini_keys, learned: Mutex::new(load_learned()), total_freq: total_freq.max(1.0) }
     })
 }
 
@@ -159,7 +162,7 @@ pub fn lookup(ascii: &str) -> Vec<Hit> {
     // 整句候选放最前面（打字长的拼音时）
     // 整句切词现在只用词典词频，效果不稳（会出错的句子），先不进候选；
     // 等接上真正的语料 bigram 语言模型再打开。
-    if false && ascii.chars().count() >= 5 {
+    if ascii.chars().count() >= 5 {
         if let Some(s) = sentence_hit(ascii) {
             if s.word.chars().count() >= 2 {
                 out.insert(0, s);
@@ -213,7 +216,52 @@ pub fn complete(ascii: &str) -> Option<(String, String)> {
         (c[0].to_string(), c[3].to_string())
     })
 }
-// ---------------- 整句转换（词典频次 + 动态规划） ----------------
+
+// ---------------- 语言模型（词 bigram，语料训练） ----------------
+static LM_RAW: &str = include_str!("lm.tsv");
+static LM_UNI_RAW: &str = include_str!("lm_uni.tsv");
+
+type UniMap = std::collections::HashMap<&'static str, u32>;
+
+fn lm_uni() -> &'static UniMap {
+    static U: OnceLock<UniMap> = OnceLock::new();
+    U.get_or_init(|| {
+        let mut m = UniMap::default();
+        for line in LM_UNI_RAW.lines() {
+            let mut it = line.split('\t');
+            if let (Some(a), Some(b)) = (it.next(), it.next()) {
+                if let Ok(n) = b.trim().parse::<u32>() {
+                    m.insert(a, n);
+                }
+            }
+        }
+        m
+    })
+}
+
+type LmMap = std::collections::HashMap<(&'static str, &'static str), u32>;
+
+fn lm() -> &'static LmMap {
+    static LM: OnceLock<LmMap> = OnceLock::new();
+    LM.get_or_init(|| {
+        let mut m = LmMap::default();
+        for line in LM_RAW.lines() {
+            let mut it = line.split('\t');
+            if let (Some(a), Some(b), Some(c)) = (it.next(), it.next(), it.next()) {
+                if let Ok(n) = c.trim().parse::<u32>() {
+                    m.insert((a, b), n);
+                }
+            }
+        }
+        m
+    })
+}
+
+/// 两个词连在一起出现过多少次（语言模型的核心）
+fn bigram_count(a: &str, b: &str) -> u32 {
+    lm().get(&(a, b)).copied().unwrap_or(0)
+}
+// ---------------- 整句转换（词典频次 + 动态规划 + 语料 bigram） ----------------
 //
 // 讯飞/微软拼音那种"打一整句拼音、直接出句子"。
 // 这里不用神经网络，用词频做动态规划切词——离线、快、够用。
@@ -266,7 +314,24 @@ pub fn sentence(pinyin: &str) -> Option<Vec<Hit>> {
             //   + 12*(字数-1) —— 长词强偏好
             //   - 8（单字）   —— 单字词频被"作为字的频率"抬高了，必须压一压，
             //                    否则 jintiantianqihenhao 会被切成"进/提/按..."
-            let score = cur.0 + freq.ln() + 12.0 * (wlen - 1.0) - if wlen <= 1.0 { 8.0 } else { 0.0 };
+            // 语言模型：P(词 | 上一个词)，没见过的搭配回退到词自身概率。
+            let prev = cur.1.last().map(|l| line_word(l)).unwrap_or("");
+            let word = line_word(line);
+            let p_uni = (freq / idx.total_freq).max(1e-12);
+            let p = if prev.is_empty() {
+                p_uni
+            } else {
+                let u = lm_uni().get(prev).copied().unwrap_or(0);
+                let b = bigram_count(prev, word);
+                if u > 0 && b > 0 {
+                    0.75 * (b as f64 / u as f64) + 0.25 * p_uni
+                } else {
+                    p_uni * 0.02 // 语料里没见过这两个词连用：打折
+                }
+            };
+            let score = cur.0 + p.ln() + 2.5 * (wlen - 1.0)
+                - if wlen <= 1.0 { 5.0 } else { 0.0 }
+                - if freq < 120.0 { 6.0 } else { 0.0 };
             let end = i + len;
             if best[end].as_ref().map(|(s, _)| score > *s).unwrap_or(true) {
                 let mut seq = cur.1.clone();

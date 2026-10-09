@@ -183,6 +183,13 @@ for title, (sim, tra, pint, pos, ru) in rw.items():
     if pint:
         # 直连来源自带读音 —— 只贴这一个读音，别污染别的读音
         pa, pd, _pi = parse_pinyin(pint)
+    # 校验：这个拼音必须真的是这个字的读音（不然会出现"你们/ni"这种错行）
+    if pa and sim and (sim, pa) not in rows:
+        cands = [k[1] for k in rows.keys() if k[0] == sim]
+        if len(cands) == 1:
+            pa = cands[0]
+        else:
+            continue
         reads = [(pa, pd, tra or simp)] if pa else []
     else:
         reads = [(e["a"], e["d"], e["trad"]) for e in by_simp.get(simp, [])]
