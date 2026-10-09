@@ -18,6 +18,9 @@ struct Index {
     keys: Vec<&'static str>,
     initials: HashMap<&'static str, Vec<&'static str>>,
     ini_keys: Vec<&'static str>,
+    /// 1~2 个字母的前缀 -> 该前缀下词频最高的那条
+    /// （最多 26 + 26*26 = 702 条，用来避免每敲一个键都去扫几千个拼音键）
+    comp: HashMap<&'static str, &'static str>,
     learned: Mutex<HashMap<String, u32>>,
     total_freq: f64,
 }
@@ -84,20 +87,65 @@ fn index() -> &'static Index {
                 }
             }
         }
+        // 预先算好 1~2 字母前缀的最佳补全。
+        // 没有这张表的话，敲 "z" 要遍历所有以 z 开头的拼音键（几千个），
+        // 每敲一个字母就要多花 1ms 左右 —— 这就是之前"打字卡"的主因之一。
+        let mut comp: HashMap<&'static str, &'static str> = HashMap::new();
+        for (k, lines) in exact.iter() {
+            let klen = k.chars().count();
+            if klen < 2 {
+                continue;   // 单字母键自己就是"精确匹配"，不做补全
+            }
+            let best = match lines.iter().max_by_key(|l| line_score(l)) {
+                Some(l) => *l,
+                None => continue,
+            };
+            for plen in [1usize, 2usize] {
+                if klen == plen {
+                    continue;   // 和前缀等长的键属于"精确匹配"，不算补全
+                }
+                let pref = prefix_chars(k, plen);
+                let cur = comp.entry(pref).or_insert(best);
+                if line_score(best) > line_score(cur) {
+                    *cur = best;
+                }
+            }
+        }
+
         let mut keys: Vec<&'static str> = exact.keys().copied().collect();
         keys.sort_unstable();
         let mut ini_keys: Vec<&'static str> = initials.keys().copied().collect();
         ini_keys.sort_unstable();
-        Index { exact, keys, initials, ini_keys, learned: Mutex::new(load_learned()), total_freq: total_freq.max(1.0) }
+        Index { exact, keys, initials, ini_keys, comp, learned: Mutex::new(load_learned()), total_freq: total_freq.max(1.0) }
     })
 }
 
-fn hit_of(line: &'static str) -> Option<Hit> {
-    let c: Vec<&str> = line.split('\t').collect();
-    if c.len() < 7 {
-        return None;
+/// 补全用的打分：词频为主，长度做微调
+/// 取前 n 个「字符」组成的切片。
+/// 注意拼音里有 ü，是多字节字符，绝不能按字节下标切。
+fn prefix_chars(k: &str, n: usize) -> &str {
+    match k.char_indices().nth(n) {
+        Some((i, _)) => &k[..i],
+        None => k,
     }
-    Some(Hit { word: c[0].into(), pinyin: c[3].into(), ru: c[6].into() })
+}
+
+fn line_score(line: &str) -> u64 {
+    line_freq(line) * 10 + line_word(line).chars().count() as u64
+}
+
+fn hit_of(line: &'static str) -> Option<Hit> {
+    // 直接用迭代器取需要的列：原来 split().collect() 会给每一行分配一个 Vec，
+    // 而这里每敲一个字母要被调用几十次
+    let mut it = line.split('\t');
+    let word = it.next()?;
+    let _trad = it.next()?;
+    let _py = it.next()?;
+    let disp = it.next()?;
+    let _pos = it.next()?;
+    let _freq = it.next()?;
+    let ru = it.next().unwrap_or("");
+    Some(Hit { word: word.into(), pinyin: disp.into(), ru: ru.into() })
 }
 
 fn push_lines(lines: &[&'static str], out: &mut Vec<Hit>, cap: usize) {
@@ -183,6 +231,9 @@ pub fn lookup(ascii: &str) -> Vec<Hit> {
             std::cmp::Reverse(c)
         });
     }
+    // 候选窗一页 9 个，留 3 页足够；再多的候选每敲一个键都要被克隆好几遍，
+    // 对体验没有任何帮助，纯浪费。
+    out.truncate(27);
     out
 }
 
@@ -236,6 +287,16 @@ pub fn complete(ascii: &str) -> Option<(String, String)> {
         return None;
     }
     let idx = index();
+    // 1~2 个字母：直接查预算表，O(1)，不用扫几千个键
+    if ascii.chars().count() <= 2 {
+        if let Some(line) = idx.comp.get(ascii) {
+            let mut it = line.split('\t');
+            let w = it.next().unwrap_or("").to_string();
+            let d = it.nth(2).unwrap_or("").to_string();
+            return Some((w, d));
+        }
+        // 表里没有（比如带 ü 的拼音）就照旧走扫描，行为不变
+    }
     let start = idx.keys.partition_point(|k| *k < ascii);
     let mut best: Option<(u64, &'static str)> = None;
     for key in idx.keys[start..].iter() {
@@ -247,13 +308,14 @@ pub fn complete(ascii: &str) -> Option<(String, String)> {
         }
         if let Some(lines) = idx.exact.get(key) {
             for line in lines {
-                let c: Vec<&str> = line.split('\t').collect();
-                if c.len() < 7 {
-                    continue;
-                }
-                let freq: u64 = c[5].parse().unwrap_or(0);
-                let wlen = c[0].chars().count() as u64;
-                let score = freq * 10 + wlen;
+                // 只取第 0 列（词）和第 5 列（词频），不再为每行分配 Vec
+                let mut it = line.split('\t');
+                let word = it.next().unwrap_or("");
+                let freq: u64 = match it.nth(4).and_then(|s| s.parse().ok()) {
+                    Some(f) => f,
+                    None => continue,
+                };
+                let score = freq * 10 + word.chars().count() as u64;
                 if best.map(|(s, _)| score > s).unwrap_or(true) {
                     best = Some((score, line));
                 }
@@ -261,8 +323,10 @@ pub fn complete(ascii: &str) -> Option<(String, String)> {
         }
     }
     best.map(|(_, line)| {
-        let c: Vec<&str> = line.split('\t').collect();
-        (c[0].to_string(), c[3].to_string())
+        let mut it = line.split('\t');
+        let w = it.next().unwrap_or("").to_string();
+        let d = it.nth(2).unwrap_or("").to_string();
+        (w, d)
     })
 }
 
@@ -321,8 +385,7 @@ fn bigram_count(a: &str, b: &str) -> u32 {
 // 这里不用神经网络，用词频做动态规划切词——离线、快、够用。
 
 fn line_freq(line: &str) -> u64 {
-    let c: Vec<&str> = line.split('\t').collect();
-    c.get(5).and_then(|s| s.parse().ok()).unwrap_or(0)
+    line.split('\t').nth(5).and_then(|s| s.parse().ok()).unwrap_or(0)
 }
 
 fn line_word(line: &str) -> &str {
@@ -330,8 +393,7 @@ fn line_word(line: &str) -> &str {
 }
 
 fn line_ru(line: &str) -> &str {
-    let c: Vec<&str> = line.split('\t').collect();
-    c.get(6).copied().unwrap_or("")
+    line.split('\t').nth(6).unwrap_or("")
 }
 
 /// 把一串无声调拼音切成词，返回最优切分（至少两个词才算整句）。
@@ -431,6 +493,17 @@ pub fn sentence_hit(pinyin: &str) -> Option<Hit> {
     }
     Some(Hit { word, pinyin: pinyin.to_string(), ru: rus.join(" | ") })
 }
+/// 预热：把词典索引 + 语言模型一次性建好。
+///
+/// 这两块都是「每个进程一份」的重量级结构（词典 6 万条、bigram 20 万条）。
+/// 老版本是在用户打到第 3 个字母时才临时构建，那一下会明显卡顿，
+/// 而每换一个程序都要重新来一遍。现在改成激活时丢到后台线程先建好。
+pub fn warmup() {
+    let _ = lookup("kaifa");
+    let _ = complete("kaif");
+    let _ = sentence("nihaoshijie");
+}
+
 /// (词库条数, 语言模型 bigram 条数)，给设置面板显示用。
 /// 结果缓存一次：设置面板每次重绘都会问，别每帧都扫 6MB 字符串。
 pub fn stats() -> (usize, usize) {

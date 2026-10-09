@@ -211,7 +211,7 @@ unsafe extern "system" fn proc_settings(h: HWND, msg: u32, wp: WPARAM, lp: LPARA
 
             let f_title = font(14);
             let f_text = font(12);
-            draw(dc, f_title, text, sc(PAD), sc(12), "旁译 · 设置");
+            draw(dc, f_title, text, sc(PAD), sc(12), &format!("旁译 · 设置   v{}", env!("CARGO_PKG_VERSION")));
 
             let mut y = sc(48);
             for (label, opts) in rows() {
@@ -364,7 +364,7 @@ unsafe fn init() {
         ..Default::default()
     };
     RegisterClassW(&wc);
-    let title: Vec<u16> = "旁译 设置\0".encode_utf16().collect();
+    let title: Vec<u16> = format!("旁译 设置  v{}\0", env!("CARGO_PKG_VERSION")).encode_utf16().collect();
     // 普通窗口：有标题栏、有关闭按钮，能正常关掉
     WND = CreateWindowExW(
         WINDOW_EX_STYLE(0),

@@ -223,6 +223,54 @@ fn write_or_versioned(dir: &Path, name: &str, data: &[u8]) -> String {
     alt.to_string_lossy().to_string()
 }
 
+/// 把旧版本的所有痕迹清掉。装新版时调用一次。
+/// 1) 安装目录里所有不是本次注册的 pangyi_ime*.dll
+/// 2) 用户目录里早期"用户级注册"留下的副本、旧原型 exe、旧日志
+/// 3) 指向旧路径的桌面快捷方式
+/// 仍被运行中程序占用的文件删不掉，跳过即可（下次安装或重启后会自动清掉）。
+fn purge_old_versions(dir: &Path, keep: &[String]) {
+    let is_keep = |p: &Path| {
+        let s = p.to_string_lossy().to_string();
+        keep.iter().any(|k| k.eq_ignore_ascii_case(&s))
+    };
+
+    // 1) 安装目录：只留这一轮注册的那两个 DLL
+    if let Ok(rd) = std::fs::read_dir(dir) {
+        for e in rd.flatten() {
+            let name = e.file_name().to_string_lossy().to_string();
+            let low = name.to_ascii_lowercase();
+            if low.starts_with("pangyi_ime") && low.ends_with(".dll") && !is_keep(&e.path()) {
+                let _ = std::fs::remove_file(e.path());
+            }
+        }
+    }
+
+    // 2) 用户目录：现在已经是系统级安装，这些副本一个都不该留
+    if let Ok(base) = std::env::var("LOCALAPPDATA") {
+        let user_dir = Path::new(&base).join("Pangyi");
+        if let Ok(rd) = std::fs::read_dir(&user_dir) {
+            for e in rd.flatten() {
+                let name = e.file_name().to_string_lossy().to_string();
+                let low = name.to_ascii_lowercase();
+                let stale = (low.starts_with("pangyi_ime") && low.ends_with(".dll"))
+                    || low == "pangyi-settings.exe"
+                    || low.ends_with(".log")
+                    || name.starts_with("旁译");
+                if stale {
+                    let _ = std::fs::remove_file(e.path());
+                }
+            }
+        }
+    }
+
+    // 3) 指向旧路径的桌面快捷方式
+    if let Ok(profile) = std::env::var("USERPROFILE") {
+        let _ = std::fs::remove_file(
+            Path::new(&profile).join("Desktop").join("旁译 · 中俄输入.lnk"),
+        );
+    }
+}
+
 fn install() {
     let dir = Path::new(DIR);
     if std::fs::create_dir_all(dir).is_err() {
@@ -249,23 +297,10 @@ fn install() {
     let d32s = d32.to_string_lossy().to_string();
     let icos = ico.to_string_lossy().to_string();
 
-    // 清理历史版本的残留 DLL：只保留这一轮注册表将要指向的那两个。
-    // 关键点是放在「写完新文件之后」——这样任何时刻注册表指向的文件都在，
+    // 每次装新版都把旧版清干净：只留注册表这一轮指向的两个 DLL。
+    // 放在「写完新文件之后」执行，任何时刻注册表指向的文件都在，
     // 不会出现先删旧、后写新中间那个空窗。
-    // 仍被运行中程序占用的文件删不掉，跳过即可，下一次安装会再收一遍。
-    if let Ok(rd) = std::fs::read_dir(dir) {
-        for e in rd.flatten() {
-            let name = e.file_name().to_string_lossy().to_string();
-            if !name.starts_with("pangyi_ime") || !name.ends_with(".dll") {
-                continue;
-            }
-            let full = e.path().to_string_lossy().to_string();
-            if full.eq_ignore_ascii_case(&d64s) || full.eq_ignore_ascii_case(&d32s) {
-                continue;
-            }
-            let _ = std::fs::remove_file(e.path());
-        }
-    }
+    purge_old_versions(dir, &[d64s.clone(), d32s.clone()]);
 
     // COM 注册（64 位 + 32 位）
     let clsid_key = format!("SOFTWARE\\Classes\\CLSID\\{CLSID_STR}");

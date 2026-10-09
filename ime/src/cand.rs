@@ -102,6 +102,7 @@ pub unsafe fn set_horizontal(v: bool) {
 
 /// 设置改了以后让候选窗按新配置重画/重新量尺寸。
 pub unsafe fn refresh_settings() {
+    clear_font_cache();
     if alive() {
         let _ = InvalidateRect(hwnd(), None, TRUE);
     }
@@ -111,8 +112,27 @@ fn sc(px: i32) -> i32 {
     (px * dpi()) / 96
 }
 
+/// 字体缓存。
+/// 原来每次重绘 / 每次测宽都要 CreateFontW 三个字体再删掉，
+/// 敲一个字母最多要建 9 次字体。字体对象按 (字号, 缩放, DPI) 复用。
+static FONTS: Mutex<Vec<(i32, i32, i32, HFONT)>> = Mutex::new(Vec::new());
+
 fn font(px: i32) -> HFONT {
-    unsafe {
+    let scale = crate::settings::font_scale();
+    let d = dpi();
+    {
+        let g = FONTS.lock().unwrap();
+        if let Some((_, _, _, h)) = g.iter().find(|(p, s, dd, _)| *p == px && *s == scale && *dd == d) {
+            return *h;
+        }
+    }
+    let h = unsafe { make_font(px) };
+    FONTS.lock().unwrap().push((px, scale, d, h));
+    h
+}
+
+unsafe fn make_font(px: i32) -> HFONT {
+    {
         CreateFontW(
             -sc(px * crate::settings::font_scale() / 100), 0, 0, 0, 400, 0, 0, 0,
             DEFAULT_CHARSET.0 as u32,
@@ -122,6 +142,14 @@ fn font(px: i32) -> HFONT {
             (VARIABLE_PITCH.0 | FF_DONTCARE.0) as u32,
             w!("Microsoft YaHei UI"),
         )
+    }
+}
+
+/// 设置/DPI 变了就把缓存清掉重建
+pub fn clear_font_cache() {
+    let mut g = FONTS.lock().unwrap();
+    for (_, _, _, h) in g.drain(..) {
+        unsafe { let _ = DeleteObject(h); }
     }
 }
 
@@ -241,9 +269,6 @@ unsafe fn compute_layout(dc: HDC, items: &[Item]) -> Layout {
         (w, h)
     };
 
-    let _ = DeleteObject(f_text);
-    let _ = DeleteObject(f_anno);
-    let _ = DeleteObject(f_idx);
     Layout { index_w, word_w, pinyin_w, ru_w, item_w, row_h, line_h, anno_w, anno_h, width, height }
 }
 
@@ -402,9 +427,8 @@ unsafe extern "system" fn proc_cand(h: HWND, msg: u32, w: WPARAM, l: LPARAM) -> 
                 }
             }
 
-            let _ = DeleteObject(f_text);
-            let _ = DeleteObject(f_anno);
-            let _ = DeleteObject(f_idx);
+            // 注意：f_text / f_anno / f_idx 是缓存的字体对象，这里不能删
+            let _ = (f_text, f_anno, f_idx);
             let _ = EndPaint(h, &ps);
             LRESULT(0)
         }

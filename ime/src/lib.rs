@@ -232,7 +232,10 @@ impl TextService {
         static WARMED: std::sync::Once = std::sync::Once::new();
         WARMED.call_once(|| {
             std::thread::spawn(|| {
-                let _ = dict::lookup("kaifa");
+                // 词典索引 + 语言模型都在后台建好。
+                // 不预热的话，用户打到第 3 个字母时才开始建 20 万条 bigram，
+                // 那一下会明显卡顿，而且每换一个程序都要重来一次。
+                dict::warmup();
             });
         });
 
