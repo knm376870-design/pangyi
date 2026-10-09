@@ -350,6 +350,38 @@ manual_n = 0
 from collections import Counter as _Counter
 _reading_count = _Counter(s for (s, _a) in rows)
 
+# ---------- Unihan 单字兜底 ----------
+# CC-CEDICT 没收录的生僻字，Unihan 有 kMandarin + kDefinition，
+# 已经在 pivot_eng_ru.py 里翻成了俄语，单独放一个表。
+# 单字只在这里补 —— 之前"单字不给枢轴"是为了防错译，
+# 但生僻字的 Unihan 释义基本没有歧义。
+def read_unihan_pivot(name):
+    d = {}
+    p = os.path.join(RAW, name)
+    if not os.path.exists(p):
+        return d
+    with io.open(p, encoding="utf-8") as f:
+        for line in f:
+            if line.startswith("#"):
+                continue
+            c = line.rstrip("\n").split("\t")
+            if len(c) >= 6 and c[1] and c[3] and c[5]:
+                g = [x.strip() for x in c[5].split("|") if x.strip()]
+                if g:
+                    d[(c[1], c[3])] = g
+    return d
+
+uh_by = read_unihan_pivot("pivot-unihan-zh-ru.tsv")
+uh_by.update(read_unihan_pivot("pivot-unihan-zh-ru-ext.tsv"))
+
+uh_n = 0
+for ch, g in uh_by.items():
+    if (ch[0], ch[1]) in rows:
+        continue
+    rows[(ch[0], ch[1])] = {"trad": ch[0], "d": ch[1], "pos": "", "ru": g[:4],
+                            "src": "unihan", "ini": ""}
+    uh_n += 1
+
 # ---------- 英文释义兜底 ----------
 # 直连语料和两套枢轴都没翻出来的词，至少把 CEDICT 的英文首义带上：
 # 这样这些词【能打出来】，而且有个意思可看。前面加 "en: " 标明这不是俄语。
@@ -476,7 +508,7 @@ for (simp, a), rec in rows.items():
     rec["src"] = "manual"
     manual_n += 1
 
-print(f"CC-CEDICT {len(entries)}（去重读音） FreeDict {len(fd)}  RU-wikt {len(rw)}  Wikdict直连 {wik_n}  Wikdict新建 {wik_new}  枢轴补 {pivot_n}  扩展枢轴兜底 {pivot_ext_n}  英文兜底 {eng_n}  异体字跟随 {var_n}  Wikdict升级 {wik_up}  人工补 {manual_n}（另新建 {manual_only}）")
+print(f"CC-CEDICT {len(entries)}（去重读音） FreeDict {len(fd)}  RU-wikt {len(rw)}  Wikdict直连 {wik_n}  Wikdict新建 {wik_new}  Unihan单字 {uh_n}  枢轴补 {pivot_n}  扩展枢轴兜底 {pivot_ext_n}  英文兜底 {eng_n}  异体字跟随 {var_n}  Wikdict升级 {wik_up}  人工补 {manual_n}（另新建 {manual_only}）")
 
 # 现代常用词加权：jieba 词频对这几个字/词低估（古典语料里反而是另一些更常见），手工校正
 FREQ_BOOST = {"帮": 8.0, "给": 2.0, "让": 2.0, "请": 1.5, "邦": 0.15, "浜": 0.05}

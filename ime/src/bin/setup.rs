@@ -223,6 +223,25 @@ fn write_or_versioned(dir: &Path, name: &str, data: &[u8]) -> String {
     alt.to_string_lossy().to_string()
 }
 
+/// 删不掉的文件（被运行中的程序占用）排到"重启后删除"。
+/// 不这样做的话，旧 DLL 会永远留在安装目录里，"删干净"就成了空话。
+fn remove_or_schedule(p: &Path) {
+    if std::fs::remove_file(p).is_ok() {
+        return;
+    }
+    use std::os::windows::ffi::OsStrExt;
+    let mut w: Vec<u16> = p.as_os_str().encode_wide().collect();
+    w.push(0);
+    unsafe {
+        // MOVEFILE_DELAY_UNTIL_REBOOT = 0x4；第二个参数传 NULL 表示删除
+        let _ = windows::Win32::Storage::FileSystem::MoveFileExW(
+            windows::core::PCWSTR(w.as_ptr()),
+            windows::core::PCWSTR::null(),
+            windows::Win32::Storage::FileSystem::MOVE_FILE_FLAGS(0x4),
+        );
+    }
+}
+
 /// 把旧版本的所有痕迹清掉。装新版时调用一次。
 /// 1) 安装目录里所有不是本次注册的 pangyi_ime*.dll
 /// 2) 用户目录里早期"用户级注册"留下的副本、旧原型 exe、旧日志
@@ -240,7 +259,7 @@ fn purge_old_versions(dir: &Path, keep: &[String]) {
             let name = e.file_name().to_string_lossy().to_string();
             let low = name.to_ascii_lowercase();
             if low.starts_with("pangyi_ime") && low.ends_with(".dll") && !is_keep(&e.path()) {
-                let _ = std::fs::remove_file(e.path());
+                remove_or_schedule(&e.path());
             }
         }
     }
@@ -257,7 +276,7 @@ fn purge_old_versions(dir: &Path, keep: &[String]) {
                     || low.ends_with(".log")
                     || name.starts_with("旁译");
                 if stale {
-                    let _ = std::fs::remove_file(e.path());
+                    remove_or_schedule(&e.path());
                 }
             }
         }
@@ -268,6 +287,29 @@ fn purge_old_versions(dir: &Path, keep: &[String]) {
         let _ = std::fs::remove_file(
             Path::new(&profile).join("Desktop").join("旁译 · 中俄输入.lnk"),
         );
+    }
+}
+
+/// 把最新版的安装包和设置程序放到桌面
+///（用户要求"每个最新版本都要在桌面上"；只有带管理员权限的安装程序能写到桌面）
+fn copy_to_desktop() {
+    let mut desks: Vec<std::path::PathBuf> = Vec::new();
+    if let Ok(profile) = std::env::var("USERPROFILE") {
+        desks.push(Path::new(&profile).join("Desktop"));
+    }
+    desks.push(Path::new(r"C:\Users\Public\Desktop").to_path_buf());
+    let me = std::env::current_exe().ok();
+    let set = Path::new(DIR).join(SETTINGS_NAME);
+    for d in desks {
+        if !d.is_dir() {
+            continue;
+        }
+        if let Some(m) = me.as_ref() {
+            let _ = std::fs::copy(m, d.join("旁译-安装程序.exe"));
+        }
+        if set.is_file() {
+            let _ = std::fs::copy(&set, d.join("旁译-设置.exe"));
+        }
     }
 }
 
@@ -342,6 +384,8 @@ fn install() {
     reg_del_tree(HKEY_CURRENT_USER, &format!("Software\\Classes\\CLSID\\{CLSID_STR}"));
     reg_del_tree(HKEY_CURRENT_USER, &format!("Software\\Classes\\WOW6432Node\\CLSID\\{CLSID_STR}"));
     reg_del_tree(HKEY_CURRENT_USER, &format!("Software\\Classes\\WOW6432Node\\CLSID\\{CLSID_STR}"));
+
+    copy_to_desktop();
 
     msg(
         "旁译 安装完成",
