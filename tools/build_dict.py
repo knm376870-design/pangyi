@@ -239,6 +239,26 @@ def read_pivot(name, strict=False):
                 d[(c[1], c[3])] = g
     return d
 
+# ---------- CEDICT 英文首义（最后的兜底用） ----------
+GLOSS_SKIP = ("CL:", "variant of", "old variant of", "see ", "used in",
+              "surname ", "abbr. for", "erhua variant", "also written")
+def clean_gloss(defs):
+    parts = [x.strip() for x in defs.split("/") if x.strip()]
+    parts = [x for x in parts if not x.startswith(GLOSS_SKIP)]
+    if not parts:
+        return ""
+    g = re.sub(r"\([^)]*\)", " ", parts[0])
+    g = re.sub(r"\s+", " ", g).strip()
+    return g[:44]
+ced_gloss = {}
+for e in entries:
+    k = (e["simp"], e["a"])
+    if k in ced_gloss:
+        continue
+    g = clean_gloss(e["def"])
+    if g:
+        ced_gloss[k] = g
+
 # ---------- 人工撰写的高频词（优先级最高，先读进来让枢轴避开） ----------
 manual = {}
 mp = os.path.join(RAW, "manual-zh-ru.tsv")
@@ -326,6 +346,24 @@ for (simp, a), rec in rows.items():
 # 否则人工词会被枢轴先填掉，导致人工译文被静默丢弃（见长 就踩过这个坑）。
 manual_n = 0
 
+# ---------- 英文释义兜底 ----------
+# 直连语料和两套枢轴都没翻出来的词，至少把 CEDICT 的英文首义带上：
+# 这样这些词【能打出来】，而且有个意思可看。前面加 "en: " 标明这不是俄语。
+eng_n = 0
+for (simp, a), rec in rows.items():
+    if rec["ru"]:
+        continue
+    if len(simp) < 2:
+        continue          # 单字太多义，只有英文反而误导
+    if (simp, a) in manual:
+        continue
+    g = ced_gloss.get((simp, a))
+    if not g:
+        continue
+    rec["ru"] = ["en: " + g]
+    rec["src"] = "english"
+    eng_n += 1
+
 manual_n = 0
 for (simp, a), rec in rows.items():
     g = manual.get((simp, a))
@@ -337,7 +375,7 @@ for (simp, a), rec in rows.items():
     rec["src"] = "manual"
     manual_n += 1
 
-print(f"CC-CEDICT {len(entries)}（去重读音） FreeDict {len(fd)}  RU-wikt {len(rw)}  枢轴补 {pivot_n}  扩展枢轴兜底 {pivot_ext_n}  人工补 {manual_n}（另新建 {manual_only}）")
+print(f"CC-CEDICT {len(entries)}（去重读音） FreeDict {len(fd)}  RU-wikt {len(rw)}  枢轴补 {pivot_n}  扩展枢轴兜底 {pivot_ext_n}  英文兜底 {eng_n}  人工补 {manual_n}（另新建 {manual_only}）")
 
 # 现代常用词加权：jieba 词频对这几个字/词低估（古典语料里反而是另一些更常见），手工校正
 FREQ_BOOST = {"帮": 8.0, "给": 2.0, "让": 2.0, "请": 1.5, "邦": 0.15, "浜": 0.05}
