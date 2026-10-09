@@ -13,11 +13,16 @@ pub struct Hit {
     pub ru: String,
 }
 
+/// 扁平行表：(key, 词条行)，按 key 升序排好，同一个 key 的多行相邻。
+type Row = (&'static str, &'static str);
+
 struct Index {
-    exact: HashMap<&'static str, Vec<&'static str>>,
-    keys: Vec<&'static str>,
-    initials: HashMap<&'static str, Vec<&'static str>>,
-    ini_keys: Vec<&'static str>,
+    /// (拼音, 词条行)，按拼音升序。
+    /// 原来是 HashMap<&str, Vec<&str>>：6 万个 key 各带一个 Vec，
+    /// 哈希桶加上每个 Vec 自己的堆分配差不多要 7MB，而内容本身只要 2MB。
+    exact: Vec<Row>,
+    /// (首字母缩写, 词条行)，按缩写升序
+    ini: Vec<Row>,
     /// 1~2 个字母的前缀 -> 该前缀下词频最高的那条
     /// （最多 26 + 26*26 = 702 条，用来避免每敲一个键都去扫几千个拼音键）
     comp: HashMap<&'static str, &'static str>,
@@ -68,55 +73,69 @@ fn index() -> &'static Index {
     static IDX: OnceLock<Index> = OnceLock::new();
     IDX.get_or_init(|| {
         let mut total_freq = 0.0f64;
-        let mut exact: HashMap<&'static str, Vec<&'static str>> = HashMap::new();
-        let mut initials: HashMap<&'static str, Vec<&'static str>> = HashMap::new();
+        let mut exact: Vec<Row> = Vec::with_capacity(64000);
+        let mut ini: Vec<Row> = Vec::with_capacity(64000);
         for line in RAW.lines().skip(1) {
-            let c: Vec<&str> = line.split('\t').collect();
-            if c.len() < 7 {
-                continue;
-            }
-            let py = c[2];
+            // 一条记录 8 列，边遍历边取，不 collect
+            let mut it = line.split('\t');
+            let _simp = it.next();
+            let _trad = it.next();
+            let py = match it.next() { Some(s) => s, None => continue };
+            let _disp = it.next();
+            let _pos = it.next();
+            let _freq = it.next();
+            let _ru = it.next();
+            let ini_key = it.next().unwrap_or("");
             if py.is_empty() {
                 continue;
             }
-            exact.entry(py).or_default().push(line);
+            exact.push((py, line));
             total_freq += line_freq(line) as f64;
-            if let Some(ini) = c.get(7) {
-                if !ini.is_empty() {
-                    initials.entry(ini).or_default().push(line);
-                }
+            if !ini_key.is_empty() {
+                ini.push((ini_key, line));
             }
         }
+        // 稳定排序：同一个 key 内部保持词典原顺序（词典本身已按词频排好）
+        exact.sort_by(|a, b| a.0.cmp(b.0));
+        ini.sort_by(|a, b| a.0.cmp(b.0));
         // 预先算好 1~2 字母前缀的最佳补全。
         // 没有这张表的话，敲 "z" 要遍历所有以 z 开头的拼音键（几千个），
         // 每敲一个字母就要多花 1ms 左右 —— 这就是之前"打字卡"的主因之一。
+        // 遍历扁平行表，按 key 分组求该组里得分最高的那行
         let mut comp: HashMap<&'static str, &'static str> = HashMap::new();
-        for (k, lines) in exact.iter() {
-            let klen = k.chars().count();
-            if klen < 2 {
-                continue;   // 单字母键自己就是"精确匹配"，不做补全
-            }
-            let best = match lines.iter().max_by_key(|l| line_score(l)) {
-                Some(l) => *l,
-                None => continue,
-            };
-            for plen in [1usize, 2usize] {
-                if klen == plen {
-                    continue;   // 和前缀等长的键属于"精确匹配"，不算补全
+        let mut i = 0usize;
+        while i < exact.len() {
+            let k = exact[i].0;
+            let mut j = i;
+            let mut best: Option<&'static str> = None;
+            let mut best_score = 0u64;
+            while j < exact.len() && exact[j].0 == k {
+                let sc = line_score(exact[j].1);
+                if best.is_none() || sc > best_score {
+                    best_score = sc;
+                    best = Some(exact[j].1);
                 }
-                let pref = prefix_chars(k, plen);
-                let cur = comp.entry(pref).or_insert(best);
-                if line_score(best) > line_score(cur) {
-                    *cur = best;
+                j += 1;
+            }
+            if let Some(b) = best {
+                let klen = k.chars().count();
+                if klen >= 2 {
+                    for plen in [1usize, 2usize] {
+                        if klen == plen {
+                            continue;   // 和前缀等长的键属于"精确匹配"，不算补全
+                        }
+                        let pref = prefix_chars(k, plen);
+                        let cur = comp.entry(pref).or_insert(b);
+                        if best_score > line_score(*cur) {
+                            *cur = b;
+                        }
+                    }
                 }
             }
+            i = j;
         }
 
-        let mut keys: Vec<&'static str> = exact.keys().copied().collect();
-        keys.sort_unstable();
-        let mut ini_keys: Vec<&'static str> = initials.keys().copied().collect();
-        ini_keys.sort_unstable();
-        Index { exact, keys, initials, ini_keys, comp, learned: Mutex::new(load_learned()), total_freq: total_freq.max(1.0) }
+        Index { exact, ini, comp, learned: Mutex::new(load_learned()), total_freq: total_freq.max(1.0) }
     })
 }
 
@@ -148,8 +167,15 @@ fn hit_of(line: &'static str) -> Option<Hit> {
     Some(Hit { word: word.into(), pinyin: disp.into(), ru: ru.into() })
 }
 
-fn push_lines(lines: &[&'static str], out: &mut Vec<Hit>, cap: usize) {
-    for line in lines {
+/// 取 exact 里 key 完全相等的连续区间（表是按 key 排好序的）
+fn exact_group<'a>(idx: &'a Index, key: &str) -> &'a [Row] {
+    let a = idx.exact.partition_point(|(k, _)| *k < key);
+    let b = idx.exact.partition_point(|(k, _)| *k <= key);
+    &idx.exact[a..b]
+}
+
+fn push_lines(rows: &[Row], out: &mut Vec<Hit>, cap: usize) {
+    for (_, line) in rows {
         if let Some(h) = hit_of(line) {
             out.push(h);
         }
@@ -168,21 +194,19 @@ pub fn lookup(ascii: &str) -> Vec<Hit> {
     let mut out: Vec<Hit> = Vec::new();
 
     // 1) 精确
-    if let Some(lines) = idx.exact.get(ascii) {
-        push_lines(lines, &mut out, 16);
-    }
+    push_lines(exact_group(idx, ascii), &mut out, 16);
     // 2) 前缀（二分定位）
     if out.len() < 16 {
-        let start = idx.keys.partition_point(|k| *k < ascii);
-        for key in idx.keys[start..].iter() {
+        let start = idx.exact.partition_point(|(k, _)| *k < ascii);
+        for (key, line) in idx.exact[start..].iter() {
             if !key.starts_with(ascii) {
                 break;
             }
             if *key == ascii {
                 continue;
             }
-            if let Some(lines) = idx.exact.get(key) {
-                push_lines(lines, &mut out, 16);
+            if let Some(h) = hit_of(line) {
+                out.push(h);
             }
             if out.len() >= 16 {
                 break;
@@ -191,13 +215,13 @@ pub fn lookup(ascii: &str) -> Vec<Hit> {
     }
     // 3) 首字母缩写（输入全是字母且不长时才用）
     if out.len() < 9 && ascii.len() >= 2 && ascii.len() <= 6 {
-        let start = idx.ini_keys.partition_point(|k| *k < ascii);
-        for key in idx.ini_keys[start..].iter() {
+        let start = idx.ini.partition_point(|(k, _)| *k < ascii);
+        for (key, line) in idx.ini[start..].iter() {
             if !key.starts_with(ascii) {
                 break;
             }
-            if let Some(lines) = idx.initials.get(key) {
-                push_lines(lines, &mut out, 16);
+            if let Some(h) = hit_of(line) {
+                out.push(h);
             }
             if out.len() >= 16 {
                 break;
@@ -297,29 +321,25 @@ pub fn complete(ascii: &str) -> Option<(String, String)> {
         }
         // 表里没有（比如带 ü 的拼音）就照旧走扫描，行为不变
     }
-    let start = idx.keys.partition_point(|k| *k < ascii);
+    let start = idx.exact.partition_point(|(k, _)| *k < ascii);
     let mut best: Option<(u64, &'static str)> = None;
-    for key in idx.keys[start..].iter() {
+    for (key, line) in idx.exact[start..].iter() {
         if !key.starts_with(ascii) {
             break;
         }
         if *key == ascii {
             continue;
         }
-        if let Some(lines) = idx.exact.get(key) {
-            for line in lines {
-                // 只取第 0 列（词）和第 5 列（词频），不再为每行分配 Vec
-                let mut it = line.split('\t');
-                let word = it.next().unwrap_or("");
-                let freq: u64 = match it.nth(4).and_then(|s| s.parse().ok()) {
-                    Some(f) => f,
-                    None => continue,
-                };
-                let score = freq * 10 + word.chars().count() as u64;
-                if best.map(|(s, _)| score > s).unwrap_or(true) {
-                    best = Some((score, line));
-                }
-            }
+        // 只取第 0 列（词）和第 5 列（词频），不再为每行分配 Vec
+        let mut it = line.split('\t');
+        let word = it.next().unwrap_or("");
+        let freq: u64 = match it.nth(4).and_then(|s| s.parse().ok()) {
+            Some(f) => f,
+            None => continue,
+        };
+        let score = freq * 10 + word.chars().count() as u64;
+        if best.map(|(s, _)| score > s).unwrap_or(true) {
+            best = Some((score, line));
         }
     }
     best.map(|(_, line)| {
@@ -414,13 +434,13 @@ pub fn sentence(pinyin: &str) -> Option<Vec<Hit>> {
         };
         for len in 1..=(n - i).min(14) {
             let key: String = chars[i..i + len].iter().collect();
-            let lines = match idx.exact.get(key.as_str()) {
-                Some(l) => l,
-                None => continue,
-            };
+            let lines = exact_group(idx, key.as_str());
+            if lines.is_empty() {
+                continue;
+            }
             // 同一个拼音可能有多个词（如 shijie → 世纪/世界），全都要试，
             // 交给动态规划按上下文挑最好的，而不是这里就定死。
-            let mut alts: Vec<&'static str> = lines.clone();
+            let mut alts: Vec<&'static str> = lines.iter().map(|(_, l)| *l).collect();
             alts.sort_by_key(|l| std::cmp::Reverse(line_freq(l)));
             for line in alts.into_iter().take(6) {
             let freq = line_freq(line).max(1) as f64;
