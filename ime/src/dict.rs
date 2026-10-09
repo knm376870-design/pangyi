@@ -11,6 +11,8 @@ pub struct Hit {
     pub word: String,
     pub pinyin: String,
     pub ru: String,
+    /// 词典词频（来自 jieba）。用于同音词重排。
+    pub freq: u64,
 }
 
 /// 扁平行表：(key, 词条行)，按 key 升序排好，同一个 key 的多行相邻。
@@ -168,9 +170,9 @@ fn hit_of(line: &'static str) -> Option<Hit> {
     let _py = it.next()?;
     let disp = it.next()?;
     let _pos = it.next()?;
-    let _freq = it.next()?;
+    let freq: u64 = it.next().and_then(|s| s.parse().ok()).unwrap_or(0);
     let ru = it.next().unwrap_or("");
-    Some(Hit { word: word.into(), pinyin: disp.into(), ru: ru.into() })
+    Some(Hit { word: word.into(), pinyin: disp.into(), ru: ru.into(), freq })
 }
 
 /// 取 exact 里 key 完全相等的连续区间（表是按 key 排好序的）
@@ -189,6 +191,19 @@ fn push_lines(rows: &[Row], out: &mut Vec<Hit>, cap: usize) {
             return;
         }
     }
+}
+
+/// 同音词排序用的混合分。
+///
+/// 只看词典词频（jieba）会把书面/正式词排前面 —— 例如 lvxing 把「履行」排在
+/// 「旅行」前面、yisheng 把「一声」排在「医生」前面。再掺一份语料词频
+/// （语言模型的 unigram，训练语料是真实文本）就能掰回来。
+fn blended_rank(freq: u64, word: &str) -> f64 {
+    if freq == u64::MAX {
+        return f64::INFINITY;   // 自定义短语永远排最前
+    }
+    let corpus = lm_uni().get(word).copied().unwrap_or(0) as f64;
+    0.5 * ((freq as f64) + 1.0).ln() + 0.5 * (corpus + 1.0).ln()
 }
 
 /// 按无声调拼音精确/前缀查找；也支持首字母缩写（zg → 中国）。
@@ -236,6 +251,13 @@ pub fn lookup(ascii: &str) -> Vec<Hit> {
     }
 
     out.truncate(16);
+
+    // 同音词重排（稳定排序：同分保持原有顺序）
+    out.sort_by(|a, b| {
+        blended_rank(b.freq, &b.word)
+            .partial_cmp(&blended_rank(a.freq, &a.word))
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
 
     // 自定义短语优先（dz → 电子邮箱）
     if let Some(h) = phrase(ascii) {
@@ -360,7 +382,7 @@ pub fn phrase(trigger: &str) -> Option<Hit> {
     g.entries
         .iter()
         .find(|(t, _, _)| t.eq_ignore_ascii_case(trigger))
-        .map(|(_, w, r)| Hit { word: w.clone(), pinyin: trigger.to_string(), ru: r.clone() })
+        .map(|(_, w, r)| Hit { word: w.clone(), pinyin: trigger.to_string(), ru: r.clone(), freq: u64::MAX })
 }
 
 /// 补全：在「拼音以 ascii 开头、且比它更长」的词条里，挑最高频的那个。
@@ -569,7 +591,7 @@ pub fn sentence_hit(pinyin: &str) -> Option<Hit> {
             break;
         }
     }
-    Some(Hit { word, pinyin: pinyin.to_string(), ru: rus.join(" | ") })
+    Some(Hit { word, pinyin: pinyin.to_string(), ru: rus.join(" | "), freq: 0 })
 }
 /// 预热：把词典索引 + 语言模型一次性建好。
 ///

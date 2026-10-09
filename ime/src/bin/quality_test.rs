@@ -27,15 +27,22 @@ fn main() {
         let pos = hits.iter().position(|h| h.word == *want);
         match pos {
             Some(0) => h1 += 1,
-            Some(1..=2) => h3 += 1,
-            Some(3..=8) => h9 += 1,
+            Some(1..=2) => {
+                h3 += 1;
+                let top: Vec<&str> = hits.iter().take(4).map(|h| h.word.as_str()).collect();
+                bad.push(format!("  [第{}位] {py:<12} 想要 {want:<6} 实际: {}", pos.unwrap()+1, top.join(" / ")));
+            }
+            Some(3..=8) => {
+                h9 += 1;
+                let top: Vec<&str> = hits.iter().take(4).map(|h| h.word.as_str()).collect();
+                bad.push(format!("  [第{}位] {py:<12} 想要 {want:<6} 实际: {}", pos.unwrap()+1, top.join(" / ")));
+            }
             _ => {
                 miss += 1;
                 let top: Vec<&str> = hits.iter().take(3).map(|h| h.word.as_str()).collect();
-                bad.push(format!("  {py:<12} 想要 {want:<6} 实际前3: {}", top.join(" / ")));
+                bad.push(format!("  [没进前9] {py:<12} 想要 {want:<6} 实际: {}", top.join(" / ")));
             }
         }
-        if pos.is_some() && pos.unwrap() < 9 { h9 += 0; }
     }
     let mid = h3 + h9;
     let n = CASES.len();
