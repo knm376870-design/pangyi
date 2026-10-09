@@ -156,6 +156,17 @@ pub fn lookup(ascii: &str) -> Vec<Hit> {
 
     out.truncate(16);
 
+    // 整句候选放最前面（打字长的拼音时）
+    // 整句切词现在只用词典词频，效果不稳（会出错的句子），先不进候选；
+    // 等接上真正的语料 bigram 语言模型再打开。
+    if false && ascii.chars().count() >= 5 {
+        if let Some(s) = sentence_hit(ascii) {
+            if s.word.chars().count() >= 2 {
+                out.insert(0, s);
+            }
+        }
+    }
+
     // 4) 自学习：选过的词排前面
     let learned = idx.learned.lock().unwrap();
     if !learned.is_empty() {
@@ -201,4 +212,97 @@ pub fn complete(ascii: &str) -> Option<(String, String)> {
         let c: Vec<&str> = line.split('\t').collect();
         (c[0].to_string(), c[3].to_string())
     })
+}
+// ---------------- 整句转换（词典频次 + 动态规划） ----------------
+//
+// 讯飞/微软拼音那种"打一整句拼音、直接出句子"。
+// 这里不用神经网络，用词频做动态规划切词——离线、快、够用。
+
+fn line_freq(line: &str) -> u64 {
+    let c: Vec<&str> = line.split('\t').collect();
+    c.get(5).and_then(|s| s.parse().ok()).unwrap_or(0)
+}
+
+fn line_word(line: &str) -> &str {
+    line.split('\t').next().unwrap_or("")
+}
+
+fn line_ru(line: &str) -> &str {
+    let c: Vec<&str> = line.split('\t').collect();
+    c.get(6).copied().unwrap_or("")
+}
+
+/// 把一串无声调拼音切成词，返回最优切分（至少两个词才算整句）。
+pub fn sentence(pinyin: &str) -> Option<Vec<Hit>> {
+    if pinyin.chars().count() < 3 {
+        return None;
+    }
+    let idx = index();
+    let chars: Vec<char> = pinyin.chars().collect();
+    let n = chars.len();
+    // best[i] = (得分, 切分结果)
+    let mut best: Vec<Option<(f64, Vec<&'static str>)>> = vec![None; n + 1];
+    best[0] = Some((0.0, Vec::new()));
+    for i in 0..n {
+        let cur = match best[i].as_ref() {
+            Some(c) => c.clone(),
+            None => continue,
+        };
+        for len in 1..=(n - i).min(14) {
+            let key: String = chars[i..i + len].iter().collect();
+            let lines = match idx.exact.get(key.as_str()) {
+                Some(l) => l,
+                None => continue,
+            };
+            // 同一个拼音可能有多个词（如 shijie → 世纪/世界），全都要试，
+            // 交给动态规划按上下文挑最好的，而不是这里就定死。
+            let mut alts: Vec<&'static str> = lines.clone();
+            alts.sort_by_key(|l| std::cmp::Reverse(line_freq(l)));
+            for line in alts.into_iter().take(3) {
+            let freq = line_freq(line).max(1) as f64;
+            let wlen = line_word(line).chars().count() as f64;
+            // 打分（离线词模型：词频 + 长度先验 + 单字惩罚）
+            //   ln(词频)      —— 常用词得分高
+            //   + 12*(字数-1) —— 长词强偏好
+            //   - 8（单字）   —— 单字词频被"作为字的频率"抬高了，必须压一压，
+            //                    否则 jintiantianqihenhao 会被切成"进/提/按..."
+            let score = cur.0 + freq.ln() + 12.0 * (wlen - 1.0) - if wlen <= 1.0 { 8.0 } else { 0.0 };
+            let end = i + len;
+            if best[end].as_ref().map(|(s, _)| score > *s).unwrap_or(true) {
+                let mut seq = cur.1.clone();
+                seq.push(line);
+                best[end] = Some((score, seq));
+            }
+            }
+        }
+    }
+    let (_, seq) = best[n].as_ref()?;
+    if seq.len() < 2 {
+        return None;
+    }
+    Some(seq.iter().filter_map(|l| hit_of(l)).collect())
+}
+
+/// 整句候选：整句本身 + 每个词的俄语（拼在一起，长了会截断）
+pub fn sentence_hit(pinyin: &str) -> Option<Hit> {
+    let parts = sentence(pinyin)?;
+    if parts.len() < 2 {
+        return None;
+    }
+    let word: String = parts.iter().map(|h| h.word.clone()).collect();
+    let mut rus: Vec<String> = Vec::new();
+    for h in &parts {
+        for g in h.ru.split('|').map(|s| s.trim()).filter(|s| !s.is_empty()) {
+            if !rus.iter().any(|x| x == g) {
+                rus.push(g.to_string());
+            }
+            if rus.len() >= 4 {
+                break;
+            }
+        }
+        if rus.len() >= 4 {
+            break;
+        }
+    }
+    Some(Hit { word, pinyin: pinyin.to_string(), ru: rus.join(" | ") })
 }
