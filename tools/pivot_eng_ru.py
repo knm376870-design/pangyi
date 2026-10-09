@@ -3,14 +3,21 @@
 
 按 CC-CEDICT 的条目逐一翻译，所以同一个字的每个读音能拿到各自的译词
 （都 dou1->все / du1->столица）。
-输出: data/raw/pivot-zh-ru.tsv   #title  simp  trad  pinyin_ascii  pos  ru
+输出:
+  python pivot_eng_ru.py           -> data/raw/pivot-zh-ru.tsv      （保守，质量优先）
+  python pivot_eng_ru.py --ext     -> data/raw/pivot-zh-ru-ext.tsv  （激进，只当兜底）
+
+build_dict.py 的用法是【保守表优先、扩展表兜底】：
+先用保守表，保守表没命中的词才查扩展表，
+所以扩展表只会"多补词"，绝不会覆盖已有的好译文。
 """
 import gzip, io, os, re, sys
 sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
 RAW  = os.path.join(ROOT, "data", "raw")
-OUT  = os.path.join(RAW, "pivot-zh-ru.tsv")
+EXT = "--ext" in sys.argv
+OUT  = os.path.join(RAW, "pivot-zh-ru-ext.tsv" if EXT else "pivot-zh-ru.tsv")
 
 ENTRY = re.compile(r"<entry\b.*?</entry>", re.S)
 ORTH  = re.compile(r"<orth>(.*?)</orth>", re.S)
@@ -57,14 +64,21 @@ with gzip.open(os.path.join(RAW, "cedict.txt.gz"), "rt", encoding="utf-8") as f:
         if not a:
             continue
         ru = []
-        # 只在前两个释义里找：越往后越可能是冷门义项（都 dōu 的 "even" 会撞上
-        # eng-rus 里表示「埃文基族」的同形词）
-        for d in [x for x in defs.split("/") if x][:2]:
+        # 保守模式只在前两个释义里找：越往后越可能是冷门义项
+        #（都 dōu 的 "even" 会撞上 eng-rus 里表示「埃文基族」的同形词）。
+        # 扩展模式多试几个释义、并把多词释义拆成单词再试 —— 命中率更高，
+        # 但也更容易撞同形词，所以只当兜底用。
+        for d in [x for x in defs.split("/") if x][: (4 if EXT else 2)]:
             k = norm_gloss(d)
             if not k or len(k) > 30:
                 continue
+            cands = [k]
+            if k.endswith("s"):
+                cands.append(k[:-1])
+            if EXT and " " in k:
+                cands += [w for w in k.split() if len(w) >= 3]
             hit_cand = None
-            for cand in (k, k[:-1] if k.endswith("s") else None):
+            for cand in cands:
                 if cand and cand in er:
                     hit_cand = cand
                     break
@@ -75,7 +89,7 @@ with gzip.open(os.path.join(RAW, "cedict.txt.gz"), "rt", encoding="utf-8") as f:
         if ru:
             rows.append((simp, simp, trad, a, "", " | ".join(ru)))
 
-print(f"枢轴: {len(rows)} 行（按读音）")
+print(f"枢轴{'（扩展）' if EXT else ''}: {len(rows)} 行 -> {os.path.basename(OUT)}")
 with io.open(OUT, "w", encoding="utf-8", newline="\n") as f:
     f.write("#title\tsimp\ttrad\tpinyin_ascii\tpos\tru\n")
     for r in rows:

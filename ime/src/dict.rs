@@ -13,6 +13,8 @@ pub struct Hit {
     pub ru: String,
     /// 词典词频（来自 jieba）。用于同音词重排。
     pub freq: u64,
+    /// 是不是"低置信来源"（机器枢轴扩展表猜出来的），排序时要降权
+    pub low_conf: bool,
 }
 
 /// 扁平行表：(key, 词条行)，按 key 升序排好，同一个 key 的多行相邻。
@@ -172,7 +174,10 @@ fn hit_of(line: &'static str) -> Option<Hit> {
     let _pos = it.next()?;
     let freq: u64 = it.next().and_then(|s| s.parse().ok()).unwrap_or(0);
     let ru = it.next().unwrap_or("");
-    Some(Hit { word: word.into(), pinyin: disp.into(), ru: ru.into(), freq })
+    let _ini = it.next();
+    let src = it.next().unwrap_or("");
+    Some(Hit { word: word.into(), pinyin: disp.into(), ru: ru.into(), freq,
+               low_conf: src == "pivot-ext" })
 }
 
 /// 取 exact 里 key 完全相等的连续区间（表是按 key 排好序的）
@@ -198,12 +203,15 @@ fn push_lines(rows: &[Row], out: &mut Vec<Hit>, cap: usize) {
 /// 只看词典词频（jieba）会把书面/正式词排前面 —— 例如 lvxing 把「履行」排在
 /// 「旅行」前面、yisheng 把「一声」排在「医生」前面。再掺一份语料词频
 /// （语言模型的 unigram，训练语料是真实文本）就能掰回来。
-fn blended_rank(freq: u64, word: &str) -> f64 {
+fn blended_rank(freq: u64, word: &str, low_conf: bool) -> f64 {
     if freq == u64::MAX {
         return f64::INFINITY;   // 自定义短语永远排最前
     }
     let corpus = lm_uni().get(word).copied().unwrap_or(0) as f64;
-    0.5 * ((freq as f64) + 1.0).ln() + 0.5 * (corpus + 1.0).ln()
+    let base = 0.5 * ((freq as f64) + 1.0).ln() + 0.5 * (corpus + 1.0).ln();
+    // 机器枢轴扩展表猜出来的词降权：
+    // 它翻的"河水"(频次 917) 不该把有可靠来源的"喝水"(302) 压下去。
+    if low_conf { base - 1.0 } else { base }
 }
 
 /// 按无声调拼音精确/前缀查找；也支持首字母缩写（zg → 中国）。
@@ -254,8 +262,8 @@ pub fn lookup(ascii: &str) -> Vec<Hit> {
 
     // 同音词重排（稳定排序：同分保持原有顺序）
     out.sort_by(|a, b| {
-        blended_rank(b.freq, &b.word)
-            .partial_cmp(&blended_rank(a.freq, &a.word))
+        blended_rank(b.freq, &b.word, b.low_conf)
+            .partial_cmp(&blended_rank(a.freq, &a.word, a.low_conf))
             .unwrap_or(std::cmp::Ordering::Equal)
     });
 
@@ -382,7 +390,7 @@ pub fn phrase(trigger: &str) -> Option<Hit> {
     g.entries
         .iter()
         .find(|(t, _, _)| t.eq_ignore_ascii_case(trigger))
-        .map(|(_, w, r)| Hit { word: w.clone(), pinyin: trigger.to_string(), ru: r.clone(), freq: u64::MAX })
+        .map(|(_, w, r)| Hit { word: w.clone(), pinyin: trigger.to_string(), ru: r.clone(), freq: u64::MAX, low_conf: false })
 }
 
 /// 补全：在「拼音以 ascii 开头、且比它更长」的词条里，挑最高频的那个。
@@ -591,7 +599,7 @@ pub fn sentence_hit(pinyin: &str) -> Option<Hit> {
             break;
         }
     }
-    Some(Hit { word, pinyin: pinyin.to_string(), ru: rus.join(" | "), freq: 0 })
+    Some(Hit { word, pinyin: pinyin.to_string(), ru: rus.join(" | "), freq: 0, low_conf: false })
 }
 /// 预热：把词典索引 + 语言模型一次性建好。
 ///

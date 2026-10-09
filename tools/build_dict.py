@@ -216,10 +216,12 @@ with io.open(os.path.join(RAW, "jieba_dict.txt"), encoding="utf-8") as f:
 _ws.sort(key=lambda x: -x[1])
 TOP_COMMON = {w for w, _ in _ws[:3000]}
 
-pivot_by = {}
-pp = os.path.join(RAW, "pivot-zh-ru.tsv")
-if os.path.exists(pp):
-    with io.open(pp, encoding="utf-8") as f:
+def read_pivot(name, strict=False):
+    d = {}
+    p = os.path.join(RAW, name)
+    if not os.path.exists(p):
+        return d
+    with io.open(p, encoding="utf-8") as f:
         for line in f:
             if line.startswith("#"):
                 continue
@@ -228,26 +230,16 @@ if os.path.exists(pp):
                 continue
             g = [x.strip() for x in c[5].split("|") if x.strip()]
             g = [x for x in g if not x.startswith(("(", "†"))]
+            # 只对【扩展表】过滤"词典腔"（+ comp. / см. / чего-л 这些是英俄词典里的
+            # 释义占位符，直接塞进候选只会误导）。保守表的译文质量本来就高，不动它。
+            if strict:
+                BAD = ("+", "см.", "напр.", "и т.", "чего-л", "кем-л", "чем-л", "чему-л", "кому-л")
+                g = [x for x in g if not any(b in x for b in BAD)]
             if g:
-                pivot_by[(c[1], c[3])] = g
+                d[(c[1], c[3])] = g
+    return d
 
-pivot_n = 0
-for (simp, a), rec in rows.items():
-    if rec["ru"]:
-        continue          # 已有直连译词就不动：实测枢轴在单字上会出「эвен」这类
-                          # 更糟的结果，宁可留直连的，也不让它覆盖
-    g = pivot_by.get((simp, a))
-    if not g:
-        continue
-    # 只收多字词、以及有多个读音的单字。
-    # 试过给常用单字也放宽，实测质量不行（的→яркий、开→кипеть、喝→крик 都是错的），
-    # 错译比没有更糟，所以回退。
-    if len(simp) >= 2 or len(by_simp.get(simp, [])) >= 2:
-        rec["ru"] = g
-        rec["src"] = "pivot"
-        pivot_n += 1
-
-# ---------- 人工撰写的高频词（助手逐条写，优先于枢轴；直连语料优先于人工） ----------
+# ---------- 人工撰写的高频词（优先级最高，先读进来让枢轴避开） ----------
 manual = {}
 mp = os.path.join(RAW, "manual-zh-ru.tsv")
 if os.path.exists(mp):
@@ -258,8 +250,11 @@ if os.path.exists(mp):
             c = line.rstrip("\n").split("\t")
             if len(c) >= 3 and c[0] and c[1] and c[2]:
                 manual[(c[0], c[1])] = [x.strip() for x in c[2].split(";") if x.strip()]
-manual_n = 0
 
+# 【顺序很重要】人工表先建行，再由枢轴补其它读音：
+#   人工表里的词如果有别的读音没被覆盖（了 le/liao、还 hai/huan），
+#   那些读音还是要让枢轴补上；但同一个 (词,拼音) 绝对不许枢轴插手。
+# 之前把"人工表建行"放在枢轴之后，导致枢轴先占了读音，人工译文被静默丢弃。
 # 人工表里若出现 CEDICT/维基都没有的词（或读音写法对不上），也照样建行 ——
 # 人工表是权威来源，不能被静默丢掉。
 rows_by_simp = {}
@@ -289,6 +284,48 @@ for (simp, a), g in manual.items():
                        "src": "manual", "ini": ""}
     manual_only += 1
 
+
+# 保守表（质量优先）和扩展表（覆盖优先，只当兜底）
+pivot_by = read_pivot("pivot-zh-ru.tsv")
+pivot_ext_by = read_pivot("pivot-zh-ru-ext.tsv", strict=True)
+
+pivot_n = 0
+pivot_ext_n = 0
+for (simp, a), rec in rows.items():
+    if rec["ru"]:
+        continue          # 已有直连译词就不动：实测枢轴在单字上会出「эвен」这类
+                          # 更糟的结果，宁可留直连的，也不让它覆盖
+    multi = len(simp) >= 2
+    # 只收多字词、以及有多个读音的单字。
+    # 试过给常用单字也放宽，实测质量不行（的→яркий、开→кипеть、喝→крик 都是错的），
+    # 错译比没有更糟，所以回退。
+    if not (multi or len(by_simp.get(simp, [])) >= 2):
+        continue
+    if (simp, a) in manual:
+        continue          # 这个读音人工表自己给了译文，枢轴不许覆盖
+    g = pivot_by.get((simp, a))
+    src = "pivot"
+    if not g:
+        # 保守表没命中的，才去查扩展表；而且只给多字词用 ——
+        # 单字用"拆词匹配"太容易撞同形词（的→новый、can→бидон）。
+        # 这样扩展表只会【新增】词条，绝不会改动已有的好译文。
+        if not multi:
+            continue
+        g = pivot_ext_by.get((simp, a))
+        src = "pivot-ext"
+    if not g:
+        continue
+    rec["ru"] = g
+    rec["src"] = src
+    if src == "pivot":
+        pivot_n += 1
+    else:
+        pivot_ext_n += 1
+
+# 人工表在下面「枢轴」之前就解析好：枢轴必须先跳过人工词，
+# 否则人工词会被枢轴先填掉，导致人工译文被静默丢弃（见长 就踩过这个坑）。
+manual_n = 0
+
 manual_n = 0
 for (simp, a), rec in rows.items():
     g = manual.get((simp, a))
@@ -300,7 +337,7 @@ for (simp, a), rec in rows.items():
     rec["src"] = "manual"
     manual_n += 1
 
-print(f"CC-CEDICT {len(entries)}（去重读音） FreeDict {len(fd)}  RU-wikt {len(rw)}  枢轴补 {pivot_n}  人工补 {manual_n}（另新建 {manual_only}）")
+print(f"CC-CEDICT {len(entries)}（去重读音） FreeDict {len(fd)}  RU-wikt {len(rw)}  枢轴补 {pivot_n}  扩展枢轴兜底 {pivot_ext_n}  人工补 {manual_n}（另新建 {manual_only}）")
 
 # 现代常用词加权：jieba 词频对这几个字/词低估（古典语料里反而是另一些更常见），手工校正
 FREQ_BOOST = {"帮": 8.0, "给": 2.0, "让": 2.0, "请": 1.5, "邦": 0.15, "浜": 0.05}
@@ -309,10 +346,11 @@ out = []
 for (simp, a), r in rows.items():
     if r["ru"]:
         _f = int(freq.get(simp, 0) * FREQ_BOOST.get(simp, 1.0))
-        out.append((simp, r["trad"], a, r["d"], r["pos"], _f, " | ".join(r["ru"][:4]), r.get("ini", "")))
+        out.append((simp, r["trad"], a, r["d"], r["pos"], _f, " | ".join(r["ru"][:4]),
+                    r.get("ini", ""), r.get("src", "")))
 out.sort(key=lambda x: (-x[5], len(x[0]), x[2]))
 with io.open(OUT, "w", encoding="utf-8", newline="\n") as f:
-    f.write("#simplified\ttraditional\tpinyin_ascii\tpinyin_display\tpos\tfreq\tru\tinitials\n")
+    f.write("#simplified\ttraditional\tpinyin_ascii\tpinyin_display\tpos\tfreq\tru\tinitials\tsrc\n")
     for r in out:
         f.write("\t".join(str(x) for x in r) + "\n")
 print(f"写出 {OUT}: {len(out)} 条")
