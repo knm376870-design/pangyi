@@ -395,6 +395,11 @@ impl ITfKeyEventSink_Impl for TextService {
     }
 
     fn OnTestKeyDown(&self, _pic: Option<&ITfContext>, wparam: WPARAM, _lp: LPARAM) -> Result<BOOL> {
+        // 带 Ctrl / Alt / Win 的组合键一律不碰，原样交给应用和系统
+        if command_modifier_down() {
+            dlog!("KeySink::OnTestKeyDown wparam={} 有修饰键，放行", wparam.0);
+            return Ok(BOOL(0));
+        }
         let ch0 = wparam.0 as u8 as char;
         if ch0.is_ascii_alphabetic() && crate::settings::english() {
             return Ok(BOOL(0));
@@ -425,6 +430,10 @@ impl ITfKeyEventSink_Impl for TextService {
     }
 
     fn OnKeyDown(&self, pic: Option<&ITfContext>, wparam: WPARAM, _lp: LPARAM) -> Result<BOOL> {
+        // 双保险：带 Ctrl / Alt / Win 的键直接放行，绝不进组合
+        if command_modifier_down() {
+            return Ok(BOOL(0));
+        }
         let ch = wparam.0 as u8 as char;
         dlog!("KeySink::OnKeyDown wparam={} ch={ch:?}", wparam.0);
 
@@ -470,6 +479,8 @@ impl ITfKeyEventSink_Impl for TextService {
 
         // 数字 1-9：直接选第几个候选
         if (0x31..=0x39).contains(&(wparam.0 as u32)) {
+            // Shift+数字 让应用去输入 ! @ # 等符号
+            if shift_down() { return Ok(BOOL(0)); }
             if !has_buf { return Ok(BOOL(0)); }
             let idx = (wparam.0 as usize) - 0x31;
             let word = UI_CANDS.lock().unwrap().get(idx).map(|(w, _)| w.clone());
@@ -569,6 +580,29 @@ fn status_toggle_english() {
     crate::settings::set_english(!crate::settings::english());
 }
 
+/// 某个虚拟键现在是不是按下的
+fn key_down(vk: i32) -> bool {
+    unsafe { (windows::Win32::UI::Input::KeyboardAndMouse::GetKeyState(vk) as u16 & 0x8000) != 0 }
+}
+
+/// Ctrl / Alt / Win 按住时，输入法必须【完全放行】。
+///
+/// 这是之前一个很严重的问题：claim() 只看键码不看修饰键，
+/// 而 Ctrl+C 的 C、Ctrl+V 的 V、Alt+F4 的 F4(0x73='s')、Win+D 的 D 都是"字母"，
+/// 于是这些系统快捷键全被输入法当成"要打拼音"吞掉了 ——
+/// 复制粘贴、全选、撤销、保存、关闭窗口、Win 组合键统统失效。
+fn command_modifier_down() -> bool {
+    use windows::Win32::UI::Input::KeyboardAndMouse::{VK_CONTROL, VK_LWIN, VK_MENU, VK_RWIN};
+    key_down(VK_CONTROL.0 as i32)
+        || key_down(VK_MENU.0 as i32)
+        || key_down(VK_LWIN.0 as i32)
+        || key_down(VK_RWIN.0 as i32)
+}
+
+fn shift_down() -> bool {
+    key_down(windows::Win32::UI::Input::KeyboardAndMouse::VK_SHIFT.0 as i32)
+}
+
 fn claim(wparam: WPARAM, has_buf: bool, english: bool) -> bool {
     let ch = wparam.0 as u8 as char;
     if ch.is_ascii_alphabetic() {
@@ -579,7 +613,8 @@ fn claim(wparam: WPARAM, has_buf: bool, english: bool) -> bool {
     }
     match wparam.0 as u32 {
         0x20 | 0x1B | 0x08 | 0x0D | 0x09 => true, // 空格 / ESC / 退格 / 回车 / Tab
-        0x31..=0x39 => true,                      // 数字选词
+        // 数字选词。Shift+数字 是打 ! @ # $ % 这类符号，不能抢
+        0x31..=0x39 => !shift_down(),
         0x25..=0x28 => true,                      // 方向键选词
         0x21 | 0x22 => true,                      // PageUp / PageDown
         _ => is_punct_vk(wparam.0 as u32),
