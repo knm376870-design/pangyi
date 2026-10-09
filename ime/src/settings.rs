@@ -101,6 +101,10 @@ pub fn dark(system_dark: bool) -> bool {
 
 // ---------------- 面板 ----------------
 
+fn wide(s: &str) -> Vec<u16> {
+    s.encode_utf16().chain(std::iter::once(0)).collect()
+}
+
 fn sc(px: i32) -> i32 {
     let d = unsafe { crate::cand::dpi() };
     (px * d) / 96
@@ -149,6 +153,7 @@ fn draw(dc: HDC, f: HFONT, color: COLORREF, x: i32, y: i32, s: &str) -> i32 {
 }
 
 const ROW_H: i32 = 34;
+const ROW_COUNT: i32 = 5;
 const PAD: i32 = 16;
 
 /// 每行的选项：标签 + 选项文本 + 动作号
@@ -158,6 +163,7 @@ fn rows() -> Vec<(&'static str, Vec<(&'static str, i32)>)> {
         ("字号", vec![("小", 4), ("标准", 5), ("大", 6)]),
         ("排版", vec![("竖排", 7), ("横排", 8)]),
         ("主题", vec![("跟随系统", 9), ("浅色", 10), ("深色", 11)]),
+        ("自定义短语", vec![("打开短语文件", 12)]),
     ]
 }
 
@@ -250,7 +256,7 @@ unsafe extern "system" fn proc_settings(h: HWND, msg: u32, wp: WPARAM, lp: LPARA
             let _ = DeleteObject(f_text);
             let _ = ReleaseDC(h, dc);
             // 点到底部的「关闭」就关窗
-            let close_y = sc(48) + sc(ROW_H) * 4;
+            let close_y = sc(48) + sc(ROW_H) * ROW_COUNT;
             if hit == 0 && py2 >= close_y && py2 <= close_y + sc(30) {
                 let _ = SendMessageW(h, WM_CLOSE, WPARAM(0), LPARAM(0));
                 let _ = DeleteObject(f_text);
@@ -298,6 +304,22 @@ fn apply(action: i32) {
         9 => THEME.store(0, Ordering::Relaxed),
         10 => THEME.store(1, Ordering::Relaxed),
         11 => THEME.store(2, Ordering::Relaxed),
+        12 => {
+            // 打开自定义短语文件（phrases.txt）
+            let base = std::env::var("LOCALAPPDATA").unwrap_or_else(|_| ".".into());
+            let file = format!("{base}\\Pangyi\\phrases.txt");
+            let _ = crate::dict::phrase("dz"); // 顺便保证文件已生成
+            let f = wide(&file);
+            let v = wide("open");
+            let n = wide("notepad.exe");
+            unsafe {
+                windows::Win32::UI::Shell::ShellExecuteW(
+                    HWND(0), PCWSTR(n.as_ptr()), PCWSTR(f.as_ptr()),
+                    PCWSTR::null(), PCWSTR::null(), SW_SHOWNORMAL,
+                );
+                let _ = v;
+            }
+        }
         _ => {}
     }
     save();
@@ -325,7 +347,7 @@ unsafe fn init() {
         WINDOW_EX_STYLE(0),
         PCWSTR(cls.as_ptr()), PCWSTR(title.as_ptr()),
         WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX,
-        0, 0, sc(340), sc(260), None, None, hinst, None);
+        0, 0, sc(340), sc(300), None, None, hinst, None);
 }
 /// 独立设置程序用：开一个带标题栏的普通窗口（可以从右上角关掉）。
 pub unsafe fn open_app() {
@@ -337,7 +359,7 @@ pub unsafe fn open_app() {
     let (_, _, bg, _) = colors();
     let _ = DeleteObject(BG);
     BG = CreateSolidBrush(bg);
-    let (w, h) = (sc(340), sc(260));
+    let (w, h) = (sc(340), sc(300));
     let sw = GetSystemMetrics(SM_CXSCREEN);
     let sh = GetSystemMetrics(SM_CYSCREEN);
     let _ = SetWindowPos(WND, HWND_TOP, (sw - w) / 2, (sh - h) / 2, w, h, SWP_SHOWWINDOW);
