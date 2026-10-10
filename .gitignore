@@ -12,4 +12,13 @@ data/*.log
 data/*.err
 ime/payload/
 tools/pylibs/
+tools/pylibs2/
+tools/pylibs3/
+tools/_*
+data/_preview*.tsv
+data/net/
+ime/pre-review-backup/
+ime/build/_enc/
+ime/src/*.bak*
+/outputs/
 /pangyi-setup.exe

@@ -16,13 +16,18 @@ use windows::Win32::UI::WindowsAndMessaging::*;
 const DLL64: &[u8] = include_bytes!("../../payload/pangyi_ime.dll");
 const DLL32: &[u8] = include_bytes!("../../payload/pangyi_ime-x86.dll");
 const ICO: &[u8] = include_bytes!("../../payload/pangyi.ico");
-const SETTINGS64: &[u8] = include_bytes!("../../payload/pangyi-settings.exe");
 
 const DIR: &str = r"C:\Program Files\Pangyi";
 const DLL64_NAME: &str = "pangyi_ime.dll";
 const DLL32_NAME: &str = "pangyi_ime-x86.dll";
 const ICO_NAME: &str = "pangyi.ico";
 const SETTINGS_NAME: &str = "pangyi-settings.exe";
+/// 单一入口程序名（安装 + 设置都在这一个 exe 里）
+const APP_NAME: &str = "pangyi.exe";
+/// 桌面上的那个软件名
+const DESKTOP_APP: &str = "旁译.exe";
+/// 版本标记：装完后写进安装目录，用来判断"已经是当前版本了"
+const VERSION_FILE: &str = "version.txt";
 const CLSID_STR: &str = "{B4E8F2A1-7C3D-4E5F-9A21-8D6C4B3E1F07}";
 const PROFILE_STR: &str = "{5A7C9E12-3D4B-4F8A-B6E1-2C9D7A5E8F34}";
 const CLSID: GUID = GUID::from_u128(0xB4E8F2A1_7C3D_4E5F_9A21_8D6C4B3E1F07);
@@ -199,11 +204,14 @@ unsafe fn make_shortcut(lnk: &str, target: &str, workdir: &str) {
 }
 
 unsafe fn shortcuts() {
-    let set = format!("{DIR}\\{SETTINGS_NAME}");
-    let common_start = r"C:\ProgramData\Microsoft\Windows\Start Menu\Programs\旁译 设置.lnk";
-    make_shortcut(common_start, &set, DIR);
-    let public_desktop = r"C:\Users\Public\Desktop\旁译 设置.lnk";
-    make_shortcut(public_desktop, &set, DIR);
+    // 开始菜单只留【一个】入口，指向那个单一软件
+    let app = format!("{DIR}\\{APP_NAME}");
+    let _ = std::fs::remove_file(r"C:\ProgramData\Microsoft\Windows\Start Menu\Programs\旁译 设置.lnk");
+    make_shortcut(
+        r"C:\ProgramData\Microsoft\Windows\Start Menu\Programs\旁译.lnk",
+        &app,
+        DIR,
+    );
 }
 
 /// 写组件；如果目标文件被正在运行的程序占用，就换个带时间戳的名字写，
@@ -253,12 +261,17 @@ fn purge_old_versions(dir: &Path, keep: &[String]) {
         keep.iter().any(|k| k.eq_ignore_ascii_case(&s))
     };
 
-    // 1) 安装目录：只留这一轮注册的那两个 DLL
+    // 1) 安装目录：只留这一轮注册的那两个 DLL，外加"那一个软件"
+    //    （旧的 pangyi-settings.exe / pangyi-setup.exe 现在都并进单一软件了，要删掉）
+    let keep_names = [DLL64_NAME, DLL32_NAME, APP_NAME, ICO_NAME, VERSION_FILE];
     if let Ok(rd) = std::fs::read_dir(dir) {
         for e in rd.flatten() {
             let name = e.file_name().to_string_lossy().to_string();
             let low = name.to_ascii_lowercase();
-            if low.starts_with("pangyi_ime") && low.ends_with(".dll") && !is_keep(&e.path()) {
+            let is_old_dll = low.starts_with("pangyi_ime") && low.ends_with(".dll") && !is_keep(&e.path());
+            let is_obsolete = keep_names.iter().all(|k| !k.eq_ignore_ascii_case(&name))
+                && (low.ends_with(".exe") || name.starts_with("旁译"));
+            if is_old_dll || is_obsolete {
                 remove_or_schedule(&e.path());
             }
         }
@@ -274,7 +287,7 @@ fn purge_old_versions(dir: &Path, keep: &[String]) {
                 let stale = (low.starts_with("pangyi_ime") && low.ends_with(".dll"))
                     || low == "pangyi-settings.exe"
                     || low.ends_with(".log")
-                    || name.starts_with("旁译");
+                    || legacy_desktop_names().iter().any(|k| *k == name);
                 if stale {
                     remove_or_schedule(&e.path());
                 }
@@ -290,25 +303,55 @@ fn purge_old_versions(dir: &Path, keep: &[String]) {
     }
 }
 
-/// 把最新版的安装包和设置程序放到桌面
-///（用户要求"每个最新版本都要在桌面上"；只有带管理员权限的安装程序能写到桌面）
-fn copy_to_desktop() {
+/// 桌面上已知的旧版旁译文件名（精确匹配，只删这些）。
+///
+/// ⚠️ 绝不能用「旁译」前缀匹配清桌面：用户桌面上可能有「旁译-对话存档」这种
+/// 以旁译开头的目录或文件，前缀匹配会误删（对目录还会排队"重启后删除"）。
+fn legacy_desktop_names() -> [&'static str; 5] {
+    [
+        DESKTOP_APP, // 上一版的那个软件，重新复制前先删掉
+        "旁译 设置.lnk",
+        "旁译 · 中俄输入.lnk",
+        "旁译设置.exe",
+        "旁译安装.exe",
+    ]
+}
+
+/// 把"旁译"做成【桌面上的一个软件】。
+///
+/// 做法：先清掉桌面/公共桌面上清单里的旧旁译文件（安装包、设置程序、旧快捷方式），
+/// 再只放一个「旁译.exe」。以后每次升级也走这里，所以桌面上永远只有一个。
+fn place_single_app() {
+    let me = std::env::current_exe().ok();
+
     let mut desks: Vec<std::path::PathBuf> = Vec::new();
     if let Ok(profile) = std::env::var("USERPROFILE") {
         desks.push(Path::new(&profile).join("Desktop"));
     }
     desks.push(Path::new(r"C:\Users\Public\Desktop").to_path_buf());
-    let me = std::env::current_exe().ok();
-    let set = Path::new(DIR).join(SETTINGS_NAME);
-    for d in desks {
+
+    for (i, d) in desks.iter().enumerate() {
         if !d.is_dir() {
             continue;
         }
-        if let Some(m) = me.as_ref() {
-            let _ = std::fs::copy(m, d.join("旁译-安装程序.exe"));
+        // 只删清单里的旧文件（精确匹配 + 只动文件，目录一律不碰）
+        if let Ok(rd) = std::fs::read_dir(d) {
+            for e in rd.flatten() {
+                let Ok(ft) = e.file_type() else { continue };
+                if !ft.is_file() {
+                    continue;
+                }
+                let name = e.file_name().to_string_lossy().to_string();
+                if legacy_desktop_names().iter().any(|k| *k == name) {
+                    remove_or_schedule(&e.path());
+                }
+            }
         }
-        if set.is_file() {
-            let _ = std::fs::copy(&set, d.join("旁译-设置.exe"));
+        // 只在【用户桌面】放那个唯一的软件；公共桌面不放（避免出现两份）
+        if i == 0 {
+            if let Some(m) = me.as_ref() {
+                let _ = std::fs::copy(m, d.join(DESKTOP_APP));
+            }
         }
     }
 }
@@ -320,19 +363,20 @@ fn install() {
         return;
     }
     let ico = dir.join(ICO_NAME);
-    let set = dir.join(SETTINGS_NAME);
     let _ = std::fs::write(&ico, ICO);
-    let _ = std::fs::write(&set, SETTINGS64);
     unsafe { shortcuts(); }
 
     let d64s = write_or_versioned(dir, DLL64_NAME, DLL64);
     let d32s = write_or_versioned(dir, DLL32_NAME, DLL32);
     let d64 = std::path::PathBuf::from(&d64s);
     let d32 = std::path::PathBuf::from(&d32s);
-    // 把自己也放进安装目录，卸载时用得上
+    // 把自己放进安装目录（这就是"那个软件"），卸载时也用它
     if let Ok(me) = std::env::current_exe() {
-        let _ = std::fs::copy(me, dir.join("pangyi-setup.exe"));
+        let _ = std::fs::copy(&me, dir.join(APP_NAME));
+        let _ = std::fs::remove_file(dir.join("pangyi-setup.exe"));
     }
+    // 版本标记：下次再双击时，是"开设置"还是"装新版"就看它
+    let _ = std::fs::write(dir.join(VERSION_FILE), env!("CARGO_PKG_VERSION"));
     icacls_grant(DIR);
 
     let d64s = d64.to_string_lossy().to_string();
@@ -375,7 +419,9 @@ fn install() {
     reg_set(HKEY_LOCAL_MACHINE, &un, "Publisher", "Pangyi");
     reg_set(HKEY_LOCAL_MACHINE, &un, "InstallLocation", DIR);
     reg_set(HKEY_LOCAL_MACHINE, &un, "DisplayIcon", &icos);
-    let uninstall_cmd = format!("\"{}\" --uninstall", set.parent().unwrap().join("pangyi-setup.exe").to_string_lossy());
+    let inst_dir = Path::new(DIR);
+    let app_path = inst_dir.join(APP_NAME);
+    let uninstall_cmd = format!("\"{}\" --uninstall", app_path.to_string_lossy());
     reg_set(HKEY_LOCAL_MACHINE, &un, "UninstallString", &uninstall_cmd);
     reg_set_dword(HKEY_LOCAL_MACHINE, &un, "NoModify", 1);
     reg_set_dword(HKEY_LOCAL_MACHINE, &un, "NoRepair", 1);
@@ -383,13 +429,12 @@ fn install() {
     // 清掉用户级覆盖（会盖住 HKLM）——64 位和 32 位两处都要清
     reg_del_tree(HKEY_CURRENT_USER, &format!("Software\\Classes\\CLSID\\{CLSID_STR}"));
     reg_del_tree(HKEY_CURRENT_USER, &format!("Software\\Classes\\WOW6432Node\\CLSID\\{CLSID_STR}"));
-    reg_del_tree(HKEY_CURRENT_USER, &format!("Software\\Classes\\WOW6432Node\\CLSID\\{CLSID_STR}"));
 
-    copy_to_desktop();
+    place_single_app();
 
     msg(
         "旁译 安装完成",
-        "旁译已安装。\n\n下一步：注销后重新登录（或重启一次），然后在任意程序里按 Win+空格 切到「旁译」即可。\n\n设置：点状态条上的齿轮，或运行 C:\\Program Files\\Pangyi\\pangyi-settings.exe",
+        "旁译已安装。\n\n下一步：注销后重新登录（或重启一次），然后在任意程序里按 Win+空格 切到「旁译」即可。\n\n设置：双击桌面上的「旁译」，或运行 C:\\Program Files\\Pangyi\\pangyi.exe",
     );
 }
 
@@ -402,17 +447,53 @@ fn uninstall() {
     reg_del_tree(HKEY_LOCAL_MACHINE, "SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\Pangyi");
     reg_del_tree(HKEY_CURRENT_USER, &format!("Software\\Classes\\CLSID\\{CLSID_STR}"));
     let _ = std::fs::remove_file(r"C:\ProgramData\Microsoft\Windows\Start Menu\Programs\旁译 设置.lnk");
+    let _ = std::fs::remove_file(r"C:\ProgramData\Microsoft\Windows\Start Menu\Programs\旁译.lnk");
     let _ = std::fs::remove_file(r"C:\Users\Public\Desktop\旁译 设置.lnk");
-    for f in [DLL64_NAME, DLL32_NAME, ICO_NAME, SETTINGS_NAME, "pangyi-setup.exe"] {
+    // 桌面上的那个软件也删掉
+    if let Ok(profile) = std::env::var("USERPROFILE") {
+        let _ = std::fs::remove_file(Path::new(&profile).join("Desktop").join(DESKTOP_APP));
+    }
+    for f in [DLL64_NAME, DLL32_NAME, ICO_NAME, SETTINGS_NAME, "pangyi-setup.exe", APP_NAME, VERSION_FILE] {
         let _ = std::fs::remove_file(dir.join(f));
     }
     let _ = std::fs::remove_dir(dir);
     msg("旁译 已卸载", "旁译已卸载。注销或重启后，输入法列表里就不会再有它了。");
 }
 
+/// 已经装好了吗？（安装目录里有 version.txt 且版本号与当前 exe 一致）
+fn installed_current() -> bool {
+    let dir = Path::new(DIR);
+    let v = match std::fs::read_to_string(dir.join(VERSION_FILE)) {
+        Ok(v) => v,
+        Err(_) => return false,
+    };
+    v.trim() == env!("CARGO_PKG_VERSION") && dir.join(DLL64_NAME).is_file()
+}
+
+/// 打开设置窗口（不需要管理员权限）。
+/// 这就是"那一个软件"的日常用途 —— 双击就开设置。
+unsafe fn open_settings() -> ! {
+    pangyi_ime::settings::load();
+    pangyi_ime::settings::open_app();
+    let mut msg = MSG::default();
+    while GetMessageW(&mut msg, None, 0, 0).as_bool() {
+        let _ = TranslateMessage(&msg);
+        DispatchMessageW(&msg);
+    }
+    std::process::exit(0);
+}
+
 fn main() {
     unsafe {
-        let do_uninstall = std::env::args().any(|a| a == "--uninstall");
+        let args: Vec<String> = std::env::args().collect();
+        let do_uninstall = args.iter().any(|a| a == "--uninstall");
+        let force_install = args.iter().any(|a| a == "--install");
+
+        // 已经是最新版 → 直接开设置窗口（不需要 UAC）
+        if !do_uninstall && !force_install && installed_current() {
+            open_settings();
+        }
+
         if !elevated() {
             relaunch_elevated(do_uninstall);
             return;
@@ -421,6 +502,8 @@ fn main() {
             uninstall();
         } else {
             install();
+            // 装完顺手把设置窗口打开，用户点一次就什么都齐了
+            open_settings();
         }
     }
 }

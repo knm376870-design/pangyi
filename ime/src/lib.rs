@@ -36,7 +36,19 @@ static PENDING_CAND: Mutex<Option<(i32, i32)>> = Mutex::new(None);
 pub const CLSID_PANGYI: GUID = GUID::from_u128(0xB4E8F2A1_7C3D_4E5F_9A21_8D6C4B3E1F07);
 pub const GUID_PROFILE: GUID = GUID::from_u128(0x5A7C9E12_3D4B_4F8A_B6E1_2C9D7A5E8F34);
 
+/// COM 对象存活计数。
+///
+/// 之前 LIVE 从来没被加过：DllCanUnloadNow 恒返回 S_OK，COM 运行时
+/// （CoFreeUnusedLibraries）空闲时真可能把 DLL 卸掉，而 TextService 实例还活着，
+/// 宿主进程就会崩。现在每建一个 TextService 加一，对象销毁时（LiveGuard 的 Drop）减一。
 static LIVE: AtomicU32 = AtomicU32::new(0);
+
+struct LiveGuard;
+impl Drop for LiveGuard {
+    fn drop(&mut self) {
+        LIVE.fetch_sub(1, Ordering::SeqCst);
+    }
+}
 /// 当前活动组合。一个进程里可能有好几个线程在用输入法，这块是进程级状态，
 /// 原来写成 static mut 属于数据竞争 —— 改成互斥量。
 ///
@@ -56,7 +68,6 @@ static UI_CANDS: Mutex<Vec<(String, String)>> = Mutex::new(Vec::new());
 /// 全部候选（翻页用）以及当前页号
 static ALL_CANDS: Mutex<Vec<(String, String, String)>> = Mutex::new(Vec::new());
 static PAGE: AtomicUsize = AtomicUsize::new(0);
-const PAGE_SIZE: usize = 9;
 const S_FALSE_HR: HRESULT = HRESULT(1);
 const CLASS_E_CLASSNOTAVAILABLE_HR: HRESULT = HRESULT(0x80040111u32 as i32);
 
@@ -97,6 +108,8 @@ macro_rules! dlog {
 
 #[implement(ITfTextInputProcessorEx, ITfKeyEventSink, ITfThreadMgrEventSink, ITfCompositionSink)]
 struct TextService {
+    /// COM 存活标记：对象销毁时给 LIVE 减一（见 LIVE 的注释）
+    _live: LiveGuard,
     client_id: Cell<u32>,
     tid: Cell<u32>,
     /// 保持线程管理器 / 按键管理器的引用计数，别存裸指针
@@ -115,7 +128,9 @@ struct TextService {
 
 impl TextService {
     fn new() -> Self {
+        LIVE.fetch_add(1, Ordering::SeqCst);
         Self {
+            _live: LiveGuard,
             client_id: Cell::new(0),
             tid: Cell::new(0),
             tm: RefCell::new(None),
@@ -151,11 +166,13 @@ impl ITfTextInputProcessorEx_Impl for TextService {
 /// 之前是「持着锁直接调 refresh_page()」，而 refresh_page 也要锁 ALL_CANDS ——
 /// std::sync::Mutex 不可重入，于是敲第一个字母就把输入线程锁死，
 /// 表现就是"切到旁译之后打不出字，得重新开一个程序才行"。
-fn set_all_cands(hits: &[dict::Hit]) {
+fn set_all_cands(hits: Vec<dict::Hit>) {
     {
         let mut g = ALL_CANDS.lock().unwrap();
         g.clear();
-        g.extend(hits.iter().map(|h| (h.word.clone(), h.pinyin.clone(), h.ru.clone())));
+        // 直接把 lookup 的结果移进来（原来是逐条 clone），
+        // 候选池放大到几百条之后这一步不能再白拷一份
+        g.extend(hits.into_iter().map(|h| (h.word, h.pinyin, h.ru)));
     }
     PAGE.store(0, std::sync::atomic::Ordering::Relaxed);
     refresh_page();
@@ -164,33 +181,67 @@ fn set_all_cands(hits: &[dict::Hit]) {
 /// 把当前页的候选交给候选窗。
 /// 先在锁里把这一页拷出来，出了锁再去动 UI / 窗口，避免任何嵌套加锁。
 fn refresh_page() {
-    let (items, ui) = {
+    // 页大小 = 「候选个数」设置：翻页、候选窗显示、数字选词都用同一份，
+    // 否则设成 5/7 时翻页会跳过没显示的候选，数字还能选到窗口上没有的条目
+    let size = crate::settings::max_cands();
+    let (items, ui, page, pages) = {
         let all = ALL_CANDS.lock().unwrap();
-        let page = PAGE.load(std::sync::atomic::Ordering::Relaxed);
-        let start = (page * PAGE_SIZE).min(all.len());
-        let end = (start + PAGE_SIZE).min(all.len());
+        let pages = ((all.len() + size - 1) / size).max(1);
+        let page = PAGE
+            .load(std::sync::atomic::Ordering::Relaxed)
+            .min(pages - 1);
+        let start = (page * size).min(all.len());
+        let end = (start + size).min(all.len());
         let slice = &all[start..end];
         let items: Vec<cand::Item> = slice
             .iter()
             .map(|(w, p, r)| cand::Item { word: w.clone(), pinyin: p.clone(), ru: r.clone(), fresh: false })
             .collect();
         let ui: Vec<(String, String)> = slice.iter().map(|(w, _p, r)| (w.clone(), r.clone())).collect();
-        (items, ui)
+        (items, ui, page, pages)
     };
-    unsafe { cand::set_items(items); }
+    unsafe {
+        cand::set_items(items);
+        // 页码给候选窗画右下角那个「▲▼ 2/59」
+        cand::set_page(page, pages);
+    }
     let mut u = UI_CANDS.lock().unwrap();
     u.clear();
     u.extend(ui);
 }
 
+/// 翻页：delta = -1 上一页 / +1 下一页。返回是否真的翻动了
+///（已经在头/尾页就返回 false，按键当没发生）。
+/// 微软拼音同款按键：PageUp/PageDown、`-`/`=`，上下方向键撞到页边界也翻。
+fn flip_page(delta: isize) -> bool {
+    let total = ALL_CANDS.lock().unwrap().len();
+    if total == 0 {
+        return false;
+    }
+    let size = crate::settings::max_cands();
+    let pages = (total + size - 1) / size;
+    let cur = PAGE.load(std::sync::atomic::Ordering::Relaxed);
+    let next = if delta < 0 {
+        cur.saturating_sub(1)
+    } else {
+        (cur + 1).min(pages.saturating_sub(1))
+    };
+    if next == cur {
+        return false;
+    }
+    PAGE.store(next, std::sync::atomic::Ordering::Relaxed);
+    refresh_page();
+    true
+}
+
 impl TextService {
-    /// 把某个词上屏（换掉当前组合）
-    fn commit_word(&self, pic: Option<&ITfContext>, word: &str) {
-        dict::note_choice(word); // 自学习：下次把这个词排前面
+    /// 把文本写进文档（换掉当前组合），不记录自学习。
+    /// 用于「候选 + 标点 / 候选 + 大写字母」这类拼接上屏 —— 不能把拼接串
+    /// 喂给 note_choice，否则 learned.txt 里会混进「你好,」「你H」这种脏词条。
+    fn commit_text(&self, pic: Option<&ITfContext>, text: &str) {
         if let Some(ctx) = pic {
             let session: ITfEditSession = DoneSession {
-                ctx: ctx.clone(),
-                text: word.encode_utf16().collect(),
+                text: text.encode_utf16().collect(),
             }
             .into();
             let flags = TF_CONTEXT_EDIT_CONTEXT_FLAGS(TF_ES_SYNC.0 | TF_ES_READWRITE.0);
@@ -198,18 +249,37 @@ impl TextService {
         }
     }
 
+    /// 把某个词上屏（换掉当前组合）
+    fn commit_word(&self, pic: Option<&ITfContext>, word: &str) {
+        dict::note_choice(word); // 自学习：下次把这个词排前面
+        self.commit_text(pic, word);
+    }
+
     /// 更新组合内容为当前的拼音串（用于退格）
     fn refresh_composition(&self, pic: Option<&ITfContext>) {
         let key = self.buf.borrow().clone();
         if key.is_empty() {
-            *COMPOSITION.lock().unwrap() = None;
+            // 删到空了：把组合真正结束掉，否则文档里会残留最后一个拼音字母
+            // （直接置 None 只是丢掉引用，组合文字还在文档里，见 EndSession 的注释）
             unsafe { cand_hide(); }
+            if let Some(ctx) = pic {
+                let s: ITfEditSession = EndSession.into();
+                let flags = TF_CONTEXT_EDIT_CONTEXT_FLAGS(TF_ES_SYNC.0 | TF_ES_READWRITE.0);
+                let _ = unsafe { ctx.RequestEditSession(self.client_id.get(), &s, flags) };
+            } else {
+                *COMPOSITION.lock().unwrap() = None;
+            }
             return;
         }
         unsafe { cand::set_preedit(&key); }
         unsafe { cand::set_sentence(dict::complete(&key).map(|(w, _)| w)); }
-        let hits = dict::lookup(&key);
-        set_all_cands(&hits);
+        set_all_cands(dict::lookup(&key));
+        // 候选窗重画：set_items 只改内存，不触发 WM_PAINT。
+        // 缺这一句的话，退格后候选窗还停留在旧拼音的候选上（v4.2.0 的 bug：
+        // 删一个字母候选不变，删光才一起消失 —— 只有 cand_hide 生效）。
+        if let Some((x, y)) = *PENDING_CAND.lock().unwrap() {
+            unsafe { cand_update(x, y); }
+        }
         if let Some(ctx) = pic {
             let s: ITfEditSession = UpdateSession { text: key.encode_utf16().collect() }.into();
             let flags = TF_CONTEXT_EDIT_CONTEXT_FLAGS(TF_ES_SYNC.0 | TF_ES_READWRITE.0);
@@ -395,6 +465,18 @@ impl ITfKeyEventSink_Impl for TextService {
     }
 
     fn OnTestKeyDown(&self, _pic: Option<&ITfContext>, wparam: WPARAM, _lp: LPARAM) -> Result<BOOL> {
+        // Shift 的按下/抬起在测试回调里直接记，不靠 OnKeyDown/OnKeyUp：
+        // 按 TSF 契约，OnKeyDown/OnKeyUp 只在测试回调返回 TRUE 时才会被回调，
+        // 而 Shift 不能被 claim（会吞掉 Shift+字母、Shift+方向键）。
+        // 测试回调对每个按键都会问一遍，所以放这里最稳。
+        if wparam.0 == 0x10 {
+            SHIFT_DOWN_AT.store(now_ms32(), Ordering::Relaxed);
+            // 只有「单独」按 Shift 才算候选切换：有别的修饰键按着（Ctrl+Shift 等）就记脏
+            SHIFT_DIRTY.store(command_modifier_down(), Ordering::Relaxed);
+            dlog!("KeySink::OnTestKeyDown wparam=16 Shift键 async_shift={} async_caps={}", shift_down(), caps_on());
+            return Ok(BOOL(0));
+        }
+        SHIFT_DIRTY.store(true, Ordering::Relaxed);
         // 带 Ctrl / Alt / Win 的组合键一律不碰，原样交给应用和系统
         if command_modifier_down() {
             dlog!("KeySink::OnTestKeyDown wparam={} 有修饰键，放行", wparam.0);
@@ -404,17 +486,23 @@ impl ITfKeyEventSink_Impl for TextService {
         if ch0.is_ascii_alphabetic() && crate::settings::english() {
             return Ok(BOOL(0));
         }
+        // Shift / Caps + 字母：大写英文直通（微软一致 —— 用户原话「不能输入
+        // 大写英文字母」）。没有拼音时直接放行，应用按键盘状态输出大写字母；
+        // 有拼音时先 claim，OnKeyDown 里提交首选候选再放行（微软：拼音中间
+        // 按 Shift+字母 = 首选上屏 + 大写字母）。
+        if ch0.is_ascii_alphabetic() && (shift_down() || caps_on()) {
+            dlog!("KeySink::OnTestKeyDown wparam={} shift={} caps={} 大写分支", wparam.0, shift_down(), caps_on());
+            let has_buf = !self.buf.borrow().is_empty();
+            return Ok(BOOL(has_buf as i32));
+        }
         let has_buf = !self.buf.borrow().is_empty();
         let want = claim(wparam, has_buf, crate::settings::english());
-        dlog!("KeySink::OnTestKeyDown wparam={} 我要={want}", wparam.0);
+        dlog!("KeySink::OnTestKeyDown wparam={} 我要={want} shift={} caps={}", wparam.0, shift_down(), caps_on());
         Ok(BOOL(want as i32))
     }
     fn OnTestKeyUp(&self, _pic: Option<&ITfContext>, w: WPARAM, _l: LPARAM) -> Result<BOOL> {
-        dlog!("KeySink::OnTestKeyUp wparam={}", w.0);
-        Ok(BOOL(0))
-    }
-    fn OnKeyUp(&self, _pic: Option<&ITfContext>, w: WPARAM, _l: LPARAM) -> Result<BOOL> {
-        // 单独按一下 Shift（没夹着别的键）= 切中/英
+        // 单独按一下 Shift（没夹着别的键、400ms 内松开）= 切中/英。
+        // 放在测试回调而不是 OnKeyUp，原因见 OnTestKeyDown 的注释。
         if w.0 == 0x10 {
             let t0 = SHIFT_DOWN_AT.load(Ordering::Relaxed);
             let dt = now_ms32().wrapping_sub(t0);
@@ -422,6 +510,10 @@ impl ITfKeyEventSink_Impl for TextService {
                 status_toggle_english();
             }
         }
+        Ok(BOOL(0))
+    }
+    fn OnKeyUp(&self, _pic: Option<&ITfContext>, _w: WPARAM, _l: LPARAM) -> Result<BOOL> {
+        // Shift 切换已经挪到 OnTestKeyUp（见上面的注释），这里不再处理
         Ok(BOOL(0))
     }
     fn OnPreservedKey(&self, _pic: Option<&ITfContext>, g: *const GUID) -> Result<BOOL> {
@@ -437,13 +529,34 @@ impl ITfKeyEventSink_Impl for TextService {
         let ch = wparam.0 as u8 as char;
         dlog!("KeySink::OnKeyDown wparam={} ch={ch:?}", wparam.0);
 
-        // 单独按一下 Shift = 切换中/英（没有状态条了，用这个切）
-        if wparam.0 == 0x10 {
-            SHIFT_DOWN_AT.store(now_ms32(), Ordering::Relaxed);
-            SHIFT_DIRTY.store(false, Ordering::Relaxed);
-            return Ok(BOOL(0));
+        // Shift/Caps 大写字母：首选候选上屏 + 大写字母自己写进文档，然后吃掉
+        // 按键（BOOL(1)）。不能走「提交后 return BOOL(0) 让应用输出」——实测
+        // （fix_e2e 探针）TSF 下 claim 过的键 OnKeyDown 返回 FALSE 也到不了
+        // 应用，标点分支原来就吃这个亏。没有拼音时 OnTestKeyDown 不 claim，
+        // 键直接放行由应用输出大写，走不到这里。
+        if ch.is_ascii_alphabetic() && (shift_down() || caps_on()) {
+            dlog!("KeySink::OnKeyDown wparam={} shift={} caps={} buf={:?} 大写分支", wparam.0, shift_down(), caps_on(), self.buf.borrow());
+            if crate::settings::english() {
+                return Ok(BOOL(0));
+            }
+            if !self.buf.borrow().is_empty() {
+                let w = unsafe { cand::current() }
+                    .or_else(|| UI_CANDS.lock().unwrap().first().map(|(w, _)| w.clone()));
+                self.buf.borrow_mut().clear();
+                UI_CANDS.lock().unwrap().clear();
+                unsafe { cand_hide(); }
+                let letter = ch.to_ascii_uppercase();
+                match w {
+                    Some(w) => {
+                        dict::note_choice(&w);
+                        self.commit_text(pic, &format!("{w}{letter}"));
+                    }
+                    // 没有候选：组合里只剩拼音，直接换成大写字母上屏
+                    None => self.commit_text(pic, &letter.to_string()),
+                }
+            }
+            return Ok(BOOL(1));
         }
-        SHIFT_DIRTY.store(true, Ordering::Relaxed);
 
         // 字母：进组合
         if ch.is_ascii_alphabetic() {
@@ -452,8 +565,7 @@ impl ITfKeyEventSink_Impl for TextService {
             let key = self.buf.borrow().clone();
             unsafe { cand::set_preedit(&key); }
             unsafe { cand::set_sentence(dict::complete(&key).map(|(w, _)| w)); }
-            let hits = dict::lookup(&key);
-            set_all_cands(&hits);
+            set_all_cands(dict::lookup(&key));
             if let Some(ctx) = pic {
                 let text: Vec<u16> = key.encode_utf16().collect();
                 let sink: ITfCompositionSink = match unsafe { self.cast() } { Ok(s) => s, Err(_) => return Ok(BOOL(1)) };
@@ -484,22 +596,40 @@ impl ITfKeyEventSink_Impl for TextService {
             if !has_buf { return Ok(BOOL(0)); }
             let idx = (wparam.0 as usize) - 0x31;
             let word = UI_CANDS.lock().unwrap().get(idx).map(|(w, _)| w.clone());
-            if let Some(w) = word {
-                self.buf.borrow_mut().clear();
-                UI_CANDS.lock().unwrap().clear();
-                unsafe { cand_hide(); }
-                self.commit_word(pic, &w);
-            }
+            // 理论上 claim() 只会放行当前页里真有的候选，这里再兜一次底
+            let Some(w) = word else { return Ok(BOOL(0)); };
+            self.buf.borrow_mut().clear();
+            UI_CANDS.lock().unwrap().clear();
+            unsafe { cand_hide(); }
+            self.commit_word(pic, &w);
             return Ok(BOOL(1));
         }
 
-        // 方向键 / Tab：在候选里移动
+        // 方向键 / Tab：在候选里移动；撞到页边界自动翻页
+        // （第 1 个再往上 = 上一页的最后一条，最后一个再往下 = 下一页第 1 条，
+        //   和微软拼音一样看着一页一页连起来翻）
         if matches!(wparam.0 as u32, 0x26 | 0x28 | 0x09) {
             if !has_buf { return Ok(BOOL(0)); }
-            let n = UI_CANDS.lock().unwrap().len().min(9);
-            if n == 0 { return Ok(BOOL(1)); }
+            let n = UI_CANDS.lock().unwrap().len();
+            // 没有候选可动就让应用正常处理方向键/Tab（移动光标、切焦点）
+            if n == 0 { return Ok(BOOL(0)); }
+            let up = (wparam.0 as u32) == 0x26;
             let cur = unsafe { cand::current_index() };
-            let next = if (wparam.0 as u32) == 0x26 { (cur + n - 1) % n } else { (cur + 1) % n };
+            if up && cur == 0 {
+                if flip_page(-1) {
+                    // 翻到上一页后选最后一条（连续往上按不会卡住）
+                    let last = unsafe { cand::count() }.saturating_sub(1);
+                    unsafe { cand::select(last); }
+                }
+                return Ok(BOOL(1));
+            }
+            if !up && cur + 1 >= n {
+                if flip_page(1) {
+                    unsafe { cand::select(0); }
+                }
+                return Ok(BOOL(1));
+            }
+            let next = if up { cur - 1 } else { cur + 1 };
             unsafe { cand::select(next); }
             return Ok(BOOL(1));
         }
@@ -517,43 +647,66 @@ impl ITfKeyEventSink_Impl for TextService {
             return Ok(BOOL(1));
         }
 
-        // ESC：取消这次输入
+        // ESC：取消这次输入（组合要真正结束掉，见 EndSession 的注释）
         if wparam.0 == 0x1B {
             if !has_buf { return Ok(BOOL(0)); }
             self.buf.borrow_mut().clear();
             UI_CANDS.lock().unwrap().clear();
             unsafe { cand_hide(); }
-            *COMPOSITION.lock().unwrap() = None;
+            if let Some(ctx) = pic {
+                let s: ITfEditSession = EndSession.into();
+                let flags = TF_CONTEXT_EDIT_CONTEXT_FLAGS(TF_ES_SYNC.0 | TF_ES_READWRITE.0);
+                let _ = unsafe { ctx.RequestEditSession(self.client_id.get(), &s, flags) };
+            } else {
+                *COMPOSITION.lock().unwrap() = None;
+            }
             return Ok(BOOL(1));
         }
 
         // PageUp / PageDown：翻页
         if matches!(wparam.0 as u32, 0x21 | 0x22) {
             if !has_buf { return Ok(BOOL(0)); }
-            let total = ALL_CANDS.lock().unwrap().len();
-            let pages = (total + PAGE_SIZE - 1) / PAGE_SIZE;
-            let cur = PAGE.load(std::sync::atomic::Ordering::Relaxed);
-            let next = if (wparam.0 as u32) == 0x21 {
-                cur.saturating_sub(1)
-            } else {
-                (cur + 1).min(pages.saturating_sub(1))
-            };
-            if next != cur {
-                PAGE.store(next, std::sync::atomic::Ordering::Relaxed);
-                refresh_page();
-            }
+            flip_page(if (wparam.0 as u32) == 0x21 { -1 } else { 1 });
             return Ok(BOOL(1));
         }
 
-        // 标点：先把当前候选上屏，再放行让标点正常输入
+        // - / = ：翻页（微软拼音同款）。注意它们在 is_punct_vk 名单里，
+        // 这一段必须放在下面「标点上屏」分支之前，否则会被当成标点提交上屏
+        if matches!(wparam.0 as u32, 0xBD | 0xBB) {
+            if !has_buf { return Ok(BOOL(0)); }
+            flip_page(if (wparam.0 as u32) == 0xBD { -1 } else { 1 });
+            return Ok(BOOL(1));
+        }
+
+        // 标点：先把当前候选上屏，标点字符自己写进文档，然后吃掉按键。
+        // 理由同大写分支：claim 过的键 TSF 不会再交给应用，原来「return
+        // BOOL(0) 放行」实测到不了应用（候选上屏了、标点被吞）。
         if has_buf && is_punct_vk(wparam.0 as u32) {
             let w = unsafe { cand::current() }
                 .or_else(|| UI_CANDS.lock().unwrap().first().map(|(w, _)| w.clone()));
+            let c = vk_to_char(wparam.0 as u32);
             self.buf.borrow_mut().clear();
             UI_CANDS.lock().unwrap().clear();
             unsafe { cand_hide(); }
-            if let Some(w) = w { self.commit_word(pic, &w); }
-            return Ok(BOOL(0));
+            match (w, c) {
+                (Some(w), Some(c)) => {
+                    dict::note_choice(&w);
+                    self.commit_text(pic, &format!("{w}{c}"));
+                }
+                (Some(w), None) => self.commit_word(pic, &w),
+                (None, Some(c)) => self.commit_text(pic, &c.to_string()),
+                (None, None) => {
+                    // 什么都没得写：像 ESC 一样把组合真正结束掉
+                    if let Some(ctx) = pic {
+                        let s: ITfEditSession = EndSession.into();
+                        let flags = TF_CONTEXT_EDIT_CONTEXT_FLAGS(TF_ES_SYNC.0 | TF_ES_READWRITE.0);
+                        let _ = unsafe { ctx.RequestEditSession(self.client_id.get(), &s, flags) };
+                    } else {
+                        *COMPOSITION.lock().unwrap() = None;
+                    }
+                }
+            }
+            return Ok(BOOL(1));
         }
 
         Ok(BOOL(0))
@@ -565,6 +718,35 @@ fn is_punct_vk(vk: u32) -> bool {
         vk,
         0xBA | 0xBB | 0xBC | 0xBD | 0xBE | 0xBF | 0xC0 | 0xDB | 0xDC | 0xDD | 0xDE
     )
+}
+
+/// 虚拟键码 → 当前键盘布局下（含 Shift/Caps 状态）实际会打出的字符。
+/// 自己往文档里写标点时用：布局必须是前台线程正在用的那个，字符才和
+/// 应用自己按键打出来的一致（中文布局下 Shift+逗号 是《不是 <）。
+fn vk_to_char(vk: u32) -> Option<char> {
+    use windows::Win32::UI::Input::KeyboardAndMouse::{
+        GetKeyboardLayout, MapVirtualKeyW, ToUnicodeEx, MAPVK_VK_TO_VSC, VK_CAPITAL, VK_SHIFT,
+    };
+    use windows::Win32::UI::WindowsAndMessaging::{GetForegroundWindow, GetWindowThreadProcessId};
+    unsafe {
+        let scan = MapVirtualKeyW(vk, MAPVK_VK_TO_VSC);
+        // 返回值才是线程 id（出参写的是进程 id），GetKeyboardLayout 要线程 id
+        let hkl = GetKeyboardLayout(GetWindowThreadProcessId(GetForegroundWindow(), None));
+        let mut state = [0u8; 256];
+        if shift_down() {
+            state[VK_SHIFT.0 as usize] = 0x80;
+        }
+        if caps_on() {
+            state[VK_CAPITAL.0 as usize] = 0x01;
+        }
+        let mut buf = [0u16; 4];
+        let n = ToUnicodeEx(vk, scan, &state, &mut buf, 0, hkl);
+        if n == 1 {
+            char::from_u32(buf[0] as u32)
+        } else {
+            None
+        }
+    }
 }
 
 /// 这个键要不要拦下来（有拼音时还要拦退格、数字、标点、回车等）
@@ -580,9 +762,14 @@ fn status_toggle_english() {
     crate::settings::set_english(!crate::settings::english());
 }
 
-/// 某个虚拟键现在是不是按下的
+/// 某个虚拟键现在是不是按下的。
+/// 必须用 GetAsyncKeyState：GetKeyState 只反映「调用线程消息队列最后一次
+/// 取消息时」的键盘快照，而 TSF 的按键回调跑在 TSF 自己的键盘管理器线程上，
+/// 那个线程从不取应用消息 —— 结果 Shift/Ctrl/Caps 永远读不到（大写字母
+/// 直通失效就是栽在这里）。GetAsyncKeyState 读全局输入状态表，任何线程、
+/// 任何来源（真实键盘 / SendInput 注入）都即时正确。
 fn key_down(vk: i32) -> bool {
-    unsafe { (windows::Win32::UI::Input::KeyboardAndMouse::GetKeyState(vk) as u16 & 0x8000) != 0 }
+    unsafe { (windows::Win32::UI::Input::KeyboardAndMouse::GetAsyncKeyState(vk) as u16 & 0x8000) != 0 }
 }
 
 /// Ctrl / Alt / Win 按住时，输入法必须【完全放行】。
@@ -603,6 +790,21 @@ fn shift_down() -> bool {
     key_down(windows::Win32::UI::Input::KeyboardAndMouse::VK_SHIFT.0 as i32)
 }
 
+/// Caps Lock 灯是不是亮着（亮着时字母应直通英文大写，和微软一样）。
+/// 注意：GetAsyncKeyState 的低 1 位是「上次查询后按过没有」，不是开关状态
+/// （实测 Caps 按下瞬间为 true、下一键查询就变 false），不能用；
+/// GetKeyState 的低 1 位才是真正的开关状态（队列快照，TSF 回调线程上
+/// 对 Shift 这类瞬时键是过期的，但 Caps 开关位试试是不是也过期）。
+fn caps_on() -> bool {
+    unsafe {
+        (windows::Win32::UI::Input::KeyboardAndMouse::GetKeyState(
+            windows::Win32::UI::Input::KeyboardAndMouse::VK_CAPITAL.0 as i32,
+        ) as u16
+            & 0x0001)
+            != 0
+    }
+}
+
 fn claim(wparam: WPARAM, has_buf: bool, english: bool) -> bool {
     let ch = wparam.0 as u8 as char;
     if ch.is_ascii_alphabetic() {
@@ -613,8 +815,12 @@ fn claim(wparam: WPARAM, has_buf: bool, english: bool) -> bool {
     }
     match wparam.0 as u32 {
         0x20 | 0x1B | 0x08 | 0x0D | 0x09 => true, // 空格 / ESC / 退格 / 回车 / Tab
-        // 数字选词。Shift+数字 是打 ! @ # $ % 这类符号，不能抢
-        0x31..=0x39 => !shift_down(),
+        // 数字选词：只认当前页里真有的候选，没有就放行给应用（可能只是打字）。
+        // Shift+数字 是打 ! @ # $ % 这类符号，不能抢
+        0x31..=0x39 => {
+            let idx = (wparam.0 as usize) - 0x31;
+            !shift_down() && idx < UI_CANDS.lock().unwrap().len()
+        }
         0x25..=0x28 => true,                      // 方向键选词
         0x21 | 0x22 => true,                      // PageUp / PageDown
         _ => is_punct_vk(wparam.0 as u32),
@@ -672,7 +878,14 @@ impl IClassFactory_Impl for Factory {
         let hr = unsafe { svc.query(riid, ppv) };
         if hr.is_ok() { Ok(()) } else { Err(hr.into()) }
     }
-    fn LockServer(&self, _f: BOOL) -> Result<()> { Ok(()) }
+    fn LockServer(&self, f: BOOL) -> Result<()> {
+        if f.as_bool() {
+            LIVE.fetch_add(1, Ordering::SeqCst);
+        } else {
+            LIVE.fetch_sub(1, Ordering::SeqCst);
+        }
+        Ok(())
+    }
 }
 
 #[no_mangle]
@@ -831,7 +1044,6 @@ impl ITfEditSession_Impl for CompSession {
 /// 上屏：把 composition 的文字换成最终的中文，然后结束组合
 #[implement(ITfEditSession)]
 struct DoneSession {
-    ctx: ITfContext,
     text: Vec<u16>,
 }
 
@@ -876,9 +1088,7 @@ impl ITfEditSession_Impl for UpdateSession {
 }
 /// 结束组合：单独一次编辑会话。以前和“换字”挤在同一次会话里，会出现上屏成拼音或干脆不上屏。
 #[implement(ITfEditSession)]
-struct EndSession {
-    ctx: ITfContext,
-}
+struct EndSession;
 
 impl ITfEditSession_Impl for EndSession {
     fn DoEditSession(&self, ec: u32) -> Result<()> {
@@ -886,14 +1096,15 @@ impl ITfEditSession_Impl for EndSession {
             let mut g = COMPOSITION.lock().unwrap();
             dlog!("EndSession: 有组合={}", g.is_some());
             if let Some(comp) = g.take() {
+                // 先清空组合文字再结束：不结束的话文字会留在文档里被宿主当正文提交
+                if let Ok(r) = comp.GetRange() {
+                    let empty: Vec<u16> = Vec::new();
+                    let _ = r.SetText(ec, 0, &empty);
+                }
                 let hr = comp.EndComposition(ec);
                 dlog!("EndSession: EndComposition -> {hr:?}");
             }
         }
         Ok(())
     }
-}
-
-unsafe fn end_composition() {
-    *COMPOSITION.lock().unwrap() = None;
 }

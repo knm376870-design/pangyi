@@ -257,7 +257,6 @@ unsafe extern "system" fn proc_settings(h: HWND, msg: u32, wp: WPARAM, lp: LPARA
         WM_LBUTTONDOWN => {
             let dc = GetDC(h);
             let f_text = font(12);
-            let (_, _, _, _) = colors();
             let mut y = sc(48);
             let py2 = ((lp.0 >> 16) & 0xFFFF) as i16 as i32;
             let mut hit = 0;
@@ -276,14 +275,14 @@ unsafe extern "system" fn proc_settings(h: HWND, msg: u32, wp: WPARAM, lp: LPARA
                 }
                 y += sc(ROW_H);
             }
+            // 字体和 DC 只释放这一次：以前点「关闭」的分支里又删了一次字体、
+            // 又还了一次 DC，第二次调用只会静默失败，纯属悬空操作
             let _ = DeleteObject(f_text);
             let _ = ReleaseDC(h, dc);
             // 点到底部的「关闭」就关窗
             let close_y = sc(48) + sc(ROW_H) * ROW_COUNT;
             if hit == 0 && py2 >= close_y && py2 <= close_y + sc(30) {
                 let _ = SendMessageW(h, WM_CLOSE, WPARAM(0), LPARAM(0));
-                let _ = DeleteObject(f_text);
-                let _ = ReleaseDC(h, dc);
                 return LRESULT(1);
             }
             if hit != 0 {
@@ -356,11 +355,19 @@ unsafe fn init() {
     BG = CreateSolidBrush(bg);
     let hinst = windows::Win32::System::LibraryLoader::GetModuleHandleW(None).unwrap();
     let cls: Vec<u16> = "PangyiSettings\0".encode_utf16().collect();
+    // 标题栏 / 任务栏 / Alt-Tab 用 exe 里编号 1 的图标资源（就是桌面上那个「中Я」）。
+    // 独立设置程序 settings_app.exe 里没有这个资源，LoadImageW 会失败 → hIcon=0，退回系统默认图标。
+    let big = LoadImageW(hinst, PCWSTR(1 as *const u16), IMAGE_ICON, 0, 0,
+        LR_DEFAULTSIZE | LR_SHARED).map(|h| HICON(h.0)).unwrap_or_default();
+    let (smx, smy) = (GetSystemMetrics(SM_CXSMICON), GetSystemMetrics(SM_CYSMICON));
+    let small = LoadImageW(hinst, PCWSTR(1 as *const u16), IMAGE_ICON, smx, smy,
+        LR_SHARED).map(|h| HICON(h.0)).unwrap_or_default();
     let wc = WNDCLASSW {
         lpfnWndProc: Some(proc_settings),
         lpszClassName: PCWSTR(cls.as_ptr()),
         hInstance: hinst.into(),
         hbrBackground: BG,
+        hIcon: big,
         ..Default::default()
     };
     RegisterClassW(&wc);
@@ -371,6 +378,10 @@ unsafe fn init() {
         PCWSTR(cls.as_ptr()), PCWSTR(title.as_ptr()),
         WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX,
         0, 0, sc(340), sc(300), None, None, hinst, None);
+    // WNDCLASSW 没有 hIconSm 字段，标题栏那个 16x16 小图标用 WM_SETICON 单独设
+    if WND.0 != 0 && small.0 != 0 {
+        SendMessageW(WND, WM_SETICON, WPARAM(0), LPARAM(small.0 as isize));
+    }
 }
 /// 独立设置程序用：开一个带标题栏的普通窗口（可以从右上角关掉）。
 pub unsafe fn open_app() {

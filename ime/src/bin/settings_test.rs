@@ -5,7 +5,8 @@
 fn main() {
     unsafe {
         pangyi_ime::settings::load();
-        pangyi_ime::settings::toggle();
+        // toggle() 早就没了，开设置面板现在是 open_app()（2026-10-10，v4.2.0 顺手修）
+        pangyi_ime::settings::open_app();
         let mut msg = windows::Win32::UI::WindowsAndMessaging::MSG::default();
         let start = std::time::Instant::now();
         while start.elapsed().as_secs() < 12 {

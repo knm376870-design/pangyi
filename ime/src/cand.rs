@@ -19,6 +19,9 @@ static ITEMS: Mutex<Vec<Item>> = Mutex::new(Vec::new());
 static PREEDIT: Mutex<String> = Mutex::new(String::new());
 static SENTENCE: Mutex<Option<String>> = Mutex::new(None);
 static SEL: AtomicUsize = AtomicUsize::new(0);
+/// 当前页号（0 起）和总页数，画右下角那个「▲▼ 2/59」用。总页数 1 就不画。
+static PAGE_CUR: AtomicUsize = AtomicUsize::new(0);
+static PAGE_TOT: AtomicUsize = AtomicUsize::new(1);
 static DARK: AtomicBool = AtomicBool::new(true);
 static HORIZONTAL: AtomicBool = AtomicBool::new(false);
 // 句柄和 DPI 是全进程共享的（同一进程里可能有好几个线程在用输入法），
@@ -254,6 +257,15 @@ unsafe fn compute_layout(dc: HDC, items: &[Item]) -> Layout {
     };
     let pre_h = if !has_top { 0 } else { measure(dc, f_anno, "x").1 + sc(ROW_PAD) * 2 };
 
+    // 右下角页码「▲▼ 2/59」——只有一页时不出，老尺寸完全不变
+    let pages = PAGE_TOT.load(Ordering::Relaxed);
+    let (footer_w, footer_h) = if pages > 1 {
+        let s = format!("▲▼ {}/{}", PAGE_CUR.load(Ordering::Relaxed) + 1, pages);
+        (measure(dc, f_anno, &s).0, measure(dc, f_anno, "x").1 + sc(ROW_PAD))
+    } else {
+        (0, 0)
+    };
+
     let (width, height) = if crate::settings::horizontal() {
         let inset = sc(PAD) / 2;
         let mut w = pad * 2 + inset * 2;
@@ -261,11 +273,13 @@ unsafe fn compute_layout(dc: HDC, items: &[Item]) -> Layout {
             if i > 0 { w += gap; }
             w += iw;
         }
-        let h = pad * 2 + pre_h + row_h + if anno_h > 0 { anno_h } else { 0 };
-        (w.max(pad * 2 + anno_w).max(pad * 2 + top_w).max(sc(120)), h)
+        let h = pad * 2 + pre_h + row_h + if anno_h > 0 { anno_h } else { 0 } + footer_h;
+        (w.max(pad * 2 + anno_w).max(pad * 2 + top_w).max(pad * 2 + footer_w).max(sc(120)), h)
     } else {
-        let w = (pad * 2 + index_w + gap + word_w + gap + pinyin_w + gap + ru_w).max(pad * 2 + top_w);
-        let h = pad * 2 + pre_h + (nth as i32) * row_h;
+        let w = (pad * 2 + index_w + gap + word_w + gap + pinyin_w + gap + ru_w)
+            .max(pad * 2 + top_w)
+            .max(pad * 2 + footer_w);
+        let h = pad * 2 + pre_h + (nth as i32) * row_h + footer_h;
         (w, h)
     };
 
@@ -427,6 +441,20 @@ unsafe extern "system" fn proc_cand(h: HWND, msg: u32, w: WPARAM, l: LPARAM) -> 
                 }
             }
 
+            // 右下角页码：▲▼ 2/59（只有一页时不画）。它就是"还能往下翻"的提示，
+            // 没有它用户根本不知道候选不止窗口里这几个
+            let pages = PAGE_TOT.load(Ordering::Relaxed);
+            if pages > 1 {
+                let s = format!("▲▼ {}/{}", PAGE_CUR.load(Ordering::Relaxed) + 1, pages);
+                let (_, hh) = measure(dc, f_anno, "x");
+                let wpx = measure(dc, f_anno, &s).0;
+                let ty = rc.bottom - pad - hh - sc(ROW_PAD) / 2;
+                SelectObject(dc, f_anno);
+                SetTextColor(dc, p.index);
+                let t: Vec<u16> = s.encode_utf16().collect();
+                TextOutW(dc, rc.right - pad - wpx, ty, &t);
+            }
+
             // 注意：f_text / f_anno / f_idx 是缓存的字体对象，这里不能删
             let _ = (f_text, f_anno, f_idx);
             let _ = EndPaint(h, &ps);
@@ -464,6 +492,17 @@ pub unsafe fn init() {
 pub unsafe fn set_items(items: Vec<Item>) {
     { let mut g = ITEMS.lock().unwrap(); *g = items; }
     SEL.store(0, Ordering::Relaxed);
+}
+
+/// 记下页码（画右下角的「▲▼ n/总」）。cur 是 0 起的页号。
+pub unsafe fn set_page(cur: usize, total: usize) {
+    PAGE_CUR.store(cur, Ordering::Relaxed);
+    PAGE_TOT.store(total.max(1), Ordering::Relaxed);
+}
+
+/// 给测试台架用：当前页号和总页数
+pub unsafe fn page_info() -> (usize, usize) {
+    (PAGE_CUR.load(Ordering::Relaxed), PAGE_TOT.load(Ordering::Relaxed))
 }
 
 pub unsafe fn set_preedit(s: &str) { *PREEDIT.lock().unwrap() = s.to_string(); }

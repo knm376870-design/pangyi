@@ -2,10 +2,22 @@
 //!
 //! 索引：精确（HashMap）+ 前缀（排序数组二分）+ 首字母缩写（zg → 中国）。
 //! 另外会记住你选过的词（%LOCALAPPDATA%\Pangyi\learned.txt），下次把它排到前面。
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Mutex, OnceLock};
 
 static RAW: &str = include_str!("dict.tsv");
+
+/// 编译期生成的缩写键表（gen_abbr 产出）：每行「键 TAB 行号」，
+/// 行号 = dict.tsv 里该词的行号（1 起，表头不计）。
+/// 原本在 index() 里对 29 万行现切拼音生成（预热 312→997 ms、私有内存 30→80 MB，
+/// 用户每开一个新进程第一次按键就卡 1 秒），挪到编译期后预热回到 ~350 ms。
+/// ⚠️ 往 dict.tsv 追加词条后必须重跑 gen_abbr 再构建，否则新词没有缩写键。
+static ABBR: &str = include_str!("abbr-keys.tsv");
+
+/// dict.tsv 原文（给 gen_abbr 用；词典本体只能纯追加，不能重建 —— 见存档技术笔记）
+pub fn raw() -> &'static str {
+    RAW
+}
 
 pub struct Hit {
     pub word: String,
@@ -31,6 +43,11 @@ struct Index {
     /// 1~2 个字母的前缀 -> 该前缀下词频最高的那条
     /// （最多 26 + 26*26 = 702 条，用来避免每敲一个键都去扫几千个拼音键）
     comp: HashMap<&'static str, &'static str>,
+    /// 1~2 个字母的前缀 -> 该前缀下（拼音比前缀更长的）词频最高的前 200 条。
+    /// 打 "y" 时不再按拼音字母序先给一堆 ya 系词，而是全 y 系里最高频的词；
+    /// 打 "yi" 时精确组翻到底还能接着翻到 yichang（一场）/yijing（已经）这些
+    /// 更长读音的词 —— 「像微软那样翻页看到全部」靠的就是这张表。
+    prefix_top: HashMap<&'static str, Vec<(&'static str, u64)>>,
     learned: Mutex<HashMap<String, u32>>,
     total_freq: f64,
 }
@@ -78,12 +95,15 @@ fn index() -> &'static Index {
     static IDX: OnceLock<Index> = OnceLock::new();
     IDX.get_or_init(|| {
         let mut total_freq = 0.0f64;
+        // 行向量：行号 → 行内容。缩写键表（ABBR）里存的就是这里的行号，
+        // 这样不用把 29 万行再复制一份进二进制。
+        let lines: Vec<&'static str> = RAW.lines().skip(1).collect();
         let mut exact: Vec<Row> = Vec::with_capacity(64000);
-        let mut ini: Vec<Row> = Vec::with_capacity(64000);
-        for line in RAW.lines().skip(1) {
+        let mut ini: Vec<Row> = Vec::with_capacity(320000);
+        for line in &lines {
             // 一条记录 8 列，边遍历边取，不 collect
             let mut it = line.split('\t');
-            let _simp = it.next();
+            let _simp = it.next().unwrap_or("");
             let _trad = it.next();
             let py = match it.next() { Some(s) => s, None => continue };
             let _disp = it.next();
@@ -94,16 +114,32 @@ fn index() -> &'static Index {
             if py.is_empty() {
                 continue;
             }
-            exact.push((py, line));
+            exact.push((py, *line));
             // ü 的替代拼法：中文输入法里一律用 v 打 ü（nv→女、lvxing→旅行、falv→法律）。
             // 词典里存的是 ü，不建这条别名的话这 500 多个词永远敲不出来。
             if py.contains('ü') {
                 let alt: &'static str = Box::leak(py.replace('ü', "v").into_boxed_str());
-                exact.push((alt, line));
+                exact.push((alt, *line));
             }
-            total_freq += line_freq(line) as f64;
+            total_freq += line_freq(*line) as f64;
             if !ini_key.is_empty() {
-                ini.push((ini_key, line));
+                ini.push((ini_key, *line));
+            }
+        }
+        // 首字母缩写键（v4.2.2）：词典第八列只覆盖 12 万条，还有 17 万条
+        // 多字词没有缩写键（两个/最大/很多…… 敲 lg/hd 出不来）。这些键
+        // 由 gen_abbr 在编译期生成（ABBR 表），index() 只做「行号 → 行」解析。
+        // 生成规则见 gen_abbr.rs：按「一个汉字一个音节」切拼音，每词两种键 ——
+        //   首字母键    gongzuo→gz、zhongguo→zg
+        //   完整声母键  zhongguo→zhg（zh/ch/sh 算一个声母；an/er 这类
+        //               没有声母的音节就取首字母，方案 fang|an → fa）
+        for line in ABBR.lines() {
+            if let Some((k, n)) = line.split_once('\t') {
+                if let Ok(i) = n.parse::<usize>() {
+                    if let Some(l) = lines.get(i.wrapping_sub(1)) {
+                        ini.push((k, l));
+                    }
+                }
             }
         }
         // 稳定排序：同一个 key 内部保持词典原顺序（词典本身已按词频排好）
@@ -112,24 +148,35 @@ fn index() -> &'static Index {
         // 预先算好 1~2 字母前缀的最佳补全。
         // 没有这张表的话，敲 "z" 要遍历所有以 z 开头的拼音键（几千个），
         // 每敲一个字母就要多花 1ms 左右 —— 这就是之前"打字卡"的主因之一。
-        // 遍历扁平行表，按 key 分组求该组里得分最高的那行
+        // 遍历扁平行表，按 key 分组求该组里得分最高的那行。
+        // 同一遍里顺手把 1~2 字母前缀的高频词表也建了（见 Index::prefix_top）。
         let mut comp: HashMap<&'static str, &'static str> = HashMap::new();
+        let mut prefix_top: HashMap<&'static str, Vec<(&'static str, u64)>> = HashMap::new();
         let mut i = 0usize;
         while i < exact.len() {
             let k = exact[i].0;
+            let klen = k.chars().count();
             let mut j = i;
             let mut best: Option<&'static str> = None;
             let mut best_score = 0u64;
             while j < exact.len() && exact[j].0 == k {
-                let sc = line_score(exact[j].1);
+                let line = exact[j].1;
+                let sc = line_score(line);
                 if best.is_none() || sc > best_score {
                     best_score = sc;
-                    best = Some(exact[j].1);
+                    best = Some(line);
+                }
+                // 只收「拼音比前缀更长」的行：和前缀等长的属于"精确匹配"，
+                // 由 lookup 的精确分支负责，别重复算
+                if klen > 1 {
+                    prefix_top.entry(prefix_chars(k, 1)).or_default().push((line, sc));
+                }
+                if klen > 2 {
+                    prefix_top.entry(prefix_chars(k, 2)).or_default().push((line, sc));
                 }
                 j += 1;
             }
             if let Some(b) = best {
-                let klen = k.chars().count();
                 if klen >= 2 {
                     for plen in [1usize, 2usize] {
                         if klen == plen {
@@ -145,8 +192,22 @@ fn index() -> &'static Index {
             }
             i = j;
         }
+        // 每个前缀只留分最高的前 200 条；shrink_to_fit 把建表时的
+        // 临时大桶（打 "y" 的那个桶曾装下两万多条）真正还回去
+        for v in prefix_top.values_mut() {
+            v.sort_by(|a, b| b.1.cmp(&a.1));   // 稳定：同分保持词典原顺序
+            v.truncate(PREFIX_TOP);
+            v.shrink_to_fit();
+        }
 
-        Index { exact, ini, comp, learned: Mutex::new(load_learned()), total_freq: total_freq.max(1.0) }
+        Index {
+            exact,
+            ini,
+            comp,
+            prefix_top,
+            learned: Mutex::new(load_learned()),
+            total_freq: total_freq.max(1.0),
+        }
     })
 }
 
@@ -157,6 +218,94 @@ fn prefix_chars(k: &str, n: usize) -> &str {
     match k.char_indices().nth(n) {
         Some((i, _)) => &k[..i],
         None => k,
+    }
+}
+
+/// 把词拼音切成「一个字一个音节」，每个切法生成缩写键（见 index() 里调用处）。
+/// 切不出（词典音节表覆盖不到的读音）返回 None；最多收 3 种切法。
+pub fn abbr_keys(py: &'static str, want: usize, syll: &HashSet<&'static str>) -> Option<Vec<&'static str>> {
+    if want < 2 || py.chars().count() < want {
+        return None;
+    }
+    let chars: Vec<char> = py.chars().collect();
+    let mut segs: Vec<Vec<&'static str>> = Vec::with_capacity(3);
+    let mut cur: Vec<&'static str> = Vec::with_capacity(want);
+    seg_dfs(&chars, 0, want, syll, &mut cur, &mut segs);
+    if segs.is_empty() {
+        return None;
+    }
+    let mut keys: Vec<&'static str> = Vec::with_capacity(segs.len() * 2);
+    for seg in segs {
+        let mut a = String::new(); // 首字母键
+        let mut b = String::new(); // 完整声母键
+        for s in &seg {
+            let c0 = match s.chars().next() {
+                Some(c) if c.is_ascii_lowercase() => c,
+                // ü/ǹ 开头的音节键盘敲不出来，这种切法的键不要
+                _ => {
+                    a.clear();
+                    b.clear();
+                    break;
+                }
+            };
+            a.push(c0);
+            if s.starts_with("zh") || s.starts_with("ch") || s.starts_with("sh") {
+                b.push_str(&s[..2]);
+            } else {
+                b.push(c0);
+            }
+        }
+        if a.is_empty() || b.is_empty() {
+            continue;
+        }
+        for k in [a, b] {
+            if !keys.iter().any(|x| *x == k) {
+                keys.push(Box::leak(k.into_boxed_str()));
+            }
+        }
+    }
+    if keys.is_empty() {
+        None
+    } else {
+        Some(keys)
+    }
+}
+
+/// 回溯切分：把 chars[pos..] 切成「剩余音节数」个音节。每个音节 1~6 个字符
+/// （最长的 zhuang 是 6），必须在音节表里。找到 3 种切法就停。
+fn seg_dfs(
+    chars: &[char],
+    pos: usize,
+    want: usize,
+    syll: &HashSet<&'static str>,
+    cur: &mut Vec<&'static str>,
+    out: &mut Vec<Vec<&'static str>>,
+) {
+    if out.len() >= 3 {
+        return;
+    }
+    let rem_syl = want - cur.len();
+    let rem_ch = chars.len() - pos;
+    if rem_syl == 0 {
+        if pos == chars.len() {
+            out.push(cur.clone());
+        }
+        return;
+    }
+    // 每个音节至少 1 个字符、至多 6 个：先剪掉必然失败的枝
+    if rem_ch < rem_syl || rem_ch > rem_syl * 6 {
+        return;
+    }
+    let maxl = (rem_ch - (rem_syl - 1)).min(6); // 给后面的音节各留至少 1 字符
+    for len in 1..=maxl {
+        let cand: String = chars[pos..pos + len].iter().collect();
+        if !syll.contains(cand.as_str()) {
+            continue;
+        }
+        let leaked: &'static str = Box::leak(cand.into_boxed_str());
+        cur.push(leaked);
+        seg_dfs(chars, pos + len, want, syll, cur, out);
+        cur.pop();
     }
 }
 
@@ -192,15 +341,47 @@ fn exact_group<'a>(idx: &'a Index, key: &str) -> &'a [Row] {
     &idx.exact[a..b]
 }
 
-fn push_lines(rows: &[Row], out: &mut Vec<Hit>, cap: usize) {
-    for (_, line) in rows {
-        if let Some(h) = hit_of(line) {
-            out.push(h);
-        }
-        if out.len() >= cap * 3 {
-            return;
+/// 一次查找最多返回多少候选 —— 也就是翻页的总深度。
+/// 词库里最大的一组读音（yi）有 557 条，600 能装下整组还有余量。
+const MAX_HITS: usize = 600;
+/// 1~2 字母前缀的高频表每个前缀留多少条（见 Index::prefix_top）
+const PREFIX_TOP: usize = 200;
+/// 3 个字母及以上的前缀，顺序扫最多多少条
+const PREFIX_SCAN: usize = 200;
+
+/// 同一个词（候选文本）只留一条。
+/// 词典里同一个词可能有多行（Unihan 一条带译文 + nogloss 一条没译文，
+/// 补全的时候没合并干净）。候选少的时候看不出来，一翻页就露馅：
+/// 第 5 页出现两个一模一样的「槸」。优先留有俄语译文的，其次词频高的。
+fn dedup_words(out: &mut Vec<Hit>) {
+    if out.len() < 2 {
+        return;
+    }
+    let mut best: HashMap<&str, usize> = HashMap::with_capacity(out.len());
+    for (i, h) in out.iter().enumerate() {
+        match best.get(h.word.as_str()) {
+            None => {
+                best.insert(h.word.as_str(), i);
+            }
+            Some(&j) => {
+                let cur_ru = !out[j].ru.is_empty();
+                let new_ru = !h.ru.is_empty();
+                if (new_ru && !cur_ru) || (new_ru == cur_ru && h.freq > out[j].freq) {
+                    best.insert(h.word.as_str(), i);
+                }
+            }
         }
     }
+    if best.len() == out.len() {
+        return; // 本来就没有重复，不用再扫一遍
+    }
+    let keep: std::collections::HashSet<usize> = best.into_values().collect();
+    let mut i = 0usize;
+    out.retain(|_| {
+        let r = keep.contains(&i);
+        i += 1;
+        r
+    });
 }
 
 /// 同音词排序用的混合分。
@@ -225,6 +406,10 @@ fn blended_rank(freq: u64, word: &str, tier: u8) -> f64 {
 }
 
 /// 按无声调拼音精确/前缀查找；也支持首字母缩写（zg → 中国）。
+///
+/// 候选池放到「翻页能翻到底」的规模（v4.2.0）：精确组整组都收，
+/// 1~2 字母前缀走预热的按词频排的表。之前只留 max_cands*3 条，
+/// 用户看到的就永远是那八九个，翻不动。
 pub fn lookup(ascii: &str) -> Vec<Hit> {
     if ascii.is_empty() {
         return Vec::new();
@@ -232,78 +417,176 @@ pub fn lookup(ascii: &str) -> Vec<Hit> {
     let idx = index();
     let mut out: Vec<Hit> = Vec::new();
 
-    // 1) 精确
-    push_lines(exact_group(idx, ascii), &mut out, 16);
-    // 2) 前缀（二分定位）
-    if out.len() < 16 {
-        let start = idx.exact.partition_point(|(k, _)| *k < ascii);
-        for (key, line) in idx.exact[start..].iter() {
-            if !key.starts_with(ascii) {
-                break;
+    // 1) 精确：整个读音组都收（最大的一组「yi」557 条）
+    for (_, line) in exact_group(idx, ascii) {
+        if let Some(h) = hit_of(line) {
+            out.push(h);
+        }
+        if out.len() >= MAX_HITS {
+            break;
+        }
+    }
+    // 2) 前缀：只有精确组是【空的】才用 —— 输入已经是一个完整读音
+    //    （li / han / xian）时只给这个读音，和微软一致。
+    //    不拦的话："li" 会把 liao 的「了」（词频 88 万）顶到第一个；
+    //    "han" 会把 hang 的「行/航」混进来。
+    if out.is_empty() {
+        let nchars = ascii.chars().count();
+        if nchars <= 2 {
+            // 1~2 个字母走高频表：全前缀空间里词频最高的一批。
+            // （旧实现按拼音字母序取前 16 条，打 y 先出来一堆 ya 系词）
+            if let Some(list) = idx.prefix_top.get(ascii) {
+                for (line, _) in list {
+                    if out.len() >= MAX_HITS {
+                        break;
+                    }
+                    if let Some(h) = hit_of(line) {
+                        out.push(h);
+                    }
+                }
             }
-            if *key == ascii {
-                continue;
-            }
-            if let Some(h) = hit_of(line) {
-                out.push(h);
-            }
-            if out.len() >= 16 {
-                break;
+        } else {
+            // 3 个字母以上：词量已经不大，顺序扫「以它开头、比它长」的词条
+            // （nih → nihao 你好 这种打一半的整词）
+            let start = idx.exact.partition_point(|(k, _)| *k < ascii);
+            let mut n = 0usize;
+            for (key, line) in idx.exact[start..].iter() {
+                if !key.starts_with(ascii) {
+                    break;
+                }
+                if *key == ascii {
+                    continue;
+                }
+                if let Some(h) = hit_of(line) {
+                    out.push(h);
+                    n += 1;
+                }
+                if n >= PREFIX_SCAN || out.len() >= MAX_HITS {
+                    break;
+                }
             }
         }
     }
-    // 3) 首字母缩写（输入全是字母且不长时才用）
-    if out.len() < 9 && ascii.len() >= 2 && ascii.len() <= 6 {
+    // 3) 首字母缩写：只要候选池没满就补 —— 微软也是把缩写候选和拼音候选
+    //    混在一起按词频排。以前"池里 ≥9 条就不补"太粗：fa 的精确组一满，
+    //    方案（f+a）就永远出不来；现在 fa 的精确组 + 缩写一起排，发/法在前，
+    //    方案跟在后面 —— 和微软一致。
+    //    上限放到 12 个字母：以前 7 字母以上的长缩写（zhrmghg→中华人民共和国、
+    //    zgrmjfj→中国人民解放军）直接出不来 —— "多打几个字母候选就没了"
+    //    的主因之一。深度 160 条：da 这种精确组本身就 70 多条的输入，
+    //    缩写得能接着补进去（答案 d+a 才进得来），也够翻十几页看全部。
+    //    池子已经很大的输入（yi/zh 几百条）进循环第一下就撞上限退出，
+    //    不会污染拼音候选。
+    if ascii.len() >= 2 && ascii.len() <= 12 {
         let start = idx.ini.partition_point(|(k, _)| *k < ascii);
         for (key, line) in idx.ini[start..].iter() {
             if !key.starts_with(ascii) {
                 break;
             }
+            if out.len() >= 160 {
+                break;
+            }
             if let Some(h) = hit_of(line) {
                 out.push(h);
-            }
-            if out.len() >= 16 {
-                break;
             }
         }
     }
 
-    out.truncate(16);
+    // 3.5) 整句切词（≥5 字母）—— 提前切好：切出来的"尾巴"补全候选
+    //      要进池参与排序，整句本体稍后放最前。
+    //      旧版整串切不完就什么都不给（zhongguorenm 之类前面全是空窗），
+    //      尾巴补全保证窗口永远有候选 —— "多打几个字母候选就没了"的另一半。
+    let sentence_plan = if ascii.chars().count() >= 5 {
+        sentence(ascii)
+    } else {
+        None
+    };
+    if let Some((_, tail)) = &sentence_plan {
+        if !tail.is_empty() {
+            for h in prefix_hits(tail, 8) {
+                out.push(h);
+                if out.len() >= MAX_HITS {
+                    break;
+                }
+            }
+        }
+    }
 
-    // 同音词重排（稳定排序：同分保持原有顺序）
-    out.sort_by(|a, b| {
-        blended_rank(b.freq, &b.word, b.tier)
-            .partial_cmp(&blended_rank(a.freq, &a.word, a.tier))
-            .unwrap_or(std::cmp::Ordering::Equal)
-    });
+    // 同一个词只留一条（见 dedup_words 的注释）
+    dedup_words(&mut out);
+
+    // 同音词重排（稳定排序：同分保持原有顺序）。
+    // 预先给每条算好一次 blended_rank —— 原来是 sort_by 里每比较一次算两遍，
+    // 候选从十几条放大到几百条后这里会变成热点。
+    let mut ranked: Vec<(f64, Hit)> = out
+        .drain(..)
+        .map(|h| (blended_rank(h.freq, &h.word, h.tier), h))
+        .collect();
+    ranked.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+    let mut out: Vec<Hit> = ranked.into_iter().map(|(_, h)| h).collect();
+
+    // 短语 + 整句候选放最前面。用 head 记下插到头部这几条的条数，
+    // 下面自学习排序只动 head 之后的部分 —— 否则学过的单字（米/个/高
+    // 这类高频字）会把整句拼出来的答案顶下去：打 zhongguorenm 想要
+    // 中国人，学过一次「米」之后按 1 就变成米了（v4.2.2 实测翻车）。
+    let mut head: usize = 0;
 
     // 自定义短语优先（dz → 电子邮箱）
     if let Some(h) = phrase(ascii) {
         out.insert(0, h);
+        head += 1;
     }
 
-    // 整句候选放最前面（打字长的拼音时）
-    // 整句切词现在只用词典词频，效果不稳（会出错的句子），先不进候选；
-    // 等接上真正的语料 bigram 语言模型再打开。
-    if ascii.chars().count() >= 5 {
-        if let Some(s) = sentence_hit(ascii) {
-            if s.word.chars().count() >= 2 {
-                out.insert(0, s);
+    // 整句候选放最前面：整串切成 ≥2 个词，或单个多字词带尾巴
+    // （zhongguom → 中国 + m）。单字带尾巴（nih → 你+h）不插 ——
+    // 这种时候前缀候选（你好）已经对了，插个「你」反而把对的顶下去。
+    // 查重：输入本身就是整词时，整句候选与精确候选是同一个词
+    // （zhongguorenmin → 中国人民），不查重会看到两条一模一样的
+    // （v4.2.2 修掉的旧 bug）。
+    if let Some((parts, _)) = sentence_plan {
+        let ok_insert =
+            parts.len() >= 2 || (parts.len() == 1 && parts[0].word.chars().count() >= 2);
+        if ok_insert {
+            let word: String = parts.iter().map(|h| h.word.clone()).collect();
+            if !out.iter().any(|h| h.word == word) {
+                let mut rus: Vec<String> = Vec::new();
+                for h in &parts {
+                    for g in h.ru.split('|').map(|s| s.trim()).filter(|s| !s.is_empty()) {
+                        if !rus.iter().any(|x| x == g) {
+                            rus.push(g.to_string());
+                        }
+                        if rus.len() >= 4 {
+                            break;
+                        }
+                    }
+                    if rus.len() >= 4 {
+                        break;
+                    }
+                }
+                out.insert(0, Hit {
+                    word,
+                    pinyin: ascii.to_string(),
+                    ru: rus.join(" | "),
+                    freq: 0,
+                    tier: 0,
+                });
+                head += 1;
             }
         }
     }
 
-    // 4) 自学习：选过的词排前面
+    // 4) 自学习：选过的词排前面（只排 head 之后的普通候选，
+    //    短语/整句候选保持头部 —— 见 head 上面的注释）
     let learned = idx.learned.lock().unwrap();
-    if !learned.is_empty() {
-        out.sort_by_key(|h| {
+    if !learned.is_empty() && head < out.len() {
+        let mut rest = out.split_off(head);
+        rest.sort_by_key(|h| {
             let c = learned.get(&h.word).copied().unwrap_or(0);
             std::cmp::Reverse(c)
         });
+        out.extend(rest);
     }
-    // 候选窗一页 9 个，留 3 页足够；再多的候选每敲一个键都要被克隆好几遍，
-    // 对体验没有任何帮助，纯浪费。
-    out.truncate(27);
+    out.truncate(MAX_HITS);
     out
 }
 
@@ -514,8 +797,14 @@ fn line_ru(line: &str) -> &str {
     line.split('\t').nth(6).unwrap_or("")
 }
 
-/// 把一串无声调拼音切成词，返回最优切分（至少两个词才算整句）。
-pub fn sentence(pinyin: &str) -> Option<Vec<Hit>> {
+fn line_py(line: &str) -> &str {
+    line.split('\t').nth(2).unwrap_or("")
+}
+
+/// 把一串无声调拼音切成词。
+/// 返回 (切出的词序列, 没切完的尾巴)。尾巴是最后一个词只打了一半剩下的
+/// 拼音（zhongguorenm → 中国/人 + "m"），整串切完时为空。切不出词时 None。
+pub fn sentence(pinyin: &str) -> Option<(Vec<Hit>, String)> {
     if pinyin.chars().count() < 3 {
         return None;
     }
@@ -538,8 +827,14 @@ pub fn sentence(pinyin: &str) -> Option<Vec<Hit>> {
             }
             // 同一个拼音可能有多个词（如 shijie → 世纪/世界），全都要试，
             // 交给动态规划按上下文挑最好的，而不是这里就定死。
-            let mut alts: Vec<&'static str> = lines.iter().map(|(_, l)| *l).collect();
-            alts.sort_by_key(|l| std::cmp::Reverse(line_freq(l)));
+            // 取前 48 条再排序：词典文件本身按词频降序，同一个读音的前几十条
+            // 就是最高频的那些（实测全库 17 万个读音组里只有 12 个组的前 6 名
+            // 会因此不同）。不设上限的话，"yi"这种 500 多条的读音组每次转移
+            // 都要解析+排序 500 行，长句子输入从 0.4ms 涨到 1.5ms。
+            // sort_by_cached_key：词频只解析一次/行（sort_by_key 是每次比较都解析）。
+            let mut alts: Vec<&'static str> =
+                lines.iter().take(48).map(|(_, l)| *l).collect();
+            alts.sort_by_cached_key(|l| std::cmp::Reverse(line_freq(l)));
             for line in alts.into_iter().take(6) {
             let freq = line_freq(line).max(1) as f64;
             let wlen = line_word(line).chars().count() as f64;
@@ -568,9 +863,17 @@ pub fn sentence(pinyin: &str) -> Option<Vec<Hit>> {
                     log_p_uni - 3.0
                 }
             };
+            // 单字词旧版统一 -5：本意是压住被"作为字的频率"抬高的生僻字
+            // （呣/進这种），但 我/你/是 这些高频字也被一起压死了 ——
+            // woshi 会切出「卧室」而不是「我+是」。改成只在两种情况下罚：
+            //   词频 < 120 的生僻单字 → 照罚 5（再叠下面的 -6，共 -11）
+            //   高频单字 → 不罚，交给语料词频和 bigram 自己排序
+            // jintiantianqihenhao 仍切「今天/天气/很好」：今天(词频15万+长词
+            // 加成)本来就压得过 进/提/按，不靠这一刀。
+            let single_pen = if wlen <= 1.0 && freq < 120.0 { 5.0 } else { 0.0 };
             let score = cur.0 + log_p
                 + 2.5 * (wlen - 1.0)
-                - if wlen <= 1.0 { 5.0 } else { 0.0 }
+                - single_pen
                 - if freq < 120.0 { 6.0 } else { 0.0 };
             let end = i + len;
             if best[end].as_ref().map(|(s, _)| score > *s).unwrap_or(true) {
@@ -581,35 +884,82 @@ pub fn sentence(pinyin: &str) -> Option<Vec<Hit>> {
             }
         }
     }
-    let (_, seq) = best[n].as_ref()?;
-    if seq.len() < 2 {
-        return None;
+    // 整串切完了 → 尾巴为空，切分就是答案。
+    // 例外：最后一个词是生僻单字（呣/啊这类词频 <120 的单字）时，
+    // 多半是下一个词只打了一半被硬拼成了字（zhongguorenm → 中国人+呣），
+    // 把最后一个词退回去当"尾巴"，候选才像微软（中国人 + m 的补全）。
+    if let Some((_, seq)) = &best[n] {
+        let last_is_junk = seq.len() >= 2
+            && seq
+                .last()
+                .map_or(false, |l| line_word(l).chars().count() == 1 && line_freq(l) < 120);
+        if last_is_junk {
+            let last_chars = line_py(seq.last().unwrap()).chars().count();
+            let p = n.saturating_sub(last_chars);
+            if let Some((_, pseq)) = &best[p] {
+                if !pseq.is_empty() {
+                    let hits: Vec<Hit> = pseq.iter().filter_map(|l| hit_of(l)).collect();
+                    let tail: String = chars[p..].iter().collect();
+                    return Some((hits, tail));
+                }
+            }
+        }
+        if !seq.is_empty() {
+            let hits: Vec<Hit> = seq.iter().filter_map(|l| hit_of(l)).collect();
+            return Some((hits, String::new()));
+        }
+        // seq 是空的只会出现在 n=0（不可能），继续走下面的回退
     }
-    Some(seq.iter().filter_map(|l| hit_of(l)).collect())
+    // 整串切不完 → 最长可切前缀 + 尾巴（最后一个词只打了一半：
+    // zhongguorenx → 中国人 + "x"）。这样窗口永远不会空。
+    for p in (1..n).rev() {
+        if let Some((_, pseq)) = &best[p] {
+            if !pseq.is_empty() {
+                let hits: Vec<Hit> = pseq.iter().filter_map(|l| hit_of(l)).collect();
+                let tail: String = chars[p..].iter().collect();
+                return Some((hits, tail));
+            }
+        }
+    }
+    None
 }
 
-/// 整句候选：整句本身 + 每个词的俄语（拼在一起，长了会截断）
-pub fn sentence_hit(pinyin: &str) -> Option<Hit> {
-    let parts = sentence(pinyin)?;
-    if parts.len() < 2 {
-        return None;
-    }
-    let word: String = parts.iter().map(|h| h.word.clone()).collect();
-    let mut rus: Vec<String> = Vec::new();
-    for h in &parts {
-        for g in h.ru.split('|').map(|s| s.trim()).filter(|s| !s.is_empty()) {
-            if !rus.iter().any(|x| x == g) {
-                rus.push(g.to_string());
+/// 前缀补全：拼音以 ascii 开头、且比它更长的词条，最多 cap 条。
+/// 1~2 个字母走预算好的高频表；更长顺序扫。整句尾巴补全用它
+/// （zhongguorenm 的尾巴 "m" → 吗/们/没……）。
+fn prefix_hits(ascii: &str, cap: usize) -> Vec<Hit> {
+    let idx = index();
+    let mut out: Vec<Hit> = Vec::with_capacity(cap.min(16));
+    let nchars = ascii.chars().count();
+    if nchars <= 2 {
+        if let Some(list) = idx.prefix_top.get(ascii) {
+            for (line, _) in list {
+                if out.len() >= cap {
+                    break;
+                }
+                if let Some(h) = hit_of(line) {
+                    out.push(h);
+                }
             }
-            if rus.len() >= 4 {
+        }
+    } else {
+        let start = idx.exact.partition_point(|(k, _)| *k < ascii);
+        for (key, line) in idx.exact[start..].iter() {
+            if !key.starts_with(ascii) {
+                break;
+            }
+            if *key == ascii {
+                continue;
+            }
+            if let Some(h) = hit_of(line) {
+                out.push(h);
+            }
+            if out.len() >= cap {
                 break;
             }
         }
-        if rus.len() >= 4 {
-            break;
-        }
     }
-    Some(Hit { word, pinyin: pinyin.to_string(), ru: rus.join(" | "), freq: 0, tier: 0 })
+    out
 }
 /// 预热：把词典索引 + 语言模型一次性建好。
 ///
