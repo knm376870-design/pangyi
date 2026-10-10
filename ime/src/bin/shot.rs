@@ -21,7 +21,6 @@ const LOGFILE: &str = r"C:\Users\33354\AppData\Local\Temp\shot-log.txt";
 
 static mut EDIT: HWND = HWND(0);
 static mut STEP: u32 = 0;
-static mut KSM: Option<ITfKeystrokeMgr> = None;
 static mut LOG: String = String::new();
 
 fn wide(s: &str) -> Vec<u16> { s.encode_utf16().chain(std::iter::once(0)).collect() }
@@ -31,15 +30,19 @@ fn logline(s: &str) {
     std::fs::write(LOGFILE, unsafe { LOG.as_bytes() }).ok();
 }
 
-unsafe fn send_ks(ks: &ITfKeystrokeMgr, c: u8) {
-    let vk = WPARAM((c - 32) as usize);
-    match ks.TestKeyDown(vk, LPARAM(0)) {
-        Ok(b) => {
-            logline(&format!("  TestKeyDown({}) -> eaten={}", c as char, b.as_bool()));
-            if b.as_bool() { let _ = ks.KeyDown(vk, LPARAM(0)); }
-        }
-        Err(e) => logline(&format!("  TestKeyDown 失败 {e:?}")),
-    }
+/// 真实 SendInput 按键（fix_e2e 同款）：SendInput -> 系统队列 -> TSF -> 旁译 -> RichEdit
+unsafe fn send_code(vk: u16) {
+    let mut ins: Vec<INPUT> = Vec::new();
+    let mut i = INPUT::default();
+    i.r#type = INPUT_KEYBOARD;
+    i.Anonymous.ki.wVk = VIRTUAL_KEY(vk);
+    ins.push(i);
+    let mut i = INPUT::default();
+    i.r#type = INPUT_KEYBOARD;
+    i.Anonymous.ki.wVk = VIRTUAL_KEY(vk);
+    i.Anonymous.ki.dwFlags = KEYEVENTF_KEYUP;
+    ins.push(i);
+    let _ = SendInput(&ins, std::mem::size_of::<INPUT>() as i32);
 }
 
 unsafe fn focus_ours(h: HWND) {
@@ -67,7 +70,6 @@ unsafe fn do_step(h: HWND) {
             logline(&format!("前台: {} (hwnd={:?} fg={:?})", GetForegroundWindow() == h, h, GetForegroundWindow()));
             if let Ok(tm) = CoCreateInstance::<_, ITfThreadMgr>(&CLSID_TF_ThreadMgr, None, CLSCTX_INPROC_SERVER) {
                 match tm.Activate() { Ok(t) => logline(&format!("ThreadMgr Activate ok clientId={t}")), Err(e) => logline(&format!("Activate 失败 {e:?}")) }
-                if let Ok(ks) = tm.cast::<ITfKeystrokeMgr>() { KSM = Some(ks); logline("拿到 KeystrokeMgr"); }
                 // 不靠系统前台：重新 SetFocus 触发 RichEdit 自己连 TSF 并接管文档焦点
                 let _ = SetFocus(EDIT);
             } else { logline("拿不到 ThreadMgr"); }
@@ -80,9 +82,16 @@ unsafe fn do_step(h: HWND) {
             SetTimer(h, 1, 1200, None);
         }
         2 => {
-            if let Some(ks) = KSM.as_ref() {
-                for c in b"pengyou" { send_ks(ks, *c); }
-            } else { logline("没有 KeystrokeMgr"); }
+            // 每键都确认前台还是自己再发（被用户点走就抢回来，抢不回就停手——键绝不漏进别的应用）
+            for c in b"pengyou" {
+                if GetForegroundWindow() != h {
+                    focus_ours(h);
+                    if GetForegroundWindow() != h { logline("前台被抢走且抢不回，中止按键"); break; }
+                    std::thread::sleep(std::time::Duration::from_millis(150));
+                }
+                send_code((c - 32) as u16);
+                std::thread::sleep(std::time::Duration::from_millis(260));
+            }
             SetTimer(h, 1, 30000, None); // 挂 30 秒给外部截屏
         }
         _ => {
