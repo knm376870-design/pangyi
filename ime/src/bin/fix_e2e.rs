@@ -451,7 +451,9 @@ unsafe fn tick(h: HWND) {
         }
         12 => {
             let t = text_of();
-            let _ = result("G4", "正好「你,」（标点不丢）", t == "你,");
+            // v4.3.0 起中文标点默认开：逗号转全角。这里断言的是「不丢 + 首选上屏」，
+            // 标点跟随当前版本的全角行为。
+            let _ = result("G4", "正好「你，」（首选上屏 + 全角逗号）", t == "你，");
             clear_edit();
             logline("=== G5: Caps 开 + 字母 A + Caps 关 —— 大写 A 直通（Caps 不吞字母）===");
             QUEUE = vec![0x14, 0x41, 0x14]; // Caps A Caps
@@ -508,7 +510,7 @@ fn main() -> Result<()> {
             let _ = std::fs::create_dir_all(&dir);
             let _ = std::fs::write(
                 format!("{dir}\\settings.txt"),
-                "max=5\nscale=100\nlayout=v\ntheme=0\nenglish=0\ndebug=0\n",
+                "max=5\nscale=100\nlayout=v\ntheme=0\nenglish=0\ndebug=0\ncnpunct=1\n",
             );
         }
         // 抢注必须在【建窗/聚焦之前】—— 否则 TSF 聚焦时会先把已安装的旁译

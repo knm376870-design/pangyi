@@ -11,7 +11,7 @@ pub mod settings;
 
 use std::cell::{Cell, RefCell};
 use std::os::raw::c_void;
-use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 
 use std::sync::Mutex;
 use windows::core::{implement, ComInterface, Result, GUID, HRESULT};
@@ -241,6 +241,7 @@ impl TextService {
     fn commit_text(&self, pic: Option<&ITfContext>, text: &str) {
         if let Some(ctx) = pic {
             let session: ITfEditSession = DoneSession {
+                ctx: ctx.clone(),
                 text: text.encode_utf16().collect(),
             }
             .into();
@@ -296,7 +297,12 @@ impl TextService {
         }
         // 先读设置：log() 要靠 settings::debug() 决定要不要写，顺序不能反
         unsafe { settings::load(); }
-        log("Activate");
+        log("Activate v4.3.0");
+        log(&format!(
+            "cnpunct={} english={}",
+            crate::settings::cnpunct(),
+            crate::settings::english()
+        ));
 
         // 后台预热词典索引，避免第一次打字时卡一下（只跑一次）
         static WARMED: std::sync::Once = std::sync::Once::new();
@@ -477,6 +483,12 @@ impl ITfKeyEventSink_Impl for TextService {
             return Ok(BOOL(0));
         }
         SHIFT_DIRTY.store(true, Ordering::Relaxed);
+        // Ctrl+. 切换中文标点（微软同款快捷键）。必须放在「带修饰键放行」之前，
+        // 否则永远到不了 OnKeyDown。
+        if wparam.0 == 0xBE && ctrl_only() {
+            dlog!("KeySink::OnTestKeyDown Ctrl+. 切中文标点");
+            return Ok(BOOL(1));
+        }
         // 带 Ctrl / Alt / Win 的组合键一律不碰，原样交给应用和系统
         if command_modifier_down() {
             dlog!("KeySink::OnTestKeyDown wparam={} 有修饰键，放行", wparam.0);
@@ -522,6 +534,13 @@ impl ITfKeyEventSink_Impl for TextService {
     }
 
     fn OnKeyDown(&self, pic: Option<&ITfContext>, wparam: WPARAM, _lp: LPARAM) -> Result<BOOL> {
+        // Ctrl+. 切换中文标点（微软同款快捷键）。OnTestKeyDown 已经 claim 过，
+        // 这里直接执行；组合保持原样（微软也不会因它上屏）。
+        if wparam.0 == 0xBE && ctrl_only() {
+            crate::settings::set_cnpunct(!crate::settings::cnpunct());
+            dlog!("KeySink::OnKeyDown Ctrl+. 中文标点 -> {}", crate::settings::cnpunct());
+            return Ok(BOOL(1));
+        }
         // 双保险：带 Ctrl / Alt / Win 的键直接放行，绝不进组合
         if command_modifier_down() {
             return Ok(BOOL(0));
@@ -684,7 +703,14 @@ impl ITfKeyEventSink_Impl for TextService {
         if has_buf && is_punct_vk(wparam.0 as u32) {
             let w = unsafe { cand::current() }
                 .or_else(|| UI_CANDS.lock().unwrap().first().map(|(w, _)| w.clone()));
-            let c = vk_to_char(wparam.0 as u32);
+            // v4.3.0：中文标点开且没按 Shift 时，标点转全角；Shift+标点 保持半角
+            let c = vk_to_char(wparam.0 as u32).map(|c| {
+                if crate::settings::cnpunct() && !crate::settings::english() && !shift_down() {
+                    punct_full(c).unwrap_or(c)
+                } else {
+                    c
+                }
+            });
             self.buf.borrow_mut().clear();
             UI_CANDS.lock().unwrap().clear();
             unsafe { cand_hide(); }
@@ -709,6 +735,18 @@ impl ITfKeyEventSink_Impl for TextService {
             return Ok(BOOL(1));
         }
 
+        // 中文标点（智能全角）：无拼音时标点键直接转全角上屏，不进组合。
+        // claim() 只在 中文模式 + 开关开 + 无 Shift 时拦标点（- = ` 不拦），
+        // 这里兜底照做一遍：拿不到字符就放行给应用。
+        if !has_buf && is_punct_vk(wparam.0 as u32) {
+            if let Some(c) = vk_to_char(wparam.0 as u32) {
+                let c = punct_full(c).unwrap_or(c);
+                self.commit_text(pic, &c.to_string());
+                return Ok(BOOL(1));
+            }
+            return Ok(BOOL(0));
+        }
+
         Ok(BOOL(0))
     }}
 
@@ -718,6 +756,35 @@ fn is_punct_vk(vk: u32) -> bool {
         vk,
         0xBA | 0xBB | 0xBC | 0xBD | 0xBE | 0xBF | 0xC0 | 0xDB | 0xDC | 0xDD | 0xDE
     )
+}
+
+/// 引号配对：' 第一次出左引号，第二次出右引号（和微软一致，简单交替）。
+static QUOTE_OPEN: AtomicBool = AtomicBool::new(false);
+
+/// 半角标点 → 全角中文标点。没有全角对应的（- = ` 等）返回 None，原样写。
+fn punct_full(c: char) -> Option<char> {
+    Some(match c {
+        ',' => '，',
+        '.' => '。',
+        ';' => '；',
+        '/' => '、',
+        '\\' => '、',
+        '[' => '【',
+        ']' => '】',
+        '\'' => {
+            if QUOTE_OPEN.fetch_xor(true, Ordering::Relaxed) { '’' } else { '‘' }
+        }
+        _ => return None,
+    })
+}
+
+/// 只有 Ctrl 按着（Alt / Win 没按）—— Ctrl+. 切中文标点用。
+fn ctrl_only() -> bool {
+    use windows::Win32::UI::Input::KeyboardAndMouse::{VK_CONTROL, VK_LWIN, VK_MENU, VK_RWIN};
+    key_down(VK_CONTROL.0 as i32)
+        && !key_down(VK_MENU.0 as i32)
+        && !key_down(VK_LWIN.0 as i32)
+        && !key_down(VK_RWIN.0 as i32)
 }
 
 /// 虚拟键码 → 当前键盘布局下（含 Shift/Caps 状态）实际会打出的字符。
@@ -811,7 +878,12 @@ fn claim(wparam: WPARAM, has_buf: bool, english: bool) -> bool {
         return !english;
     }
     if !has_buf {
-        return false;
+        // 中文标点：无拼音时标点键也拦下来转全角（不进组合）。
+        // Shift+标点 保持半角放行（方便打代码）；- = ` 没有全角对应，不拦。
+        return !english
+            && crate::settings::cnpunct()
+            && !shift_down()
+            && matches!(wparam.0 as u32, 0xBA | 0xBC | 0xBE..=0xBF | 0xDB..=0xDE);
     }
     match wparam.0 as u32 {
         0x20 | 0x1B | 0x08 | 0x0D | 0x09 => true, // 空格 / ESC / 退格 / 回车 / Tab
@@ -1041,9 +1113,11 @@ impl ITfEditSession_Impl for CompSession {
     }
 }
 
-/// 上屏：把 composition 的文字换成最终的中文，然后结束组合
+/// 上屏：把 composition 的文字换成最终的中文，然后结束组合。
+/// 没有活动组合时（无拼音直接上屏，比如中文标点）写到当前光标处。
 #[implement(ITfEditSession)]
 struct DoneSession {
+    ctx: ITfContext,
     text: Vec<u16>,
 }
 
@@ -1051,17 +1125,26 @@ impl ITfEditSession_Impl for DoneSession {
     fn DoEditSession(&self, ec: u32) -> Result<()> {
         unsafe {
             // 换字 + 结束组合放在同一次会话里（拆成两次会让某些宿主把文字丢掉）
-            let mut wrote = false;
             if let Some(comp) = COMPOSITION.lock().unwrap().take() {
+                let mut wrote = false;
                 if let Ok(r) = comp.GetRange() {
                     wrote = r.SetText(ec, 0, &self.text).is_ok();
                 }
                 let hr = comp.EndComposition(ec);
                 dlog!("上屏: SetText={wrote} EndComposition -> {hr:?}");
             } else {
-                log("上屏: 没有活动组合");
+                // 无组合：插到当前 selection（CommitSession 同款）
+                let mut sel = [TF_SELECTION::default()];
+                let mut n = 0u32;
+                self.ctx.GetSelection(ec, 0, &mut sel, &mut n)?;
+                if n == 0 {
+                    return Ok(());
+                }
+                if let Some(range) = (&*sel[0].range).as_ref() {
+                    let ok = range.SetText(ec, 0, &self.text).is_ok();
+                    dlog!("上屏: 无组合 SetText={ok}");
+                }
             }
-
         }
         Ok(())
     }
