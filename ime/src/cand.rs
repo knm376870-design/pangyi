@@ -6,6 +6,9 @@ use std::sync::atomic::{AtomicBool, AtomicI32, AtomicIsize, AtomicUsize, Orderin
 use windows::core::{PCWSTR, w};
 use windows::Win32::Foundation::*;
 use windows::Win32::Graphics::Gdi::*;
+use windows::Win32::UI::Input::KeyboardAndMouse::{
+    SendInput, INPUT, INPUT_KEYBOARD, KEYEVENTF_KEYUP, VK_RETURN,
+};
 use windows::Win32::UI::WindowsAndMessaging::*;
 
 pub struct Item {
@@ -19,6 +22,9 @@ static ITEMS: Mutex<Vec<Item>> = Mutex::new(Vec::new());
 static PREEDIT: Mutex<String> = Mutex::new(String::new());
 static SENTENCE: Mutex<Option<String>> = Mutex::new(None);
 static SEL: AtomicUsize = AtomicUsize::new(0);
+/// 蓝条选中哪一侧：false = 中文（默认），true = 俄语侧 —— 上屏只出俄语，
+/// 中文不输入。←/→ 切换，鼠标点俄语列同样进入；每次换新候选组自动回中文侧。
+static RU_SEL: AtomicBool = AtomicBool::new(false);
 /// 当前页号（0 起）和总页数，画右下角那个「▲▼ 2/59」用。总页数 1 就不画。
 static PAGE_CUR: AtomicUsize = AtomicUsize::new(0);
 static PAGE_TOT: AtomicUsize = AtomicUsize::new(1);
@@ -414,7 +420,9 @@ unsafe extern "system" fn proc_cand(h: HWND, msg: u32, w: WPARAM, l: LPARAM) -> 
                     let ry = y + (i as i32) * lay.row_h;
                     if i == sel {
                         let hb = CreateSolidBrush(p.highlight);
-                        let rgn = CreateRoundRectRgn(pad / 2, ry, rc.right - pad / 2, ry + lay.row_h, sc(RADIUS), sc(RADIUS));
+                        // 选中俄语侧时蓝条只罩住俄语那一列（←→/点俄语列进入）
+                        let l = if RU_SEL.load(Ordering::Relaxed) { x_ru - pad / 2 } else { pad / 2 };
+                        let rgn = CreateRoundRectRgn(l, ry, rc.right - pad / 2, ry + lay.row_h, sc(RADIUS), sc(RADIUS));
                         FillRgn(dc, rgn, hb);
                         let _ = DeleteObject(rgn);
                         let _ = DeleteObject(hb);
@@ -460,8 +468,37 @@ unsafe extern "system" fn proc_cand(h: HWND, msg: u32, w: WPARAM, l: LPARAM) -> 
             let _ = EndPaint(h, &ps);
             LRESULT(0)
         }
+        // 鼠标点候选直接上屏：点哪条选哪条；竖排点俄语列＝选中俄语侧。
+        // 然后合成一次回车，走和真键盘完全一样的 TSF 提交路径 —— 自学习、
+        // 逐字/整句翻译、句子缓冲一个不落，不另开一条提交逻辑。
+        WM_LBUTTONDOWN => {
+            // 客户区坐标：l 低 16 位是 x、高 16 位是 y（有符号）
+            let x = (l.0 as i16) as i32;
+            let y = ((l.0 >> 16) as i16) as i32;
+            if let Some((i, ru)) = hit_test(x, y) {
+                select(i);
+                set_ru_sel(ru && !crate::settings::horizontal());
+                click_commit();
+            }
+            LRESULT(0)
+        }
         _ => DefWindowProcW(h, msg, w, l),
     }
+}
+
+/// 合成一次回车（按下+抬起）：候选窗点选后触发提交。
+/// 候选窗是 WS_EX_NOACTIVATE，点它不抢焦点，回车照旧落回宿主应用，
+/// 由 TSF 正常接管 —— 和用户手按回车一模一样。
+unsafe fn click_commit() {
+    let mut down = INPUT::default();
+    down.r#type = INPUT_KEYBOARD;
+    down.Anonymous.ki.wVk = VK_RETURN;
+    let mut up = INPUT::default();
+    up.r#type = INPUT_KEYBOARD;
+    up.Anonymous.ki.wVk = VK_RETURN;
+    up.Anonymous.ki.dwFlags = KEYEVENTF_KEYUP;
+    let ins = [down, up];
+    let _ = SendInput(&ins, std::mem::size_of::<INPUT>() as i32);
 }
 
 pub unsafe fn init() {
@@ -492,6 +529,8 @@ pub unsafe fn init() {
 pub unsafe fn set_items(items: Vec<Item>) {
     { let mut g = ITEMS.lock().unwrap(); *g = items; }
     SEL.store(0, Ordering::Relaxed);
+    // 新一组候选重新从中文侧开始（上次 ←→ 选中的俄语侧不再沿用）
+    RU_SEL.store(false, Ordering::Relaxed);
 }
 
 /// 记下页码（画右下角的「▲▼ n/总」）。cur 是 0 起的页号。
@@ -508,6 +547,100 @@ pub unsafe fn page_info() -> (usize, usize) {
 pub unsafe fn set_preedit(s: &str) { *PREEDIT.lock().unwrap() = s.to_string(); }
 
 pub unsafe fn set_sentence(s: Option<String>) { *SENTENCE.lock().unwrap() = s; }
+
+/// 蓝条现在选中哪一侧（true = 俄语侧）。提交路径据此决定上屏中文还是俄语。
+pub fn ru_sel() -> bool {
+    RU_SEL.load(Ordering::Relaxed)
+}
+
+/// ←/→ 切换选中侧：蓝条从整行挪到俄语那一列（或挪回来），触发重画。
+pub unsafe fn set_ru_sel(v: bool) {
+    RU_SEL.store(v, Ordering::Relaxed);
+    if alive() { let _ = InvalidateRect(hwnd(), None, TRUE); }
+}
+
+/// 竖排几何（和 WM_PAINT 同一套算法）：首行 y、行高、词列 x、俄语列 x。
+/// 顶行（拼音 / ☁ 提示）占多高就先加多高，这样点击和画的位置对得上。
+unsafe fn v_geom(dc: HDC) -> Option<(i32, i32, i32, i32)> {
+    let items = ITEMS.lock().unwrap();
+    if items.is_empty() { return None; }
+    let lay = compute_layout(dc, &items);
+    drop(items);
+    let pad = sc(PAD);
+    let gap = sc(GAP);
+    let mut y = pad;
+    let pre = PREEDIT.lock().unwrap().clone();
+    let sent = SENTENCE.lock().unwrap().clone();
+    if !pre.is_empty() || sent.is_some() {
+        let f_anno = font(ANNO_PX);
+        let (_, ph) = measure(dc, f_anno, "x");
+        y += ph + sc(ROW_PAD) * 2;
+    }
+    let x_word = pad + lay.index_w + gap;
+    let x_ru = x_word + lay.word_w + gap + lay.pinyin_w + gap;
+    Some((y, lay.row_h, x_word, x_ru))
+}
+
+/// 鼠标点 (x, y)（客户区坐标）落在哪一行、哪一侧：(行号, 是否俄语列)。
+/// 点不到候选行返回 None。索引列和词列都算中文侧。
+pub unsafe fn hit_test(x: i32, y: i32) -> Option<(usize, bool)> {
+    let h = hwnd();
+    let dc = GetDC(h);
+    if dc.0 == 0 { return None; }
+    let r = v_geom(dc);
+    if dc.0 != 0 { let _ = ReleaseDC(h, dc); }
+    let (y0, row_h, _x_word, x_ru) = r?;
+    let dy = y - y0;
+    if dy < 0 { return None; }
+    let i = (dy / row_h) as usize;
+    if i >= ITEMS.lock().unwrap().len() { return None; }
+    if x >= x_ru {
+        Some((i, true))
+    } else if x >= 0 {
+        // 俄语列左边整块（含序号、词、拼音列）都算中文侧，点空白也能选
+        Some((i, false))
+    } else {
+        None
+    }
+}
+
+/// 第 row 行中文侧/俄语侧的可点击矩形（客户区坐标），测试台架算点击点用。
+pub unsafe fn hit_rect(row: usize, ru: bool) -> Option<(i32, i32, i32, i32)> {
+    let h = hwnd();
+    let dc = GetDC(h);
+    if dc.0 == 0 { return None; }
+    let r = v_geom(dc);
+    if dc.0 != 0 { let _ = ReleaseDC(h, dc); }
+    let (y0, row_h, x_word, x_ru) = r?;
+    if row >= ITEMS.lock().unwrap().len() { return None; }
+    let top = y0 + row as i32 * row_h;
+    let l = if ru { x_ru } else { x_word };
+    Some((l, top, l + 60, top + row_h))
+}
+
+// ---- 测试台架专用导出（side_e2e 用 GetProcAddress 拿，不挂在正常 API 上）----
+
+/// 候选窗句柄：台架 PostMessage 鼠标点击用
+#[no_mangle]
+pub unsafe extern "system" fn cand_hwnd_export() -> isize {
+    hwnd().0
+}
+
+/// 第 row 行中文侧(ru=0)/俄语侧(ru=1)的可点击矩形写进 out[4] = l,t,r,b
+#[no_mangle]
+pub unsafe extern "system" fn cand_hit_rect_export(row: u32, ru: u32, out: *mut i32) -> u32 {
+    if out.is_null() { return 0; }
+    match hit_rect(row as usize, ru != 0) {
+        Some((l, t, r, b)) => {
+            *out.add(0) = l;
+            *out.add(1) = t;
+            *out.add(2) = r;
+            *out.add(3) = b;
+            1
+        }
+        None => 0,
+    }
+}
 
 pub unsafe fn select(i: usize) {
     let n = ITEMS.lock().unwrap().len();

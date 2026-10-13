@@ -238,6 +238,30 @@ fn flip_page(delta: isize) -> bool {
     true
 }
 
+/// 在候选里移动一格：delta = -1 上一格 / +1 下一格；撞到页边界自动翻页
+/// （第 1 个再往上 = 上一页的最后一条，最后一个再往下 = 下一页第 1 条，
+///   和微软拼音一样看着一页一页连起来翻）。调用前要先确认当前页有候选。
+fn move_sel(delta: isize) {
+    let n = UI_CANDS.lock().unwrap().len();
+    let cur = unsafe { cand::current_index() };
+    if delta < 0 && cur == 0 {
+        if flip_page(-1) {
+            // 翻到上一页后选最后一条（连续往上按不会卡住）
+            let last = unsafe { cand::count() }.saturating_sub(1);
+            unsafe { cand::select(last); }
+        }
+        return;
+    }
+    if delta > 0 && cur + 1 >= n {
+        if flip_page(1) {
+            unsafe { cand::select(0); }
+        }
+        return;
+    }
+    let next = if delta < 0 { cur - 1 } else { cur + 1 };
+    unsafe { cand::select(next); }
+}
+
 impl TextService {
     /// 把文本写进文档（换掉当前组合），不记录自学习。
     /// 用于「候选 + 标点 / 候选 + 大写字母」这类拼接上屏 —— 不能把拼接串
@@ -254,11 +278,25 @@ impl TextService {
         }
     }
 
+    /// ←/→ 选中「俄语侧」时，上屏内容换成该词的俄语第一释义；
+    /// 没译文的词照旧上中文（它的俄语列本来就是空的）。
+    fn pick_text(word: &str) -> String {
+        if unsafe { cand::ru_sel() } && !crate::settings::horizontal() {
+            dict::ru_of(word).map(|r| r.to_string()).unwrap_or_else(|| word.to_string())
+        } else {
+            word.to_string()
+        }
+    }
+
     /// 把某个词上屏（换掉当前组合）
     fn commit_word(&self, pic: Option<&ITfContext>, word: &str) {
         dict::note_choice(word); // 自学习：下次把这个词排前面
+        // v4.5.0 选中俄语侧：只上屏俄语，中文不输入（逐字翻译不再重复拼）
         // v4.4.0 逐字翻译：俄语第一释义跟在词后面；整句模式：记进句子缓冲
-        let text = if crate::settings::trmode() == 1 {
+        dlog!("commit_word word={word} ru_sel={} horizontal={}", unsafe { cand::ru_sel() }, crate::settings::horizontal());
+        let text = if unsafe { cand::ru_sel() } && !crate::settings::horizontal() {
+            Self::pick_text(word)
+        } else if crate::settings::trmode() == 1 {
             match dict::ru_of(word) {
                 Some(ru) => format!("{word} {ru}"),
                 None => word.to_string(),
@@ -311,7 +349,7 @@ impl TextService {
         }
         // 先读设置：log() 要靠 settings::debug() 决定要不要写，顺序不能反
         unsafe { settings::load(); }
-        log("Activate v4.4.0");
+        log("Activate v4.5.0");
         log(&format!(
             "cnpunct={} english={} trmode={}",
             crate::settings::cnpunct(),
@@ -603,7 +641,8 @@ impl ITfKeyEventSink_Impl for TextService {
                     Some(w) => {
                         dict::note_choice(&w);
                         sent_push(&w);
-                        self.commit_text(pic, &format!("{w}{letter}"));
+                        // v4.5.0：选中俄语侧时大写字母也跟在俄语后面
+                        self.commit_text(pic, &format!("{}{letter}", Self::pick_text(&w)));
                     }
                     // 没有候选：组合里只剩拼音，直接换成大写字母上屏
                     None => self.commit_text(pic, &letter.to_string()),
@@ -664,27 +703,26 @@ impl ITfKeyEventSink_Impl for TextService {
         //   和微软拼音一样看着一页一页连起来翻）
         if matches!(wparam.0 as u32, 0x26 | 0x28 | 0x09) {
             if !has_buf { return Ok(BOOL(0)); }
-            let n = UI_CANDS.lock().unwrap().len();
             // 没有候选可动就让应用正常处理方向键/Tab（移动光标、切焦点）
-            if n == 0 { return Ok(BOOL(0)); }
+            if UI_CANDS.lock().unwrap().len() == 0 { return Ok(BOOL(0)); }
             let up = (wparam.0 as u32) == 0x26;
-            let cur = unsafe { cand::current_index() };
-            if up && cur == 0 {
-                if flip_page(-1) {
-                    // 翻到上一页后选最后一条（连续往上按不会卡住）
-                    let last = unsafe { cand::count() }.saturating_sub(1);
-                    unsafe { cand::select(last); }
-                }
-                return Ok(BOOL(1));
+            move_sel(if up { -1 } else { 1 });
+            return Ok(BOOL(1));
+        }
+
+        // ← / →：竖排时在「中文 / 俄语」两边之间切换 —— 蓝条挪到俄语列，
+        // 上屏就只出俄语（中文不用输入）；再按 ← 挪回中文侧。
+        // 横排没有左右两栏，←→ 就当作 ↑↓ 移动用。
+        if matches!(wparam.0 as u32, 0x25 | 0x27) {
+            if !has_buf { return Ok(BOOL(0)); }
+            if UI_CANDS.lock().unwrap().len() == 0 { return Ok(BOOL(0)); }
+            if crate::settings::horizontal() {
+                let right = (wparam.0 as u32) == 0x27;
+                move_sel(if right { 1 } else { -1 });
+            } else {
+                unsafe { cand::set_ru_sel((wparam.0 as u32) == 0x27); }
             }
-            if !up && cur + 1 >= n {
-                if flip_page(1) {
-                    unsafe { cand::select(0); }
-                }
-                return Ok(BOOL(1));
-            }
-            let next = if up { cur - 1 } else { cur + 1 };
-            unsafe { cand::select(next); }
+            dlog!("←/→ wparam={} 现在 ru_sel={}", wparam.0, unsafe { cand::ru_sel() });
             return Ok(BOOL(1));
         }
 
@@ -762,8 +800,12 @@ impl ITfKeyEventSink_Impl for TextService {
             match (w, c) {
                 (Some(w), Some(c)) => {
                     dict::note_choice(&w);
+                    // v4.5.0：选中俄语侧时只上屏俄语+标点，中文词照旧进句子缓冲
+                    if unsafe { cand::ru_sel() } && !crate::settings::horizontal() {
+                        self.commit_text(pic, &format!("{}{c}", Self::pick_text(&w)));
+                        sent_push(&w);
                     // 逐字翻译：俄语第一释义夹在词和标点之间
-                    if crate::settings::trmode() == 1 {
+                    } else if crate::settings::trmode() == 1 {
                         let ru = dict::ru_of(&w).map(|r| format!(" {r}")).unwrap_or_default();
                         self.commit_text(pic, &format!("{w}{ru}{c}"));
                     } else {
@@ -1037,7 +1079,9 @@ fn claim(wparam: WPARAM, has_buf: bool, english: bool) -> bool {
             let idx = (wparam.0 as usize) - 0x31;
             !shift_down() && idx < UI_CANDS.lock().unwrap().len()
         }
-        0x25..=0x28 => true,                      // 方向键选词
+        // 方向键选词：当前页真有候选才拦，否则放行给应用移动光标。
+        // （v4.5.0 前这里无条件 true，空候选时 ←→ 会被 TSF 吞掉）
+        0x25..=0x28 => !UI_CANDS.lock().unwrap().is_empty(),
         0x21 | 0x22 => true,                      // PageUp / PageDown
         _ => is_punct_vk(wparam.0 as u32),
     }
