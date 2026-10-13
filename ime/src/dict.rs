@@ -780,6 +780,77 @@ fn lm() -> &'static LmMap {
 fn bigram_count(a: &str, b: &str) -> u32 {
     lm().get(&(a, b)).copied().unwrap_or(0)
 }
+// ---------------- 中文反查 + 自动翻译（v4.4.0） ----------------
+//
+// 逐字/整句自动翻译：中文词 -> 俄语 反查表，按用户上屏的词边界逐词直译。
+// 表懒建：翻译功能没开的时候一个字节都不花。词典里有几万个同形词
+// （行 xing/hang、长 chang/zhang），同形只留词频最高的一条。
+// 输出是词级直译（词典释义拼接），不做俄语变格/语序调整——
+// 离线词典的极限，成句翻译需要在线模型。
+
+struct ZhIndex {
+    /// 中文词 -> (俄语释义, 词频)
+    by_word: HashMap<&'static str, (&'static str, u64)>,
+}
+
+fn zh_index() -> &'static ZhIndex {
+    static Z: OnceLock<ZhIndex> = OnceLock::new();
+    Z.get_or_init(|| {
+        let mut by_word: HashMap<&'static str, (&'static str, u64)> = HashMap::new();
+        for line in RAW.lines().skip(1) {
+            let w = line_word(line);
+            if w.is_empty() {
+                continue;
+            }
+            let ru = line_ru(line);
+            if ru.is_empty() {
+                continue; // 没俄语的词条：译不了，也不参与切词
+            }
+            let f = line_freq(line);
+            match by_word.get(w) {
+                Some(&(_, of)) if of >= f => {}
+                _ => {
+                    by_word.insert(w, (ru, f));
+                }
+            }
+        }
+        ZhIndex { by_word }
+    })
+}
+
+/// 俄语释义只取第一项（词典里用 | 分隔多个译法，翻译输出只留第一个）。
+fn ru_first(ru: &str) -> &str {
+    ru.split('|').next().unwrap_or(ru).trim()
+}
+
+/// 查一个词的俄语第一释义。逐字模式用：词上屏时跟在后面。
+pub fn ru_of(word: &str) -> Option<&'static str> {
+    zh_index().by_word.get(word).map(|(ru, _)| ru_first(ru))
+}
+
+/// 词序列 -> 词典直译：逐词查俄语第一释义，空格拼接。
+/// 词边界就是用户上屏时的选词边界（不做重切分 —— 用户把「你好」当一个词
+/// 上屏，就该译成 привет，而不是重新切成 你+好）。没俄语的词原样保留；
+/// 整串一个可译词都没有时返回 None。
+pub fn translate_words<'a>(words: impl Iterator<Item = &'a str>) -> Option<String> {
+    let idx = zh_index();
+    let mut parts: Vec<String> = Vec::new();
+    let mut any_ru = false;
+    for w in words {
+        match idx.by_word.get(w) {
+            Some(&(ru, _)) => {
+                any_ru = true;
+                parts.push(ru_first(ru).to_string());
+            }
+            None => parts.push(w.to_string()),
+        }
+    }
+    if !any_ru {
+        return None;
+    }
+    Some(parts.join(" "))
+}
+
 // ---------------- 整句转换（词典频次 + 动态规划 + 语料 bigram） ----------------
 //
 // 讯飞/微软拼音那种"打一整句拼音、直接出句子"。

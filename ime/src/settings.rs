@@ -17,6 +17,9 @@ static THEME: AtomicI32 = AtomicI32::new(0); // 0 跟随系统 / 1 浅色 / 2 �
 static DEBUG: AtomicBool = AtomicBool::new(false);
 /// 中文标点（智能全角）开关。默认开 —— 中文模式下标点键直接出全角（，。、）等。
 static CNPUNCT: AtomicBool = AtomicBool::new(true);
+/// 翻译模式：0 关 / 1 逐字（每个词上屏时俄语跟在后面）/ 2 整句（候选窗实时
+/// 显示整句翻译，句末标点或回车时整句俄语上屏）。默认关 —— 老用户行为不变。
+static TRMODE: AtomicI32 = AtomicI32::new(0);
 
 static STANDALONE: AtomicBool = AtomicBool::new(false);
 static mut WND: HWND = HWND(0);
@@ -53,6 +56,9 @@ pub fn load() {
                 },
                 "debug" => DEBUG.store(v == "1" || v.eq_ignore_ascii_case("true"), Ordering::Relaxed),
                 "cnpunct" => CNPUNCT.store(v == "1" || v.eq_ignore_ascii_case("true"), Ordering::Relaxed),
+                "trmode" => if let Ok(n) = v.parse::<i32>() {
+                    TRMODE.store(n.clamp(0, 2), Ordering::Relaxed);
+                },
                 _ => {}
             }
         }
@@ -65,13 +71,14 @@ pub fn save() {
         let _ = std::fs::create_dir_all(dir);
     }
     let body = format!(
-        "max={}\nscale={}\nlayout={}\ntheme={}\nenglish={}\ndebug={}\ncnpunct={}\n",
+        "max={}\nscale={}\nlayout={}\ntheme={}\nenglish={}\ndebug={}\ncnpunct={}\ntrmode={}\n",
         max_cands(), font_scale(),
         if horizontal() { "h" } else { "v" },
         THEME.load(Ordering::Relaxed),
         if english() { 1 } else { 0 },
         if debug() { 1 } else { 0 },
-        if cnpunct() { 1 } else { 0 }
+        if cnpunct() { 1 } else { 0 },
+        TRMODE.load(Ordering::Relaxed)
     );
     let _ = std::fs::write(path, body);
 }
@@ -96,6 +103,15 @@ pub fn cnpunct() -> bool {
 
 pub fn set_cnpunct(v: bool) {
     CNPUNCT.store(v, Ordering::Relaxed);
+    save();
+}
+
+pub fn trmode() -> i32 {
+    TRMODE.load(Ordering::Relaxed)
+}
+
+pub fn set_trmode(v: i32) {
+    TRMODE.store(v.clamp(0, 2), Ordering::Relaxed);
     save();
 }
 
@@ -175,7 +191,7 @@ fn draw(dc: HDC, f: HFONT, color: COLORREF, x: i32, y: i32, s: &str) -> i32 {
 }
 
 const ROW_H: i32 = 34;
-const ROW_COUNT: i32 = 6;
+const ROW_COUNT: i32 = 7;
 const PAD: i32 = 16;
 
 /// 每行的选项：标签 + 选项文本 + 动作号
@@ -186,6 +202,7 @@ fn rows() -> Vec<(&'static str, Vec<(&'static str, i32)>)> {
         ("排版", vec![("竖排", 7), ("横排", 8)]),
         ("主题", vec![("跟随系统", 9), ("浅色", 10), ("深色", 11)]),
         ("中文标点", vec![("开", 13), ("关", 14)]),
+        ("翻译模式", vec![("关", 15), ("逐字", 16), ("整句", 17)]),
         ("自定义短语", vec![("打开短语文件", 12)]),
     ]
 }
@@ -207,6 +224,7 @@ fn is_current(act: i32) -> bool {
         7 | 8 => act == if horizontal() { 8 } else { 7 },
         9..=11 => act == 9 + t,
         13 | 14 => act == if cnpunct() { 13 } else { 14 },
+        15..=17 => act == 15 + trmode(),
         _ => false,
     }
 }
@@ -343,6 +361,7 @@ fn apply(action: i32) {
         11 => THEME.store(2, Ordering::Relaxed),
         13 => CNPUNCT.store(true, Ordering::Relaxed),
         14 => CNPUNCT.store(false, Ordering::Relaxed),
+        15..=17 => TRMODE.store(action - 15, Ordering::Relaxed),
         12 => {
             // 打开自定义短语文件（phrases.txt）
             let base = std::env::var("LOCALAPPDATA").unwrap_or_else(|_| ".".into());
@@ -394,7 +413,7 @@ unsafe fn init() {
         WINDOW_EX_STYLE(0),
         PCWSTR(cls.as_ptr()), PCWSTR(title.as_ptr()),
         WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX,
-        0, 0, sc(340), sc(334), None, None, hinst, None);
+        0, 0, sc(340), sc(368), None, None, hinst, None);
     // WNDCLASSW 没有 hIconSm 字段，标题栏那个 16x16 小图标用 WM_SETICON 单独设
     if WND.0 != 0 && small.0 != 0 {
         SendMessageW(WND, WM_SETICON, WPARAM(0), LPARAM(small.0 as isize));
@@ -410,7 +429,7 @@ pub unsafe fn open_app() {
     let (_, _, bg, _) = colors();
     let _ = DeleteObject(BG);
     BG = CreateSolidBrush(bg);
-    let (w, h) = (sc(340), sc(334));
+    let (w, h) = (sc(340), sc(368));
     let sw = GetSystemMetrics(SM_CXSCREEN);
     let sh = GetSystemMetrics(SM_CYSCREEN);
     let _ = SetWindowPos(WND, HWND_TOP, (sw - w) / 2, (sh - h) / 2, w, h, SWP_SHOWWINDOW);

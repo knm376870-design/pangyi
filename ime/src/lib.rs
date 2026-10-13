@@ -68,6 +68,10 @@ static UI_CANDS: Mutex<Vec<(String, String)>> = Mutex::new(Vec::new());
 /// 全部候选（翻页用）以及当前页号
 static ALL_CANDS: Mutex<Vec<(String, String, String)>> = Mutex::new(Vec::new());
 static PAGE: AtomicUsize = AtomicUsize::new(0);
+/// 整句翻译：当前句子缓冲（自上个句末标点/回车以来已上屏的中文词序列）。
+/// 只在整句模式（trmode=2）里写；句末收尾后清空。
+/// 存词不存串 —— 翻译按用户上屏的词边界逐词查，不做重切分。
+static SENT: Mutex<Vec<String>> = Mutex::new(Vec::new());
 const S_FALSE_HR: HRESULT = HRESULT(1);
 const CLASS_E_CLASSNOTAVAILABLE_HR: HRESULT = HRESULT(0x80040111u32 as i32);
 
@@ -253,7 +257,17 @@ impl TextService {
     /// 把某个词上屏（换掉当前组合）
     fn commit_word(&self, pic: Option<&ITfContext>, word: &str) {
         dict::note_choice(word); // 自学习：下次把这个词排前面
-        self.commit_text(pic, word);
+        // v4.4.0 逐字翻译：俄语第一释义跟在词后面；整句模式：记进句子缓冲
+        let text = if crate::settings::trmode() == 1 {
+            match dict::ru_of(word) {
+                Some(ru) => format!("{word} {ru}"),
+                None => word.to_string(),
+            }
+        } else {
+            word.to_string()
+        };
+        self.commit_text(pic, &text);
+        sent_push(word);
     }
 
     /// 更新组合内容为当前的拼音串（用于退格）
@@ -273,8 +287,8 @@ impl TextService {
             return;
         }
         unsafe { cand::set_preedit(&key); }
-        unsafe { cand::set_sentence(dict::complete(&key).map(|(w, _)| w)); }
         set_all_cands(dict::lookup(&key));
+        sentence_hint(&key);
         // 候选窗重画：set_items 只改内存，不触发 WM_PAINT。
         // 缺这一句的话，退格后候选窗还停留在旧拼音的候选上（v4.2.0 的 bug：
         // 删一个字母候选不变，删光才一起消失 —— 只有 cand_hide 生效）。
@@ -297,11 +311,12 @@ impl TextService {
         }
         // 先读设置：log() 要靠 settings::debug() 决定要不要写，顺序不能反
         unsafe { settings::load(); }
-        log("Activate v4.3.0");
+        log("Activate v4.4.0");
         log(&format!(
-            "cnpunct={} english={}",
+            "cnpunct={} english={} trmode={}",
             crate::settings::cnpunct(),
-            crate::settings::english()
+            crate::settings::english(),
+            crate::settings::trmode()
         ));
 
         // 后台预热词典索引，避免第一次打字时卡一下（只跑一次）
@@ -321,6 +336,7 @@ impl TextService {
         ALL_CANDS.lock().unwrap().clear();
         PAGE.store(0, Ordering::Relaxed);
         *COMPOSITION.lock().unwrap() = None;
+        SENT.lock().unwrap().clear();
         unsafe { cand_hide(); }
 
         let Some(tm) = ptim else {
@@ -445,6 +461,7 @@ impl TextService {
         ALL_CANDS.lock().unwrap().clear();
         PAGE.store(0, Ordering::Relaxed);
         *COMPOSITION.lock().unwrap() = None;
+        SENT.lock().unwrap().clear();
         unsafe { cand_hide(); }
         Ok(())
     }
@@ -466,6 +483,7 @@ impl ITfKeyEventSink_Impl for TextService {
         } else {
             // 只收候选窗；不要动组合——实测清组合会让上屏丢字
             unsafe { cand_hide(); }
+            SENT.lock().unwrap().clear(); // 换焦点：没说完的句子作废
         }
         Ok(())
     }
@@ -487,6 +505,11 @@ impl ITfKeyEventSink_Impl for TextService {
         // 否则永远到不了 OnKeyDown。
         if wparam.0 == 0xBE && ctrl_only() {
             dlog!("KeySink::OnTestKeyDown Ctrl+. 切中文标点");
+            return Ok(BOOL(1));
+        }
+        // Ctrl+, 循环切换翻译模式（关 -> 逐字 -> 整句 -> 关），和 Ctrl+. 同款思路
+        if wparam.0 == 0xBC && ctrl_only() {
+            dlog!("KeySink::OnTestKeyDown Ctrl+, 切翻译模式");
             return Ok(BOOL(1));
         }
         // 带 Ctrl / Alt / Win 的组合键一律不碰，原样交给应用和系统
@@ -541,6 +564,17 @@ impl ITfKeyEventSink_Impl for TextService {
             dlog!("KeySink::OnKeyDown Ctrl+. 中文标点 -> {}", crate::settings::cnpunct());
             return Ok(BOOL(1));
         }
+        // Ctrl+, 循环切换翻译模式（关 -> 逐字 -> 整句 -> 关）。
+        // 离开整句模式时句子缓冲作废 —— 不然攒着的半句话会带到下一个模式。
+        if wparam.0 == 0xBC && ctrl_only() {
+            let next = (crate::settings::trmode() + 1) % 3;
+            crate::settings::set_trmode(next);
+            if next != 2 {
+                SENT.lock().unwrap().clear();
+            }
+            dlog!("KeySink::OnKeyDown Ctrl+, 翻译模式 -> {next}");
+            return Ok(BOOL(1));
+        }
         // 双保险：带 Ctrl / Alt / Win 的键直接放行，绝不进组合
         if command_modifier_down() {
             return Ok(BOOL(0));
@@ -568,6 +602,7 @@ impl ITfKeyEventSink_Impl for TextService {
                 match w {
                     Some(w) => {
                         dict::note_choice(&w);
+                        sent_push(&w);
                         self.commit_text(pic, &format!("{w}{letter}"));
                     }
                     // 没有候选：组合里只剩拼音，直接换成大写字母上屏
@@ -583,8 +618,8 @@ impl ITfKeyEventSink_Impl for TextService {
             self.buf.borrow_mut().push(ch.to_ascii_lowercase());
             let key = self.buf.borrow().clone();
             unsafe { cand::set_preedit(&key); }
-            unsafe { cand::set_sentence(dict::complete(&key).map(|(w, _)| w)); }
             set_all_cands(dict::lookup(&key));
+            sentence_hint(&key);
             if let Some(ctx) = pic {
                 let text: Vec<u16> = key.encode_utf16().collect();
                 let sink: ITfCompositionSink = match unsafe { self.cast() } { Ok(s) => s, Err(_) => return Ok(BOOL(1)) };
@@ -653,6 +688,16 @@ impl ITfKeyEventSink_Impl for TextService {
             return Ok(BOOL(1));
         }
 
+        // 整句翻译：没拼音时按回车 = 句子收尾，整句俄语跟上，回车自己吞掉
+        // （用户再按一次回车才是发送/换行）。claim() 保证缓冲非空才进得来。
+        if wparam.0 == 0x0D && !has_buf {
+            if let Some(t) = sent_close("", None) {
+                self.commit_text(pic, &t);
+                return Ok(BOOL(1));
+            }
+            return Ok(BOOL(0));
+        }
+
         // 回车 / 空格：上屏当前选中的候选
         if wparam.0 == 0x0D || wparam.0 == 0x20 {
             if !has_buf { return Ok(BOOL(0)); }
@@ -717,10 +762,28 @@ impl ITfKeyEventSink_Impl for TextService {
             match (w, c) {
                 (Some(w), Some(c)) => {
                     dict::note_choice(&w);
-                    self.commit_text(pic, &format!("{w}{c}"));
+                    // 逐字翻译：俄语第一释义夹在词和标点之间
+                    if crate::settings::trmode() == 1 {
+                        let ru = dict::ru_of(&w).map(|r| format!(" {r}")).unwrap_or_default();
+                        self.commit_text(pic, &format!("{w}{ru}{c}"));
+                    } else {
+                        // 整句模式：词进句子缓冲；句末标点触发整句翻译收尾
+                        sent_push(&w);
+                        if let Some(t) = sent_close(&w, Some(c)) {
+                            self.commit_text(pic, &t);
+                        } else {
+                            self.commit_text(pic, &format!("{w}{c}"));
+                        }
+                    }
                 }
                 (Some(w), None) => self.commit_word(pic, &w),
-                (None, Some(c)) => self.commit_text(pic, &c.to_string()),
+                (None, Some(c)) => {
+                    if let Some(t) = sent_close("", Some(c)) {
+                        self.commit_text(pic, &t);
+                    } else {
+                        self.commit_text(pic, &c.to_string());
+                    }
+                }
                 (None, None) => {
                     // 什么都没得写：像 ESC 一样把组合真正结束掉
                     if let Some(ctx) = pic {
@@ -737,11 +800,21 @@ impl ITfKeyEventSink_Impl for TextService {
 
         // 中文标点（智能全角）：无拼音时标点键直接转全角上屏，不进组合。
         // claim() 只在 中文模式 + 开关开 + 无 Shift 时拦标点（- = ` 不拦），
-        // 这里兜底照做一遍：拿不到字符就放行给应用。
+        // 整句模式还会额外拦句末标点（收尾用）—— 这里兜底照做一遍：
+        // 拿不到字符就放行给应用。
         if !has_buf && is_punct_vk(wparam.0 as u32) {
             if let Some(c) = vk_to_char(wparam.0 as u32) {
-                let c = punct_full(c).unwrap_or(c);
-                self.commit_text(pic, &c.to_string());
+                let c = if crate::settings::cnpunct() && !shift_down() {
+                    punct_full(c).unwrap_or(c)
+                } else {
+                    c
+                };
+                // 整句模式：句末标点 = 收尾，整句俄语跟在标点后上屏
+                if let Some(t) = sent_close("", Some(c)) {
+                    self.commit_text(pic, &t);
+                } else {
+                    self.commit_text(pic, &c.to_string());
+                }
                 return Ok(BOOL(1));
             }
             return Ok(BOOL(0));
@@ -872,12 +945,83 @@ fn caps_on() -> bool {
     }
 }
 
+/// 整句模式：把刚上屏的词记进句子缓冲（其他模式空操作）
+fn sent_push(word: &str) {
+    if crate::settings::trmode() == 2 {
+        SENT.lock().unwrap().push(word.to_string());
+    }
+}
+
+fn is_sent_end(c: char) -> bool {
+    matches!(c, '。' | '！' | '？' | '…' | '.' | '!' | '?')
+}
+
+/// 俄语句尾标点：中文全角标点映射成俄语半角（。-> . ？-> ?）
+fn rus_end(c: char) -> char {
+    match c {
+        '。' => '.',
+        '！' => '!',
+        '？' => '?',
+        _ => c,
+    }
+}
+
+/// 整句收尾：缓冲里有没收尾的中文句子时，把它整个译成俄语接在上屏文本后面。
+/// c = 触发收尾的句末标点（回车收尾传 None，俄语不加标点）。
+/// 返回拼接好的完整上屏文本；没开整句模式 / 缓冲空 / 译不出时返回 None。
+fn sent_close(text: &str, c: Option<char>) -> Option<String> {
+    if crate::settings::trmode() != 2 {
+        return None;
+    }
+    if SENT.lock().unwrap().is_empty() {
+        return None;
+    }
+    if let Some(c) = c {
+        if !is_sent_end(c) {
+            return None;
+        }
+    }
+    let ru = dict::translate_words(SENT.lock().unwrap().iter().map(|s| s.as_str()))?;
+    SENT.lock().unwrap().clear();
+    match c {
+        Some(c) => Some(format!("{text}{c} {ru}{}", rus_end(c))),
+        None => Some(format!("{text} {ru}")),
+    }
+}
+
+/// 候选窗顶行 ☁ 提示：默认是拼音补全；整句翻译模式显示「已上屏句子 +
+/// 当前首选候选」的实时整句翻译（谷歌翻译式：每打一个字更新一次）。
+/// 要放在 set_all_cands 之后调 —— 首选候选得先刷新。
+fn sentence_hint(key: &str) {
+    let hint = if crate::settings::trmode() == 2 {
+        let cur = unsafe { cand::current() }
+            .or_else(|| UI_CANDS.lock().unwrap().first().map(|(w, _)| w.clone()))
+            .unwrap_or_default();
+        let mut words = SENT.lock().unwrap().clone();
+        if !cur.is_empty() {
+            words.push(cur);
+        }
+        dict::translate_words(words.iter().map(|s| s.as_str())).map(|ru| format!("译 {ru}"))
+    } else {
+        dict::complete(key).map(|(w, _)| w)
+    };
+    unsafe { cand::set_sentence(hint); }
+}
+
 fn claim(wparam: WPARAM, has_buf: bool, english: bool) -> bool {
     let ch = wparam.0 as u8 as char;
     if ch.is_ascii_alphabetic() {
         return !english;
     }
     if !has_buf {
+        // 整句翻译：缓冲里有没收尾的句子时，句末标点（. / 及 Shift 变体）和
+        // 回车拦下来收尾 —— 这样聊天软件里不敲标点直接按回车也能带上整句俄语
+        if crate::settings::trmode() == 2
+            && !SENT.lock().unwrap().is_empty()
+            && matches!(wparam.0 as u32, 0x0D | 0xBE | 0xBF)
+        {
+            return true;
+        }
         // 中文标点：无拼音时标点键也拦下来转全角（不进组合）。
         // Shift+标点 保持半角放行（方便打代码）；- = ` 没有全角对应，不拦。
         return !english
