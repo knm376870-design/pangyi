@@ -29,7 +29,6 @@ static RU_SEL: AtomicBool = AtomicBool::new(false);
 static PAGE_CUR: AtomicUsize = AtomicUsize::new(0);
 static PAGE_TOT: AtomicUsize = AtomicUsize::new(1);
 static DARK: AtomicBool = AtomicBool::new(true);
-static HORIZONTAL: AtomicBool = AtomicBool::new(false);
 // 句柄和 DPI 是全进程共享的（同一进程里可能有好几个线程在用输入法），
 // 原来用 static mut 属于数据竞争 —— 换成原子量。
 static WND: AtomicIsize = AtomicIsize::new(0);
