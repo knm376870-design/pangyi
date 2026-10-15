@@ -57,15 +57,16 @@ bug / 建议直接开 [Issue](../../issues)，中文即可。欢迎试用并反�
 
 ## 从源码构建
 
-Windows + Rust（[rustup](https://rustup.rs)）：
+Windows + Rust GNU 工具链（[rustup](https://rustup.rs)），并准备 llvm-mingw 的 `bin` 目录。在仓库根目录构建完整安装包：
 
 ```powershell
-cd ime
-cargo build --release                    # 64 位 pangyi_ime.dll（cdylib）
-# 32 位 DLL：需要 tools/llvm-mingw 工具链 + build/x86-stub.o（见 build.rs）
-# 安装包 exe：把两个 DLL 放进 ime/payload/ 后
-cargo build --release --bin setup        # 输出 pangyi-setup.exe
+rustup target add x86_64-pc-windows-gnu i686-pc-windows-gnu
+.\tools\build_release.ps1 -LlvmMingwBin '<llvm-mingw 的 bin 目录>' -BuildDir '<可写的纯英文构建目录>'
 ```
+
+脚本先构建并验证两种架构的新 DLL，再打包安装程序，输出 `dist\旁译-v版本号.exe` 和 SHA256 校验文件。依赖已缓存时可加 `-Offline`。图标与中文版本信息也会校验，失败时不会交付缺资源的安装包。
+
+只构建当前架构的库，可在 `ime` 目录运行 `cargo build --release --lib`。
 
 词库 `ime/src/dict.tsv` 以 `include_str!` 直接编进二进制，没有任何运行时数据文件依赖。
 
