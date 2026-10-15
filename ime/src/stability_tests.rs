@@ -157,3 +157,54 @@ fn updating_composition_calls_com_without_lock() {
     assert!(unlocked.load(Ordering::SeqCst));
     reset();
 }
+
+#[test]
+fn russian_output_keeps_the_selected_gloss() {
+    let _serial = TEST_LOCK.lock().unwrap();
+    reset();
+    UI_CANDS.lock().unwrap().push(("重".into(), "тяжёлый | тя́жкий".into()));
+    unsafe { cand::set_ru_sel(true); }
+    let (word, ru) = selected_choice().unwrap();
+    assert_eq!(TextService::pick_text(&word, &ru), "тяжёлый");
+    reset();
+}
+
+#[test]
+fn blank_candidate_gloss_does_not_borrow_another_reading() {
+    let _serial = TEST_LOCK.lock().unwrap();
+    reset();
+    UI_CANDS.lock().unwrap().push(("重".into(), String::new()));
+    unsafe { cand::set_ru_sel(true); }
+    let (word, ru) = selected_choice().unwrap();
+    assert_eq!(TextService::pick_text(&word, &ru), "重");
+    reset();
+}
+
+#[test]
+fn candidate_text_preserves_first_sense_and_translation_mode() {
+    assert_eq!(candidate_text("重", " повторя́ть | повтори́ть ", true, true), "повторя́ть");
+    assert_eq!(candidate_text("重", " повторя́ть | повтори́ть ", false, true), "重 повторя́ть");
+    assert_eq!(candidate_text("重", "тяжёлый", false, false), "重");
+    assert_eq!(candidate_text("重", "  ", true, true), "重");
+}
+
+#[test]
+fn selected_gloss_survives_candidate_pool_cleanup() {
+    let _serial = TEST_LOCK.lock().unwrap();
+    reset();
+    UI_CANDS.lock().unwrap().extend([
+        ("重".into(), "тяжёлый".into()), ("重".into(), "повторя́ть".into()),
+    ]);
+    unsafe {
+        cand::set_items(vec![
+            cand::Item { word: "重".into(), pinyin: "zhòng".into(), ru: "тяжёлый".into(), fresh: false },
+            cand::Item { word: "重".into(), pinyin: "chóng".into(), ru: "повторя́ть".into(), fresh: false },
+        ]);
+        cand::select(1);
+    }
+    let (word, ru) = selected_choice().unwrap();
+    UI_CANDS.lock().unwrap().clear();
+    assert_eq!(candidate_text(&word, &ru, true, false), "повторя́ть");
+    assert_eq!(candidate_text(&word, &ru, false, true), "重 повторя́ть");
+    reset();
+}

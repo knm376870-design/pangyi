@@ -558,6 +558,24 @@ pub unsafe fn set_ru_sel(v: bool) {
     if alive() { let _ = InvalidateRect(hwnd(), None, TRUE); }
 }
 
+fn horizontal_item_rect(index: usize, widths: &[i32], origin: (i32, i32), row_h: i32, spacing: (i32, i32)) -> Option<RECT> {
+    let width = *widths.get(index)?;
+    if width <= 0 || row_h <= 0 { return None; }
+    let (gap, inset) = spacing;
+    let x = widths[..index].iter().fold(origin.0, |x, width| x.saturating_add(*width).saturating_add(gap));
+    Some(RECT {
+        left: x.saturating_sub(inset), top: origin.1,
+        right: x.saturating_add(width).saturating_add(inset), bottom: origin.1.saturating_add(row_h),
+    })
+}
+
+fn horizontal_hit(point: (i32, i32), widths: &[i32], origin: (i32, i32), row_h: i32, spacing: (i32, i32)) -> Option<usize> {
+    (0..widths.len()).find(|&i| {
+        horizontal_item_rect(i, widths, origin, row_h, spacing).map_or(false, |r|
+            point.0 >= r.left && point.0 < r.right && point.1 >= r.top && point.1 < r.bottom)
+    })
+}
+
 /// 竖排几何（和 WM_PAINT 同一套算法）：首行 y、行高、词列 x、俄语列 x。
 /// 顶行（拼音 / ☁ 提示）占多高就先加多高，这样点击和画的位置对得上。
 unsafe fn v_geom(dc: HDC) -> Option<(i32, i32, i32, i32)> {
@@ -586,21 +604,29 @@ pub unsafe fn hit_test(x: i32, y: i32) -> Option<(usize, bool)> {
     let h = hwnd();
     let dc = GetDC(h);
     if dc.0 == 0 { return None; }
-    let r = v_geom(dc);
-    if dc.0 != 0 { let _ = ReleaseDC(h, dc); }
-    let (y0, row_h, _x_word, x_ru) = r?;
-    let dy = y - y0;
-    if dy < 0 { return None; }
-    let i = (dy / row_h) as usize;
-    if i >= ITEMS.lock().unwrap().len() { return None; }
-    if x >= x_ru {
-        Some((i, true))
-    } else if x >= 0 {
-        // 俄语列左边整块（含序号、词、拼音列）都算中文侧，点空白也能选
-        Some((i, false))
-    } else {
-        None
-    }
+    let result = (|| {
+        let (y0, row_h, _x_word, x_ru) = v_geom(dc)?;
+        if crate::settings::horizontal() {
+            let items = ITEMS.lock().unwrap();
+            let lay = compute_layout(dc, &items);
+            let pad = sc(PAD);
+            return horizontal_hit((x, y), &lay.item_w, (pad + pad / 2, y0), row_h, (sc(GAP), pad / 2))
+                .map(|i| (i, false));
+        }
+        let dy = y - y0;
+        if dy < 0 || row_h <= 0 { return None; }
+        let i = (dy / row_h) as usize;
+        if i >= ITEMS.lock().unwrap().len() { return None; }
+        if x >= x_ru {
+            Some((i, true))
+        } else if x >= 0 {
+            Some((i, false))
+        } else {
+            None
+        }
+    })();
+    let _ = ReleaseDC(h, dc);
+    result
 }
 
 /// 第 row 行中文侧/俄语侧的可点击矩形（客户区坐标），测试台架算点击点用。
@@ -608,13 +634,23 @@ pub unsafe fn hit_rect(row: usize, ru: bool) -> Option<(i32, i32, i32, i32)> {
     let h = hwnd();
     let dc = GetDC(h);
     if dc.0 == 0 { return None; }
-    let r = v_geom(dc);
-    if dc.0 != 0 { let _ = ReleaseDC(h, dc); }
-    let (y0, row_h, x_word, x_ru) = r?;
-    if row >= ITEMS.lock().unwrap().len() { return None; }
-    let top = y0 + row as i32 * row_h;
-    let l = if ru { x_ru } else { x_word };
-    Some((l, top, l + 60, top + row_h))
+    let result = (|| {
+        let (y0, row_h, x_word, x_ru) = v_geom(dc)?;
+        if crate::settings::horizontal() {
+            if ru { return None; } // 横排只显示一排中文候选，没有可选的俄语侧。
+            let items = ITEMS.lock().unwrap();
+            let lay = compute_layout(dc, &items);
+            let pad = sc(PAD);
+            let r = horizontal_item_rect(row, &lay.item_w, (pad + pad / 2, y0), row_h, (sc(GAP), pad / 2))?;
+            return Some((r.left, r.top, r.right, r.bottom));
+        }
+        if row >= ITEMS.lock().unwrap().len() { return None; }
+        let top = y0 + row as i32 * row_h;
+        let l = if ru { x_ru } else { x_word };
+        Some((l, top, l + 60, top + row_h))
+    })();
+    let _ = ReleaseDC(h, dc);
+    result
 }
 
 // ---- 测试台架专用导出（side_e2e 用 GetProcAddress 拿，不挂在正常 API 上）----
@@ -664,6 +700,27 @@ pub unsafe fn at(i: usize) -> Option<String> {
 
 pub unsafe fn count() -> usize { ITEMS.lock().unwrap().len() }
 
+/// 把候选窗放入光标所在显示器的工作区，保留副屏的负坐标，避开任务栏。
+fn fit_popup(anchor: (i32, i32), size: (i32, i32), work: RECT, margin: i32, above_gap: i32) -> RECT {
+    let span_w = work.right.saturating_sub(work.left).max(1);
+    let span_h = work.bottom.saturating_sub(work.top).max(1);
+    let mx = margin.max(0).min((span_w - 1) / 2);
+    let my = margin.max(0).min((span_h - 1) / 2);
+    let left = work.left.saturating_add(mx);
+    let top = work.top.saturating_add(my);
+    let right = work.right.saturating_sub(mx).max(left.saturating_add(1));
+    let bottom = work.bottom.saturating_sub(my).max(top.saturating_add(1));
+    let width = size.0.max(1).min(right.saturating_sub(left).max(1));
+    let height = size.1.max(1).min(bottom.saturating_sub(top).max(1));
+    let x = anchor.0.clamp(left, right.saturating_sub(width).max(left));
+    let y = if anchor.1.saturating_add(height) > bottom {
+        anchor.1.saturating_sub(height).saturating_sub(above_gap.max(0))
+    } else {
+        anchor.1
+    }.clamp(top, bottom.saturating_sub(height).max(top));
+    RECT { left: x, top: y, right: x.saturating_add(width), bottom: y.saturating_add(height) }
+}
+
 pub unsafe fn show_at(x: i32, y: i32) {
     // 每次显示前都确认窗口还在：宿主进程换了线程、原来的窗口没了就重建一个，
     // 而不是直接 return（那会让候选窗永久消失）
@@ -681,14 +738,18 @@ pub unsafe fn show_at(x: i32, y: i32) {
         ch = lay.height;
         let _ = ReleaseDC(h, dc);
     }
-    // 夹进屏幕：右边超出就左移，下方放不下就翻到光标上方
-    let sw = GetSystemMetrics(SM_CXSCREEN);
-    let sh = GetSystemMetrics(SM_CYSCREEN);
-    let mut px = x;
-    let mut py = y;
-    if px + cw > sw - 4 { px = (sw - cw - 4).max(0); }
-    if py + ch > sh - 4 { py = (y - ch - sc(30)).max(0); }
-    if py < 0 { py = 0; }
+    // SM_CXSCREEN/SM_CYSCREEN 只有主屏尺寸，不能用来夹副屏坐标。
+    let monitor = MonitorFromPoint(POINT { x, y }, MONITOR_DEFAULTTONEAREST);
+    let mut info = MONITORINFO { cbSize: std::mem::size_of::<MONITORINFO>() as u32, ..Default::default() };
+    let work = if GetMonitorInfoW(monitor, &mut info).as_bool() {
+        info.rcWork
+    } else {
+        RECT { left: 0, top: 0, right: GetSystemMetrics(SM_CXSCREEN).max(1), bottom: GetSystemMetrics(SM_CYSCREEN).max(1) }
+    };
+    let bounds = fit_popup((x, y), (cw, ch), work, sc(4), sc(30));
+    let (px, py) = (bounds.left, bounds.top);
+    cw = bounds.right - bounds.left;
+    ch = bounds.bottom - bounds.top;
     let rgn = CreateRoundRectRgn(0, 0, cw + 1, ch + 1, sc(RADIUS) * 2, sc(RADIUS) * 2);
     let _ = SetWindowRgn(h, rgn, TRUE);
     // 只在“从隐藏变显示”的那一次抬高到置顶带的最前面（保证能盖住置顶窗口），
@@ -703,3 +764,85 @@ pub unsafe fn show_at(x: i32, y: i32) {
 }
 
 pub unsafe fn hide() { if alive() { let _ = ShowWindow(hwnd(), SW_HIDE); } }
+
+#[cfg(test)]
+mod placement_tests {
+    use super::*;
+
+    fn bounds(anchor: (i32, i32), size: (i32, i32), work: RECT) -> (i32, i32, i32, i32) {
+        let r = fit_popup(anchor, size, work, 4, 30);
+        (r.left, r.top, r.right, r.bottom)
+    }
+
+    #[test]
+    fn right_monitor_keeps_its_screen_coordinates() {
+        let work = RECT { left: 1920, top: 0, right: 3840, bottom: 1040 };
+        assert_eq!(bounds((2500, 100), (400, 200), work), (2500, 100, 2900, 300));
+        assert_eq!(bounds((3800, 100), (400, 200), work), (3436, 100, 3836, 300));
+    }
+
+    #[test]
+    fn left_monitor_preserves_negative_coordinates() {
+        let work = RECT { left: -1920, top: 0, right: 0, bottom: 1040 };
+        assert_eq!(bounds((-1700, 100), (400, 200), work), (-1700, 100, -1300, 300));
+        assert_eq!(bounds((-100, 100), (400, 200), work), (-404, 100, -4, 300));
+    }
+
+    #[test]
+    fn monitor_above_primary_preserves_negative_y() {
+        let work = RECT { left: 0, top: -1200, right: 1920, bottom: -40 };
+        assert_eq!(bounds((200, -1100), (400, 200), work), (200, -1100, 600, -900));
+    }
+
+    #[test]
+    fn bottom_taskbar_moves_popup_above_caret() {
+        let work = RECT { left: 0, top: 0, right: 1920, bottom: 1040 };
+        assert_eq!(bounds((200, 1000), (400, 250), work), (200, 720, 600, 970));
+    }
+
+    #[test]
+    fn top_and_left_taskbars_define_the_usable_origin() {
+        let work = RECT { left: 80, top: 40, right: 1920, bottom: 1080 };
+        assert_eq!(bounds((5, 5), (400, 200), work), (84, 44, 484, 244));
+    }
+
+    #[test]
+    fn oversized_popup_is_bounded_by_small_work_area() {
+        let work = RECT { left: -800, top: -600, right: 0, bottom: 0 };
+        assert_eq!(bounds((-300, -100), (2000, 1500), work), (-796, -596, -4, -4));
+    }
+
+    #[test]
+    fn tiny_work_area_and_empty_size_do_not_panic() {
+        let work = RECT { left: -10, top: -10, right: -9, bottom: -9 };
+        assert_eq!(bounds((0, 0), (0, 0), work), (-10, -10, -9, -9));
+    }
+
+    #[test]
+    fn horizontal_clicks_select_the_candidate_under_the_pointer() {
+        let widths = [80, 120, 60];
+        for (point, expected) in [((12, 35), 0), ((150, 35), 1), ((260, 35), 2)] {
+            assert_eq!(horizontal_hit(point, &widths, (12, 30), 24, (8, 4)), Some(expected));
+        }
+    }
+
+    #[test]
+    fn horizontal_header_annotation_and_outer_padding_are_not_candidates() {
+        for point in [(12, 29), (12, 54), (7, 35), (292, 35), (-1, 35)] {
+            assert_eq!(horizontal_hit(point, &[80, 120, 60], (12, 30), 24, (8, 4)), None);
+        }
+    }
+
+    #[test]
+    fn horizontal_shared_edge_belongs_to_the_next_candidate() {
+        assert_eq!(horizontal_hit((95, 35), &[80, 120], (12, 30), 24, (8, 4)), Some(0));
+        assert_eq!(horizontal_hit((96, 35), &[80, 120], (12, 30), 24, (8, 4)), Some(1));
+    }
+
+    #[test]
+    fn horizontal_hit_rect_matches_the_painted_candidate_extent() {
+        let r = horizontal_item_rect(1, &[80, 120, 60], (12, 30), 24, (8, 4)).unwrap();
+        assert_eq!((r.left, r.top, r.right, r.bottom), (96, 30, 224, 54));
+        assert!(horizontal_item_rect(3, &[80, 120, 60], (12, 30), 24, (8, 4)).is_none());
+    }
+}

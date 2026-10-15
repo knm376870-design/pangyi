@@ -819,7 +819,7 @@ fn zh_index() -> &'static ZhIndex {
 }
 
 /// 俄语释义只取第一项（词典里用 | 分隔多个译法，翻译输出只留第一个）。
-fn ru_first(ru: &str) -> &str {
+pub(crate) fn ru_first(ru: &str) -> &str {
     ru.split('|').next().unwrap_or(ru).trim()
 }
 

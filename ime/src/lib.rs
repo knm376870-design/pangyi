@@ -265,6 +265,26 @@ fn move_sel(delta: isize) {
     unsafe { cand::select(next); }
 }
 
+/// 从当前页取出完整条目，提交前保存词和释义，不能再按汉字反查另一个读音。
+fn selected_choice() -> Option<(String, String)> {
+    let index = unsafe { cand::current_index() };
+    let page = UI_CANDS.lock().unwrap();
+    page.get(index).or_else(|| page.first()).cloned()
+}
+
+fn candidate_text(word: &str, ru: &str, russian_side: bool, translate_word: bool) -> String {
+    let first = dict::ru_first(ru);
+    if first.is_empty() {
+        word.to_string()
+    } else if russian_side {
+        first.to_string()
+    } else if translate_word {
+        format!("{word} {first}")
+    } else {
+        word.to_string()
+    }
+}
+
 impl TextService {
     /// 把文本写进文档（换掉当前组合），不记录自学习。
     /// 用于「候选 + 标点 / 候选 + 大写字母」这类拼接上屏 —— 不能把拼接串
@@ -283,30 +303,19 @@ impl TextService {
 
     /// ←/→ 选中「俄语侧」时，上屏内容换成该词的俄语第一释义；
     /// 没译文的词照旧上中文（它的俄语列本来就是空的）。
-    fn pick_text(word: &str) -> String {
-        if unsafe { cand::ru_sel() } && !crate::settings::horizontal() {
-            dict::ru_of(word).map(|r| r.to_string()).unwrap_or_else(|| word.to_string())
-        } else {
-            word.to_string()
-        }
+    fn pick_text(word: &str, ru: &str) -> String {
+        candidate_text(word, ru,
+            cand::ru_sel() && !crate::settings::horizontal(),
+            crate::settings::trmode() == 1)
     }
 
     /// 把某个词上屏（换掉当前组合）
-    fn commit_word(&self, pic: Option<&ITfContext>, word: &str) {
+    fn commit_word(&self, pic: Option<&ITfContext>, word: &str, ru: &str) {
         dict::note_choice(word); // 自学习：下次把这个词排前面
         // v4.5.0 选中俄语侧：只上屏俄语，中文不输入（逐字翻译不再重复拼）
         // v4.4.0 逐字翻译：俄语第一释义跟在词后面；整句模式：记进句子缓冲
         dlog!("commit_word word={word} ru_sel={} horizontal={}", unsafe { cand::ru_sel() }, crate::settings::horizontal());
-        let text = if unsafe { cand::ru_sel() } && !crate::settings::horizontal() {
-            Self::pick_text(word)
-        } else if crate::settings::trmode() == 1 {
-            match dict::ru_of(word) {
-                Some(ru) => format!("{word} {ru}"),
-                None => word.to_string(),
-            }
-        } else {
-            word.to_string()
-        };
+        let text = Self::pick_text(word, ru);
         self.commit_text(pic, &text);
         sent_push(word);
     }
@@ -663,18 +672,17 @@ impl ITfKeyEventSink_Impl for TextService {
                 return Ok(BOOL(0));
             }
             if !self.buf.borrow().is_empty() {
-                let w = unsafe { cand::current() }
-                    .or_else(|| UI_CANDS.lock().unwrap().first().map(|(w, _)| w.clone()));
+                let w = selected_choice();
                 self.buf.borrow_mut().clear();
                 UI_CANDS.lock().unwrap().clear();
                 unsafe { cand_hide(); }
                 let letter = letter.unwrap();
                 match w {
-                    Some(w) => {
+                    Some((w, ru)) => {
                         dict::note_choice(&w);
                         sent_push(&w);
                         // v4.5.0：选中俄语侧时大写字母也跟在俄语后面
-                        self.commit_text(pic, &format!("{}{letter}", Self::pick_text(&w)));
+                        self.commit_text(pic, &format!("{}{letter}", Self::pick_text(&w, &ru)));
                     }
                     // 没有候选：组合里只剩拼音，直接换成大写字母上屏
                     None => self.commit_text(pic, &letter.to_string()),
@@ -720,13 +728,13 @@ impl ITfKeyEventSink_Impl for TextService {
             if shift_down() { return Ok(BOOL(0)); }
             if !has_buf { return Ok(BOOL(0)); }
             let idx = (wparam.0 as usize) - 0x31;
-            let word = UI_CANDS.lock().unwrap().get(idx).map(|(w, _)| w.clone());
+            let word = UI_CANDS.lock().unwrap().get(idx).cloned();
             // 理论上 claim() 只会放行当前页里真有的候选，这里再兜一次底
-            let Some(w) = word else { return Ok(BOOL(0)); };
+            let Some((w, ru)) = word else { return Ok(BOOL(0)); };
             self.buf.borrow_mut().clear();
             UI_CANDS.lock().unwrap().clear();
             unsafe { cand_hide(); }
-            self.commit_word(pic, &w);
+            self.commit_word(pic, &w, &ru);
             return Ok(BOOL(1));
         }
 
@@ -771,13 +779,12 @@ impl ITfKeyEventSink_Impl for TextService {
         // 回车 / 空格：上屏当前选中的候选
         if wparam.0 == 0x0D || wparam.0 == 0x20 {
             if !has_buf { return Ok(BOOL(0)); }
-            let w = unsafe { cand::current() }
-                .or_else(|| UI_CANDS.lock().unwrap().first().map(|(w, _)| w.clone()));
+            let w = selected_choice();
             self.buf.borrow_mut().clear();
             UI_CANDS.lock().unwrap().clear();
             unsafe { cand_hide(); }
             dlog!("上屏 word={:?}", w);
-            if let Some(w) = w { self.commit_word(pic, &w); }
+            if let Some((w, ru)) = w { self.commit_word(pic, &w, &ru); }
             return Ok(BOOL(1));
         }
 
@@ -816,8 +823,7 @@ impl ITfKeyEventSink_Impl for TextService {
         // 理由同大写分支：claim 过的键 TSF 不会再交给应用，原来「return
         // BOOL(0) 放行」实测到不了应用（候选上屏了、标点被吞）。
         if has_buf && is_punct_vk(wparam.0 as u32) {
-            let w = unsafe { cand::current() }
-                .or_else(|| UI_CANDS.lock().unwrap().first().map(|(w, _)| w.clone()));
+            let w = selected_choice();
             // v4.3.0：中文标点开且没按 Shift 时，标点转全角；Shift+标点 保持半角
             let c = vk_to_char(wparam.0 as u32).map(|c| {
                 if crate::settings::cnpunct() && !crate::settings::english() && !shift_down() {
@@ -830,16 +836,15 @@ impl ITfKeyEventSink_Impl for TextService {
             UI_CANDS.lock().unwrap().clear();
             unsafe { cand_hide(); }
             match (w, c) {
-                (Some(w), Some(c)) => {
+                (Some((w, ru)), Some(c)) => {
                     dict::note_choice(&w);
                     // v4.5.0：选中俄语侧时只上屏俄语+标点，中文词照旧进句子缓冲
                     if unsafe { cand::ru_sel() } && !crate::settings::horizontal() {
-                        self.commit_text(pic, &format!("{}{c}", Self::pick_text(&w)));
+                        self.commit_text(pic, &format!("{}{c}", Self::pick_text(&w, &ru)));
                         sent_push(&w);
                     // 逐字翻译：俄语第一释义夹在词和标点之间
                     } else if crate::settings::trmode() == 1 {
-                        let ru = dict::ru_of(&w).map(|r| format!(" {r}")).unwrap_or_default();
-                        self.commit_text(pic, &format!("{w}{ru}{c}"));
+                        self.commit_text(pic, &format!("{}{c}", Self::pick_text(&w, &ru)));
                     } else {
                         // 整句模式：词进句子缓冲；句末标点触发整句翻译收尾
                         sent_push(&w);
@@ -850,7 +855,7 @@ impl ITfKeyEventSink_Impl for TextService {
                         }
                     }
                 }
-                (Some(w), None) => self.commit_word(pic, &w),
+                (Some((w, ru)), None) => self.commit_word(pic, &w, &ru),
                 (None, Some(c)) => {
                     if let Some(t) = sent_close("", Some(c)) {
                         self.commit_text(pic, &t);
