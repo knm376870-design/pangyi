@@ -69,6 +69,10 @@ cargo build --release --bin setup        # 输出 pangyi-setup.exe
 
 词库 `ime/src/dict.tsv` 以 `include_str!` 直接编进二进制，没有任何运行时数据文件依赖。
 
+### 输入稳定性回归
+
+在 `ime` 目录运行 `cargo test --lib`，检查功能键、小键盘放行、宿主终止拼音时的状态清理，以及组合编辑的同步回调。测试无需安装或注册输入法，详见 [回归说明](docs/stability-regressions.md)。
+
 ## 许可
 
 - 代码：MIT（见 [LICENSE](LICENSE)）

@@ -9,6 +9,9 @@ pub mod cand;
 pub mod dict;
 pub mod settings;
 
+#[cfg(test)]
+mod stability_tests;
+
 use std::cell::{Cell, RefCell};
 use std::os::raw::c_void;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
@@ -506,8 +509,37 @@ impl TextService {
 }
 
 impl ITfCompositionSink_Impl for TextService {
-    fn OnCompositionTerminated(&self, _ec: u32, _c: Option<&ITfComposition>) -> Result<()> {
-        *COMPOSITION.lock().unwrap() = None;
+    fn OnCompositionTerminated(&self, _ec: u32, c: Option<&ITfComposition>) -> Result<()> {
+        // 宿主取消组合后，拼音缓冲与候选必须一起失效。主动上屏/取消时组合已被
+        // take()，回调不应再清句子缓冲；旧组合的延迟通知也不能取消新组合。
+        // 接口相等比较会 QueryInterface，必须在组合锁之外做。
+        let current = COMPOSITION.lock().unwrap().clone();
+        let Some(current) = current else { return Ok(()); };
+        if c != Some(&current) { return Ok(()); }
+        let ended = {
+            let mut slot = COMPOSITION.lock().unwrap();
+            // 比较 COM 身份期间若发生重入，也不能取走后来替换的新组合。
+            if slot.as_ref().map(windows::core::Interface::as_raw)
+                != Some(windows::core::Interface::as_raw(&current))
+            {
+                return Ok(());
+            }
+            slot.take()
+        };
+        drop(ended);
+        self.buf.borrow_mut().clear();
+        UI_CANDS.lock().unwrap().clear();
+        ALL_CANDS.lock().unwrap().clear();
+        PAGE.store(0, Ordering::Relaxed);
+        *PENDING_CAND.lock().unwrap() = None;
+        SENT.lock().unwrap().clear();
+        unsafe {
+            cand::set_preedit("");
+            cand::set_sentence(None);
+            cand::set_items(Vec::new());
+            cand::set_page(0, 1);
+            cand_hide();
+        }
         Ok(())
     }
 }
@@ -555,15 +587,15 @@ impl ITfKeyEventSink_Impl for TextService {
             dlog!("KeySink::OnTestKeyDown wparam={} 有修饰键，放行", wparam.0);
             return Ok(BOOL(0));
         }
-        let ch0 = wparam.0 as u8 as char;
-        if ch0.is_ascii_alphabetic() && crate::settings::english() {
+        let letter = letter_key(wparam);
+        if letter.is_some() && crate::settings::english() {
             return Ok(BOOL(0));
         }
         // Shift / Caps + 字母：大写英文直通（微软一致 —— 用户原话「不能输入
         // 大写英文字母」）。没有拼音时直接放行，应用按键盘状态输出大写字母；
         // 有拼音时先 claim，OnKeyDown 里提交首选候选再放行（微软：拼音中间
         // 按 Shift+字母 = 首选上屏 + 大写字母）。
-        if ch0.is_ascii_alphabetic() && (shift_down() || caps_on()) {
+        if letter.is_some() && (shift_down() || caps_on()) {
             dlog!("KeySink::OnTestKeyDown wparam={} shift={} caps={} 大写分支", wparam.0, shift_down(), caps_on());
             let has_buf = !self.buf.borrow().is_empty();
             return Ok(BOOL(has_buf as i32));
@@ -617,15 +649,15 @@ impl ITfKeyEventSink_Impl for TextService {
         if command_modifier_down() {
             return Ok(BOOL(0));
         }
-        let ch = wparam.0 as u8 as char;
-        dlog!("KeySink::OnKeyDown wparam={} ch={ch:?}", wparam.0);
+        let letter = letter_key(wparam);
+        dlog!("KeySink::OnKeyDown wparam={} letter={letter:?}", wparam.0);
 
         // Shift/Caps 大写字母：首选候选上屏 + 大写字母自己写进文档，然后吃掉
         // 按键（BOOL(1)）。不能走「提交后 return BOOL(0) 让应用输出」——实测
         // （fix_e2e 探针）TSF 下 claim 过的键 OnKeyDown 返回 FALSE 也到不了
         // 应用，标点分支原来就吃这个亏。没有拼音时 OnTestKeyDown 不 claim，
         // 键直接放行由应用输出大写，走不到这里。
-        if ch.is_ascii_alphabetic() && (shift_down() || caps_on()) {
+        if letter.is_some() && (shift_down() || caps_on()) {
             dlog!("KeySink::OnKeyDown wparam={} shift={} caps={} buf={:?} 大写分支", wparam.0, shift_down(), caps_on(), self.buf.borrow());
             if crate::settings::english() {
                 return Ok(BOOL(0));
@@ -636,7 +668,7 @@ impl ITfKeyEventSink_Impl for TextService {
                 self.buf.borrow_mut().clear();
                 UI_CANDS.lock().unwrap().clear();
                 unsafe { cand_hide(); }
-                let letter = ch.to_ascii_uppercase();
+                let letter = letter.unwrap();
                 match w {
                     Some(w) => {
                         dict::note_choice(&w);
@@ -652,7 +684,7 @@ impl ITfKeyEventSink_Impl for TextService {
         }
 
         // 字母：进组合
-        if ch.is_ascii_alphabetic() {
+        if let Some(ch) = letter {
             if crate::settings::english() { return Ok(BOOL(0)); }
             self.buf.borrow_mut().push(ch.to_ascii_lowercase());
             let key = self.buf.borrow().clone();
@@ -1050,9 +1082,18 @@ fn sentence_hint(key: &str) {
     unsafe { cand::set_sentence(hint); }
 }
 
+/// Windows 字母键只在 VK_A..VK_Z（0x41..0x5A）。不能把虚拟键码当 ASCII：
+/// 小键盘 1（0x61）和 F5（0x74）碰巧对应小写 a/t，先截成 u8 还会误认扩展键码。
+fn letter_key(wparam: WPARAM) -> Option<char> {
+    if (0x41..=0x5A).contains(&wparam.0) {
+        Some(wparam.0 as u8 as char)
+    } else {
+        None
+    }
+}
+
 fn claim(wparam: WPARAM, has_buf: bool, english: bool) -> bool {
-    let ch = wparam.0 as u8 as char;
-    if ch.is_ascii_alphabetic() {
+    if letter_key(wparam).is_some() {
         return !english;
     }
     if !has_buf {
@@ -1240,10 +1281,11 @@ impl ITfEditSession_Impl for CompSession {
             self.ctx.GetSelection(ec, 0, &mut sel, &mut n)?;
             if n == 0 { return Ok(()); }
 
-            let have = COMPOSITION.lock().unwrap().is_some();
-            let range = if have {
-                let g = COMPOSITION.lock().unwrap();
-                match g.as_ref().unwrap().GetRange() {
+            // COM 调用可能同步回到 OnCompositionTerminated。只在锁内拷贝引用，
+            // GetRange/SetText/EndComposition 都在锁外执行，避免输入线程自锁。
+            let current = COMPOSITION.lock().unwrap().clone();
+            let range = if let Some(comp) = &current {
+                match comp.GetRange() {
                     Ok(r) => r,
                     Err(_) => return Ok(()),
                 }
@@ -1251,19 +1293,17 @@ impl ITfEditSession_Impl for CompSession {
                 match (&*sel[0].range).as_ref() { Some(r) => r.clone(), None => return Ok(()) }
             };
 
-            if !have {
+            if current.is_none() {
                 if let Ok(cc) = self.ctx.cast::<ITfContextComposition>() {
                     if let Ok(comp) = cc.StartComposition(ec, &range, &self.sink) {
                         *COMPOSITION.lock().unwrap() = Some(comp);
                     }
                 }
             }
-            {
-                let g = COMPOSITION.lock().unwrap();
-                if let Some(comp) = g.as_ref() {
-                    if let Ok(r) = comp.GetRange() {
-                        let _ = r.SetText(ec, 0, &self.text);
-                    }
+            let current = COMPOSITION.lock().unwrap().clone();
+            if let Some(comp) = current {
+                if let Ok(r) = comp.GetRange() {
+                    let _ = r.SetText(ec, 0, &self.text);
                 }
             }
 
@@ -1272,7 +1312,8 @@ impl ITfEditSession_Impl for CompSession {
             if let Ok(view) = self.ctx.GetActiveView() {
                 let mut rc = RECT::default();
                 let mut clipped = BOOL(0);
-                let r2 = COMPOSITION.lock().unwrap().as_ref().and_then(|c| c.GetRange().ok()).unwrap_or(range);
+                let current = COMPOSITION.lock().unwrap().clone();
+                let r2 = current.as_ref().and_then(|c| c.GetRange().ok()).unwrap_or(range);
                 if view.GetTextExt(ec, &r2, &mut rc, &mut clipped).is_ok() {
                     dlog!("候选窗定位: 文本范围 {} ,{}", rc.left, rc.bottom);
                     *PENDING_CAND.lock().unwrap() = Some((rc.left, rc.bottom + 6));
@@ -1313,7 +1354,8 @@ impl ITfEditSession_Impl for DoneSession {
     fn DoEditSession(&self, ec: u32) -> Result<()> {
         unsafe {
             // 换字 + 结束组合放在同一次会话里（拆成两次会让某些宿主把文字丢掉）
-            if let Some(comp) = COMPOSITION.lock().unwrap().take() {
+            let current = COMPOSITION.lock().unwrap().take();
+            if let Some(comp) = current {
                 let mut wrote = false;
                 if let Ok(r) = comp.GetRange() {
                     wrote = r.SetText(ec, 0, &self.text).is_ok();
@@ -1347,8 +1389,8 @@ struct UpdateSession {
 impl ITfEditSession_Impl for UpdateSession {
     fn DoEditSession(&self, ec: u32) -> Result<()> {
         unsafe {
-            let g = COMPOSITION.lock().unwrap();
-            if let Some(comp) = g.as_ref() {
+            let current = COMPOSITION.lock().unwrap().clone();
+            if let Some(comp) = current {
                 if let Ok(r) = comp.GetRange() {
                     let _ = r.SetText(ec, 0, &self.text);
                 }
@@ -1364,9 +1406,9 @@ struct EndSession;
 impl ITfEditSession_Impl for EndSession {
     fn DoEditSession(&self, ec: u32) -> Result<()> {
         unsafe {
-            let mut g = COMPOSITION.lock().unwrap();
-            dlog!("EndSession: 有组合={}", g.is_some());
-            if let Some(comp) = g.take() {
+            let current = COMPOSITION.lock().unwrap().take();
+            dlog!("EndSession: 有组合={}", current.is_some());
+            if let Some(comp) = current {
                 // 先清空组合文字再结束：不结束的话文字会留在文档里被宿主当正文提交
                 if let Ok(r) = comp.GetRange() {
                     let empty: Vec<u16> = Vec::new();
