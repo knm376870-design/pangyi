@@ -202,7 +202,7 @@ fn refresh_page() {
         let slice = &all[start..end];
         let items: Vec<cand::Item> = slice
             .iter()
-            .map(|(w, p, r)| cand::Item { word: w.clone(), pinyin: p.clone(), ru: r.clone(), fresh: false })
+            .map(|(w, _p, r)| cand::Item { word: w.clone(), ru: r.clone(), fresh: false })
             .collect();
         let ui: Vec<(String, String)> = slice.iter().map(|(w, _p, r)| (w.clone(), r.clone())).collect();
         (items, ui, page, pages)

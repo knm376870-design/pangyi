@@ -1,6 +1,6 @@
 //! 候选窗 —— 视觉与排版照青简（apps/windows/server/src/ui/candidates）：
-//! 同一套配色/字体/间距/圆角；竖排为「序号 中文 拼音 俄语」四列对齐，
-//! 横排为「序号 中文」一行排开、当前项的拼音与俄语另起一行。
+//! 同一套配色/字体/间距/圆角；竖排为「序号 中文 俄语」三列对齐，
+//! 横排为「序号 中文」一行排开、当前项的俄语释义另起一行。
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicIsize, AtomicUsize, Ordering};
 use windows::core::{PCWSTR, w};
@@ -13,7 +13,6 @@ use windows::Win32::UI::WindowsAndMessaging::*;
 
 pub struct Item {
     pub word: String,
-    pub pinyin: String,
     pub ru: String,
     pub fresh: bool,
 }
@@ -196,7 +195,6 @@ fn measure(dc: HDC, f: HFONT, s: &str) -> (i32, i32) {
 struct Layout {
     index_w: i32,
     word_w: i32,
-    pinyin_w: i32,
     ru_w: i32,
     item_w: Vec<i32>,
     row_h: i32,
@@ -217,7 +215,6 @@ unsafe fn compute_layout(dc: HDC, items: &[Item]) -> Layout {
 
     let mut index_w = 0;
     let mut word_w = 0;
-    let mut pinyin_w = 0;
     let mut ru_w = 0;
     let mut row_h = 0;
     let mut line_h = 0;
@@ -226,11 +223,9 @@ unsafe fn compute_layout(dc: HDC, items: &[Item]) -> Layout {
         let idx = format!("{}.", i + 1);
         let a = measure(dc, f_idx, &idx).0;
         let (bw, bh) = measure(dc, f_text, &it.word);
-        let c = measure(dc, f_anno, &it.pinyin).0;
         let d = measure(dc, f_anno, &gloss_of(it)).0;
         if a > index_w { index_w = a; }
         if bw > word_w { word_w = bw; }
-        if c > pinyin_w { pinyin_w = c; }
         if d > ru_w { ru_w = d; }
         let rh = bh + sc(ROW_PAD) * 2;
         if rh > row_h { row_h = rh; }
@@ -241,14 +236,10 @@ unsafe fn compute_layout(dc: HDC, items: &[Item]) -> Layout {
         row_h = sc(TEXT_PX) + sc(ROW_PAD) * 2;
     }
 
-    // 高亮项的注释行（横排时另起一行）
-    let mut anno_w = 0;
-    let mut anno_h = 0;
-    if let Some(it) = items.get(SEL.load(Ordering::Relaxed)) {
-        let s = format!("{}   {}", it.pinyin, gloss_of(it));
-        anno_w = measure(dc, f_anno, &s).0;
-        anno_h = measure(dc, f_anno, "x").1 + sc(ROW_PAD);
-    }
+    // 按整页释义预留注释区域，切换选中项时不裁字、不改变窗口大小。
+    // 整页都没有释义时，不保留空注释行。
+    let anno_w = ru_w;
+    let anno_h = if anno_w > 0 { measure(dc, f_anno, "x").1 + sc(ROW_PAD) } else { 0 };
 
     let pre = PREEDIT.lock().unwrap().clone();
     let sent = SENTENCE.lock().unwrap().clone();
@@ -281,14 +272,14 @@ unsafe fn compute_layout(dc: HDC, items: &[Item]) -> Layout {
         let h = pad * 2 + pre_h + row_h + if anno_h > 0 { anno_h } else { 0 } + footer_h;
         (w.max(pad * 2 + anno_w).max(pad * 2 + top_w).max(pad * 2 + footer_w).max(sc(120)), h)
     } else {
-        let w = (pad * 2 + index_w + gap + word_w + gap + pinyin_w + gap + ru_w)
+        let w = (pad * 2 + index_w + gap + word_w + gap + ru_w)
             .max(pad * 2 + top_w)
             .max(pad * 2 + footer_w);
         let h = pad * 2 + pre_h + (nth as i32) * row_h + footer_h;
         (w, h)
     };
 
-    Layout { index_w, word_w, pinyin_w, ru_w, item_w, row_h, line_h, anno_w, anno_h, width, height }
+    Layout { index_w, word_w, ru_w, item_w, row_h, line_h, anno_w, anno_h, width, height }
 }
 
 pub unsafe fn detect_theme() {
@@ -403,7 +394,7 @@ unsafe extern "system" fn proc_cand(h: HWND, msg: u32, w: WPARAM, l: LPARAM) -> 
                 }
                 if lay.anno_h > 0 {
                     if let Some(it) = items.get(sel) {
-                        let s = format!("{}   {}", it.pinyin, gloss_of(it));
+                        let s = gloss_of(it);
                         SelectObject(dc, f_anno);
                         SetTextColor(dc, if it.fresh { p.fresh } else { p.gloss });
                         let g: Vec<u16> = s.encode_utf16().collect();
@@ -413,8 +404,7 @@ unsafe extern "system" fn proc_cand(h: HWND, msg: u32, w: WPARAM, l: LPARAM) -> 
             } else {
                 let x_index = pad;
                 let x_word = x_index + lay.index_w + gap;
-                let x_pinyin = x_word + lay.word_w + gap;
-                let x_ru = x_pinyin + lay.pinyin_w + gap;
+                let x_ru = x_word + lay.word_w + gap;
                 for (i, it) in items.iter().take(crate::settings::max_cands()).enumerate() {
                     let ry = y + (i as i32) * lay.row_h;
                     if i == sel {
@@ -438,10 +428,6 @@ unsafe extern "system" fn proc_cand(h: HWND, msg: u32, w: WPARAM, l: LPARAM) -> 
                     TextOutW(dc, x_word, ty, &word);
 
                     SelectObject(dc, f_anno);
-                    SetTextColor(dc, p.index);
-                    let py: Vec<u16> = it.pinyin.encode_utf16().collect();
-                    TextOutW(dc, x_pinyin, ty + small_anno, &py);
-
                     SetTextColor(dc, if it.fresh { p.fresh } else { p.gloss });
                     let gloss: Vec<u16> = gloss_of(it).encode_utf16().collect();
                     TextOutW(dc, x_ru, ty + small_anno, &gloss);
@@ -594,7 +580,7 @@ unsafe fn v_geom(dc: HDC) -> Option<(i32, i32, i32, i32)> {
         y += ph + sc(ROW_PAD) * 2;
     }
     let x_word = pad + lay.index_w + gap;
-    let x_ru = x_word + lay.word_w + gap + lay.pinyin_w + gap;
+    let x_ru = x_word + lay.word_w + gap;
     Some((y, lay.row_h, x_word, x_ru))
 }
 
@@ -647,7 +633,8 @@ pub unsafe fn hit_rect(row: usize, ru: bool) -> Option<(i32, i32, i32, i32)> {
         if row >= ITEMS.lock().unwrap().len() { return None; }
         let top = y0 + row as i32 * row_h;
         let l = if ru { x_ru } else { x_word };
-        Some((l, top, l + 60, top + row_h))
+        let r = if ru { l + 60 } else { x_ru };
+        Some((l, top, r, top + row_h))
     })();
     let _ = ReleaseDC(h, dc);
     result

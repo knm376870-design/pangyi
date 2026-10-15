@@ -101,7 +101,7 @@ fn host_termination_clears_preedit_and_candidates() {
     unsafe {
         cand::set_preedit("ni");
         cand::set_items(vec![cand::Item {
-            word: "你".into(), pinyin: "nǐ".into(), ru: "ты".into(), fresh: false,
+            word: "你".into(), ru: "ты".into(), fresh: false,
         }]);
     }
     service.OnCompositionTerminated(0, Some(&comp)).unwrap();
@@ -197,8 +197,8 @@ fn selected_gloss_survives_candidate_pool_cleanup() {
     ]);
     unsafe {
         cand::set_items(vec![
-            cand::Item { word: "重".into(), pinyin: "zhòng".into(), ru: "тяжёлый".into(), fresh: false },
-            cand::Item { word: "重".into(), pinyin: "chóng".into(), ru: "повторя́ть".into(), fresh: false },
+            cand::Item { word: "重".into(), ru: "тяжёлый".into(), fresh: false },
+            cand::Item { word: "重".into(), ru: "повторя́ть".into(), fresh: false },
         ]);
         cand::select(1);
     }
