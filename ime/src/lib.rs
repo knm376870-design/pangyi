@@ -217,10 +217,27 @@ fn refresh_page() {
     u.extend(ui);
 }
 
-/// 翻页：delta = -1 上一页 / +1 下一页。返回是否真的翻动了
+/// 从原来的插入点重算窗口尺寸；窗口消息可能同步重入，不能带着定位锁调用。
+fn refresh_candidate_window() {
+    let anchor = *PENDING_CAND.lock().unwrap();
+    if let Some((x, y)) = anchor {
+        unsafe { cand_update(x, y); }
+    }
+}
+
+/// 选择变化只需重算整句翻译；普通补全只由输入串决定，不必再查词库。
+fn refresh_candidate_selection() {
+    if crate::settings::trmode() == 2 {
+        sentence_hint("");
+    }
+    refresh_candidate_window();
+}
+
+/// 载入相邻页。移动选择时先定位到跨页后的条目，再统一刷新窗口和提示。
+/// delta = -1 上一页 / +1 下一页。返回是否真的翻动了
 ///（已经在头/尾页就返回 false，按键当没发生）。
 /// 微软拼音同款按键：PageUp/PageDown、`-`/`=`，上下方向键撞到页边界也翻。
-fn flip_page(delta: isize) -> bool {
+fn load_adjacent_page(delta: isize) -> bool {
     let total = ALL_CANDS.lock().unwrap().len();
     if total == 0 {
         return false;
@@ -241,28 +258,40 @@ fn flip_page(delta: isize) -> bool {
     true
 }
 
+fn flip_page(delta: isize) -> bool {
+    let changed = load_adjacent_page(delta);
+    if changed {
+        refresh_candidate_selection();
+    }
+    changed
+}
+
 /// 在候选里移动一格：delta = -1 上一格 / +1 下一格；撞到页边界自动翻页
 /// （第 1 个再往上 = 上一页的最后一条，最后一个再往下 = 下一页第 1 条，
 ///   和微软拼音一样看着一页一页连起来翻）。调用前要先确认当前页有候选。
 fn move_sel(delta: isize) {
     let n = UI_CANDS.lock().unwrap().len();
+    if n == 0 { return; }
     let cur = unsafe { cand::current_index() };
     if delta < 0 && cur == 0 {
-        if flip_page(-1) {
+        if load_adjacent_page(-1) {
             // 翻到上一页后选最后一条（连续往上按不会卡住）
             let last = unsafe { cand::count() }.saturating_sub(1);
             unsafe { cand::select(last); }
+            refresh_candidate_selection();
         }
         return;
     }
     if delta > 0 && cur + 1 >= n {
-        if flip_page(1) {
+        if load_adjacent_page(1) {
             unsafe { cand::select(0); }
+            refresh_candidate_selection();
         }
         return;
     }
     let next = if delta < 0 { cur - 1 } else { cur + 1 };
     unsafe { cand::select(next); }
+    refresh_candidate_selection();
 }
 
 /// 从当前页取出完整条目，提交前保存词和释义，不能再按汉字反查另一个读音。
@@ -342,9 +371,7 @@ impl TextService {
         // 候选窗重画：set_items 只改内存，不触发 WM_PAINT。
         // 缺这一句的话，退格后候选窗还停留在旧拼音的候选上（v4.2.0 的 bug：
         // 删一个字母候选不变，删光才一起消失 —— 只有 cand_hide 生效）。
-        if let Some((x, y)) = *PENDING_CAND.lock().unwrap() {
-            unsafe { cand_update(x, y); }
-        }
+        refresh_candidate_window();
         if let Some(ctx) = pic {
             let s: ITfEditSession = UpdateSession { text: key.encode_utf16().collect() }.into();
             let flags = TF_CONTEXT_EDIT_CONTEXT_FLAGS(TF_ES_SYNC.0 | TF_ES_READWRITE.0);
@@ -706,9 +733,7 @@ impl ITfKeyEventSink_Impl for TextService {
                 let flags = TF_CONTEXT_EDIT_CONTEXT_FLAGS(TF_ES_SYNC.0 | TF_ES_READWRITE.0);
                 let _ = unsafe { ctx.RequestEditSession(self.client_id.get(), &s, flags) };
             }
-            if let Some((x, y)) = *PENDING_CAND.lock().unwrap() {
-                unsafe { cand_update(x, y); }
-            }
+            refresh_candidate_window();
             return Ok(BOOL(1));
         }
 
@@ -780,11 +805,16 @@ impl ITfKeyEventSink_Impl for TextService {
         if wparam.0 == 0x0D || wparam.0 == 0x20 {
             if !has_buf { return Ok(BOOL(0)); }
             let w = selected_choice();
-            self.buf.borrow_mut().clear();
+            let raw = self.buf.replace(String::new());
             UI_CANDS.lock().unwrap().clear();
             unsafe { cand_hide(); }
             dlog!("上屏 word={:?}", w);
-            if let Some((w, ru)) = w { self.commit_word(pic, &w, &ru); }
+            if let Some((w, ru)) = w {
+                self.commit_word(pic, &w, &ru);
+            } else {
+                // 无候选也要结束 TSF 组合，保留原始字母；原始串不进入自学习。
+                self.commit_text(pic, &raw);
+            }
             return Ok(BOOL(1));
         }
 
@@ -1118,7 +1148,7 @@ fn claim(wparam: WPARAM, has_buf: bool, english: bool) -> bool {
             && matches!(wparam.0 as u32, 0xBA | 0xBC | 0xBE..=0xBF | 0xDB..=0xDE);
     }
     match wparam.0 as u32 {
-        0x20 | 0x1B | 0x08 | 0x0D | 0x09 => true, // 空格 / ESC / 退格 / 回车 / Tab
+        0x20 | 0x1B | 0x08 | 0x0D => true, // 空格 / ESC / 退格 / 回车
         // 数字选词：只认当前页里真有的候选，没有就放行给应用（可能只是打字）。
         // Shift+数字 是打 ! @ # $ % 这类符号，不能抢
         0x31..=0x39 => {
@@ -1127,7 +1157,7 @@ fn claim(wparam: WPARAM, has_buf: bool, english: bool) -> bool {
         }
         // 方向键选词：当前页真有候选才拦，否则放行给应用移动光标。
         // （v4.5.0 前这里无条件 true，空候选时 ←→ 会被 TSF 吞掉）
-        0x25..=0x28 => !UI_CANDS.lock().unwrap().is_empty(),
+        0x09 | 0x25..=0x28 => !UI_CANDS.lock().unwrap().is_empty(),
         0x21 | 0x22 => true,                      // PageUp / PageDown
         _ => is_punct_vk(wparam.0 as u32),
     }

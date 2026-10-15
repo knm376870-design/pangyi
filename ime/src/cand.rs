@@ -205,13 +205,17 @@ struct Layout {
     height: i32,
 }
 
+fn visible_count(item_count: usize, limit: usize) -> usize {
+    item_count.min(limit).min(9)
+}
+
 unsafe fn compute_layout(dc: HDC, items: &[Item]) -> Layout {
     let f_text = font(TEXT_PX);
     let f_anno = font(ANNO_PX);
     let f_idx = font(INDEX_PX);
     let pad = sc(PAD);
     let gap = sc(GAP);
-    let nth = items.len().min(9);
+    let nth = visible_count(items.len(), crate::settings::max_cands());
 
     let mut index_w = 0;
     let mut word_w = 0;
@@ -219,7 +223,7 @@ unsafe fn compute_layout(dc: HDC, items: &[Item]) -> Layout {
     let mut row_h = 0;
     let mut line_h = 0;
     let mut item_w: Vec<i32> = Vec::new();
-    for (i, it) in items.iter().take(crate::settings::max_cands()).enumerate() {
+    for (i, it) in items.iter().take(nth).enumerate() {
         let idx = format!("{}.", i + 1);
         let a = measure(dc, f_idx, &idx).0;
         let (bw, bh) = measure(dc, f_text, &it.word);
@@ -370,7 +374,8 @@ unsafe extern "system" fn proc_cand(h: HWND, msg: u32, w: WPARAM, l: LPARAM) -> 
                 let inset = sc(PAD) / 2;
                 let mut x = pad + inset;
                 let baseline = y + sc(ROW_PAD);
-                for (i, it) in items.iter().take(crate::settings::max_cands()).enumerate() {
+                let nth = visible_count(items.len(), crate::settings::max_cands());
+                for (i, it) in items.iter().take(nth).enumerate() {
                     let iw = lay.item_w.get(i).copied().unwrap_or(0);
                     if i == sel {
                         let hb = CreateSolidBrush(p.highlight);
@@ -393,7 +398,7 @@ unsafe extern "system" fn proc_cand(h: HWND, msg: u32, w: WPARAM, l: LPARAM) -> 
                     x += iw + gap;
                 }
                 if lay.anno_h > 0 {
-                    if let Some(it) = items.get(sel) {
+                    if let Some(it) = items.get(sel).filter(|_| sel < nth) {
                         let s = gloss_of(it);
                         SelectObject(dc, f_anno);
                         SetTextColor(dc, if it.fresh { p.fresh } else { p.gloss });
@@ -405,7 +410,7 @@ unsafe extern "system" fn proc_cand(h: HWND, msg: u32, w: WPARAM, l: LPARAM) -> 
                 let x_index = pad;
                 let x_word = x_index + lay.index_w + gap;
                 let x_ru = x_word + lay.word_w + gap;
-                for (i, it) in items.iter().take(crate::settings::max_cands()).enumerate() {
+                for (i, it) in items.iter().take(visible_count(items.len(), crate::settings::max_cands())).enumerate() {
                     let ry = y + (i as i32) * lay.row_h;
                     if i == sel {
                         let hb = CreateSolidBrush(p.highlight);
@@ -558,8 +563,43 @@ fn horizontal_item_rect(index: usize, widths: &[i32], origin: (i32, i32), row_h:
 fn horizontal_hit(point: (i32, i32), widths: &[i32], origin: (i32, i32), row_h: i32, spacing: (i32, i32)) -> Option<usize> {
     (0..widths.len()).find(|&i| {
         horizontal_item_rect(i, widths, origin, row_h, spacing).map_or(false, |r|
-            point.0 >= r.left && point.0 < r.right && point.1 >= r.top && point.1 < r.bottom)
+            contains_point(r, point))
     })
+}
+
+fn contains_point(rect: RECT, point: (i32, i32)) -> bool {
+    point.0 >= rect.left && point.0 < rect.right && point.1 >= rect.top && point.1 < rect.bottom
+}
+
+fn clip_rect(rect: RECT, client: RECT) -> Option<RECT> {
+    let clipped = RECT {
+        left: rect.left.max(client.left), top: rect.top.max(client.top),
+        right: rect.right.min(client.right), bottom: rect.bottom.min(client.bottom),
+    };
+    (clipped.left < clipped.right && clipped.top < clipped.bottom).then_some(clipped)
+}
+
+fn exclude_footer(client: RECT, footer_space: i32) -> RECT {
+    RECT { bottom: client.bottom.saturating_sub(footer_space.max(0)).max(client.top), ..client }
+}
+
+unsafe fn candidate_client(dc: HDC, client: RECT) -> RECT {
+    let footer_space = if PAGE_TOT.load(Ordering::Relaxed) > 1 {
+        sc(PAD) + measure(dc, font(ANNO_PX), "x").1 + sc(ROW_PAD)
+    } else { 0 };
+    exclude_footer(client, footer_space)
+}
+
+/// origin 为 (俄语列 x, 首行 y)；俄语侧只覆盖这一行实际显示的释义。
+fn vertical_item_rect(index: usize, count: usize, russian_side: bool, origin: (i32, i32), row_h: i32, gloss_w: i32, client: RECT) -> Option<RECT> {
+    if index >= count || row_h <= 0 { return None; }
+    let (x_ru, y0) = origin;
+    let top = y0.saturating_add((index as i32).saturating_mul(row_h));
+    clip_rect(RECT {
+        left: if russian_side { x_ru } else { client.left }, top,
+        right: if russian_side { x_ru.saturating_add(gloss_w.max(0)) } else { x_ru },
+        bottom: top.saturating_add(row_h),
+    }, client)
 }
 
 /// 竖排几何（和 WM_PAINT 同一套算法）：首行 y、行高、词列 x、俄语列 x。
@@ -588,9 +628,13 @@ unsafe fn v_geom(dc: HDC) -> Option<(i32, i32, i32, i32)> {
 /// 点不到候选行返回 None。索引列和词列都算中文侧。
 pub unsafe fn hit_test(x: i32, y: i32) -> Option<(usize, bool)> {
     let h = hwnd();
+    let mut client = RECT::default();
+    if GetClientRect(h, &mut client).is_err() || !contains_point(client, (x, y)) { return None; }
     let dc = GetDC(h);
     if dc.0 == 0 { return None; }
     let result = (|| {
+        let client = candidate_client(dc, client);
+        if !contains_point(client, (x, y)) { return None; }
         let (y0, row_h, _x_word, x_ru) = v_geom(dc)?;
         if crate::settings::horizontal() {
             let items = ITEMS.lock().unwrap();
@@ -602,14 +646,17 @@ pub unsafe fn hit_test(x: i32, y: i32) -> Option<(usize, bool)> {
         let dy = y - y0;
         if dy < 0 || row_h <= 0 { return None; }
         let i = (dy / row_h) as usize;
-        if i >= ITEMS.lock().unwrap().len() { return None; }
-        if x >= x_ru {
-            Some((i, true))
-        } else if x >= 0 {
-            Some((i, false))
-        } else {
-            None
+        let items = ITEMS.lock().unwrap();
+        let count = visible_count(items.len(), crate::settings::max_cands());
+        if i >= count { return None; }
+        let gloss_w = measure(dc, font(ANNO_PX), &gloss_of(&items[i])).0;
+        for ru in [true, false] {
+            if vertical_item_rect(i, count, ru, (x_ru, y0), row_h, gloss_w, client)
+                .map_or(false, |rect| contains_point(rect, (x, y))) {
+                return Some((i, ru));
+            }
         }
+        None
     })();
     let _ = ReleaseDC(h, dc);
     result
@@ -618,23 +665,28 @@ pub unsafe fn hit_test(x: i32, y: i32) -> Option<(usize, bool)> {
 /// 第 row 行中文侧/俄语侧的可点击矩形（客户区坐标），测试台架算点击点用。
 pub unsafe fn hit_rect(row: usize, ru: bool) -> Option<(i32, i32, i32, i32)> {
     let h = hwnd();
+    let mut client = RECT::default();
+    if GetClientRect(h, &mut client).is_err() { return None; }
     let dc = GetDC(h);
     if dc.0 == 0 { return None; }
     let result = (|| {
-        let (y0, row_h, x_word, x_ru) = v_geom(dc)?;
+        let client = candidate_client(dc, client);
+        let (y0, row_h, _x_word, x_ru) = v_geom(dc)?;
         if crate::settings::horizontal() {
             if ru { return None; } // 横排只显示一排中文候选，没有可选的俄语侧。
             let items = ITEMS.lock().unwrap();
             let lay = compute_layout(dc, &items);
             let pad = sc(PAD);
             let r = horizontal_item_rect(row, &lay.item_w, (pad + pad / 2, y0), row_h, (sc(GAP), pad / 2))?;
+            let r = clip_rect(r, client)?;
             return Some((r.left, r.top, r.right, r.bottom));
         }
-        if row >= ITEMS.lock().unwrap().len() { return None; }
-        let top = y0 + row as i32 * row_h;
-        let l = if ru { x_ru } else { x_word };
-        let r = if ru { l + 60 } else { x_ru };
-        Some((l, top, r, top + row_h))
+        let items = ITEMS.lock().unwrap();
+        let count = visible_count(items.len(), crate::settings::max_cands());
+        if row >= count { return None; }
+        let gloss_w = measure(dc, font(ANNO_PX), &gloss_of(&items[row])).0;
+        let r = vertical_item_rect(row, count, ru, (x_ru, y0), row_h, gloss_w, client)?;
+        Some((r.left, r.top, r.right, r.bottom))
     })();
     let _ = ReleaseDC(h, dc);
     result
@@ -714,7 +766,7 @@ pub unsafe fn show_at(x: i32, y: i32) {
     if !alive() { init(); }
     if !alive() { return; }
     let h = hwnd();
-    let n = ITEMS.lock().unwrap().len().min(crate::settings::max_cands());
+    let n = visible_count(ITEMS.lock().unwrap().len(), crate::settings::max_cands());
     if n == 0 { hide(); return; }
     let dc = GetDC(h);
     let (mut cw, mut ch) = (sc(400), sc(40));
@@ -831,5 +883,78 @@ mod placement_tests {
         let r = horizontal_item_rect(1, &[80, 120, 60], (12, 30), 24, (8, 4)).unwrap();
         assert_eq!((r.left, r.top, r.right, r.bottom), (96, 30, 224, 54));
         assert!(horizontal_item_rect(3, &[80, 120, 60], (12, 30), 24, (8, 4)).is_none());
+    }
+
+    #[test]
+    fn visible_candidates_respect_page_setting_and_digit_limit() {
+        for (items, limit, expected) in [(0, 9, 0), (9, 3, 3), (2, 7, 2), (12, 20, 9)] {
+            assert_eq!(visible_count(items, limit), expected);
+        }
+    }
+
+    #[test]
+    fn clipped_horizontal_rect_excludes_invisible_candidates() {
+        let client = RECT { left: 0, top: 0, right: 150, bottom: 80 };
+        let second = horizontal_item_rect(1, &[80, 120, 60], (12, 30), 24, (8, 4)).unwrap();
+        let second = clip_rect(second, client).unwrap();
+        assert_eq!((second.left, second.top, second.right, second.bottom), (96, 30, 150, 54));
+        assert!(contains_point(second, (149, 53)));
+        assert!(!contains_point(second, (150, 53)));
+        let third = horizontal_item_rect(2, &[80, 120, 60], (12, 30), 24, (8, 4)).unwrap();
+        assert!(clip_rect(third, client).is_none());
+    }
+
+    #[test]
+    fn short_gloss_target_matches_its_visible_width() {
+        let client = RECT { left: 0, top: 0, right: 132, bottom: 80 };
+        let r = vertical_item_rect(0, 3, true, (100, 30), 24, 18, client).unwrap();
+        assert_eq!((r.left, r.top, r.right, r.bottom), (100, 30, 118, 54));
+        assert!(contains_point(r, (100, 30)));
+        assert!(contains_point(r, (117, 53)));
+        for point in [(99, 40), (118, 40), (110, 54)] {
+            assert!(!contains_point(r, point));
+        }
+    }
+
+    #[test]
+    fn empty_gloss_has_no_russian_target_and_hidden_rows_have_no_target() {
+        let client = RECT { left: 0, top: 0, right: 132, bottom: 200 };
+        assert!(vertical_item_rect(0, 3, true, (100, 30), 24, 0, client).is_none());
+        let chinese = vertical_item_rect(0, 3, false, (100, 30), 24, 0, client).unwrap();
+        assert!(contains_point(chinese, (5, 40))); // 序号列也可选中文。
+        assert!(!contains_point(chinese, (100, 40)));
+        for ru in [false, true] {
+            assert!(vertical_item_rect(3, 3, ru, (100, 30), 24, 18, client).is_none());
+        }
+    }
+
+    #[test]
+    fn clipped_vertical_rectangles_preserve_side_boundary() {
+        let client = RECT { left: 0, top: 0, right: 105, bottom: 43 };
+        let chinese = vertical_item_rect(0, 3, false, (100, 30), 24, 18, client).unwrap();
+        let russian = vertical_item_rect(0, 3, true, (100, 30), 24, 18, client).unwrap();
+        assert_eq!((chinese.left, chinese.top, chinese.right, chinese.bottom), (0, 30, 100, 43));
+        assert_eq!((russian.left, russian.top, russian.right, russian.bottom), (100, 30, 105, 43));
+        assert!(!contains_point(chinese, (100, 40)));
+        assert!(contains_point(russian, (100, 40)));
+        assert!(!contains_point(russian, (105, 40)));
+        assert!(vertical_item_rect(1, 3, false, (100, 30), 24, 18, client).is_none());
+    }
+
+    #[test]
+    fn clipped_popup_footer_cannot_commit_the_candidate_beneath_it() {
+        let client = RECT { left: 0, top: 0, right: 160, bottom: 70 };
+        let candidates = exclude_footer(client, 24);
+        assert_eq!(candidates.bottom, 46);
+        assert!(contains_point(client, (30, 50)));
+        assert!(!contains_point(candidates, (30, 50)));
+        let vertical = vertical_item_rect(0, 3, false, (100, 30), 24, 18, candidates).unwrap();
+        let horizontal = horizontal_item_rect(0, &[80], (12, 30), 24, (8, 4)).unwrap();
+        let horizontal = clip_rect(horizontal, candidates).unwrap();
+        for rect in [vertical, horizontal] {
+            assert_eq!(rect.bottom, 46);
+            assert!(contains_point(rect, (30, 45)));
+            assert!(!contains_point(rect, (30, 46)));
+        }
     }
 }
