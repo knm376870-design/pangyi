@@ -297,7 +297,6 @@ unsafe fn refresh() {
                 .iter()
                 .map(|h| pangyi_ime::cand::Item {
                     word: h.word.clone(),
-                    pinyin: h.pinyin.clone(),
                     ru: h.ru.clone(),
                     fresh: false,
                 })

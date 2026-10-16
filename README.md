@@ -11,17 +11,20 @@
 Processor），和微软拼音同一层级：装一次，在记事本、Word、浏览器、QQ、微信等**任何软件**里按
 `Win + 空格` 切过去就能用，不需要先打开任何程序。
 
-![候选窗截图](docs/cand-demo.png)
+候选显示示例：`1. 朋友　друг`。中文后直接显示俄语释义，候选窗顶行和词条旁均不显示拼音。
 
 ## 功能
 
 | 功能 | 说明 |
 |---|---|
 | 拼音输入 | 全拼；`ü` 用 `v` 代替（`nv`→女、`lvxing`→旅行、`falv`→法律） |
-| 中俄对照候选窗 | 候选列表里每个中文词后面直接跟俄语释义（带重音符号） |
+| 中俄对照候选窗 | 只显示中文与俄语释义（带重音符号），顶行和词条旁均不显示拼音；横排在下方显示当前项的俄语释义 |
+| 鼠标选词 | 横排可点选每个候选；竖排点俄语译文可只上屏该条候选的俄语第一释义；窗口外和未显示的候选不响应点选 |
+| 多屏候选定位 | 候选窗跟随光标所在显示器，按工作区避开任务栏，保留左侧或上方副屏坐标 |
 | 多音字 | 一个读音一条记录（都 dōu / 都 dū 都能打出来） |
 | 首字母缩写 | `gz`→工作、`zhg`→这个、`zyzzj`→中央政治局、`zhrmghg`→中华人民共和国（14.5 万条多音节词自动生成缩写键） |
-| 候选翻页看全部 | 整个读音组都在候选池（打 yi 有 530 条 / 59 页），微软同款翻页键 `-`/`=`、PageUp/PageDown；`↑` `↓` 撞到页首页尾自动接上；候选窗右下角显示「▲▼ 第几页/共几页」 |
+| 候选翻页看全部 | 整个读音组都在候选池（打 yi 有 530 条 / 59 页），微软同款翻页键 `-`/`=`、PageUp/PageDown；`↑` `↓` 撞到页首页尾自动接上，翻页后立即更新候选与窗口大小；右下角显示「▲▼ 第几页/共几页」 |
+| 无匹配候选 | 回车或空格保留已键入的原始字母并结束输入；Tab 正常交给应用切换焦点 |
 | 大写英文 | Shift/Caps＋字母直接出大写；拼音中间按 Shift/Caps＋字母＝首选候选上屏＋大写字母直通（微软一致）；拼音中间按标点＝首选上屏＋标点不丢 |
 | 中/英模式 | 单独按 Shift 切换（不抢 Ctrl+C/V/A、Alt+F4、Win+D） |
 | 自定义短语 | 支持 |
@@ -57,17 +60,22 @@ bug / 建议直接开 [Issue](../../issues)，中文即可。欢迎试用并反�
 
 ## 从源码构建
 
-Windows + Rust（[rustup](https://rustup.rs)）：
+Windows + Rust GNU 工具链（[rustup](https://rustup.rs)），并准备 llvm-mingw 的 `bin` 目录。在仓库根目录构建完整安装包：
 
 ```powershell
-cd ime
-cargo build --release                    # 64 位 pangyi_ime.dll（cdylib）
-# 32 位 DLL：需要 tools/llvm-mingw 工具链 + build/x86-stub.o（见 build.rs）
-# 安装包 exe：把两个 DLL 放进 ime/payload/ 后
-cargo build --release --bin setup        # 输出 pangyi-setup.exe
+rustup target add x86_64-pc-windows-gnu i686-pc-windows-gnu
+.\tools\build_release.ps1 -LlvmMingwBin '<llvm-mingw 的 bin 目录>' -BuildDir '<可写的纯英文构建目录>'
 ```
 
+脚本先构建并验证两种架构的新 DLL，再打包安装程序，输出 `dist\旁译-v版本号.exe` 和 SHA256 校验文件。依赖已缓存时可加 `-Offline`。图标与中文版本信息也会校验，失败时不会交付缺资源的安装包。
+
+只构建当前架构的库，可在 `ime` 目录运行 `cargo build --release --lib`。
+
 词库 `ime/src/dict.tsv` 以 `include_str!` 直接编进二进制，没有任何运行时数据文件依赖。
+
+### 输入稳定性回归
+
+在 `ime` 目录运行 `cargo test --lib`，检查功能键、小键盘放行、宿主终止拼音时的状态清理，以及组合编辑的同步回调。测试无需安装或注册输入法，详见 [回归说明](docs/stability-regressions.md)。
 
 ## 许可
 

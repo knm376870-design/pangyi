@@ -1,6 +1,6 @@
 //! 候选窗 —— 视觉与排版照青简（apps/windows/server/src/ui/candidates）：
-//! 同一套配色/字体/间距/圆角；竖排为「序号 中文 拼音 俄语」四列对齐，
-//! 横排为「序号 中文」一行排开、当前项的拼音与俄语另起一行。
+//! 同一套配色/字体/间距/圆角；竖排为「序号 中文 俄语」三列对齐，
+//! 横排为「序号 中文」一行排开、当前项的俄语释义另起一行。
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicIsize, AtomicUsize, Ordering};
 use windows::core::{PCWSTR, w};
@@ -13,13 +13,11 @@ use windows::Win32::UI::WindowsAndMessaging::*;
 
 pub struct Item {
     pub word: String,
-    pub pinyin: String,
     pub ru: String,
     pub fresh: bool,
 }
 
 static ITEMS: Mutex<Vec<Item>> = Mutex::new(Vec::new());
-static PREEDIT: Mutex<String> = Mutex::new(String::new());
 static SENTENCE: Mutex<Option<String>> = Mutex::new(None);
 static SEL: AtomicUsize = AtomicUsize::new(0);
 /// 蓝条选中哪一侧：false = 中文（默认），true = 俄语侧 —— 上屏只出俄语，
@@ -196,7 +194,6 @@ fn measure(dc: HDC, f: HFONT, s: &str) -> (i32, i32) {
 struct Layout {
     index_w: i32,
     word_w: i32,
-    pinyin_w: i32,
     ru_w: i32,
     item_w: Vec<i32>,
     row_h: i32,
@@ -207,30 +204,31 @@ struct Layout {
     height: i32,
 }
 
+fn visible_count(item_count: usize, limit: usize) -> usize {
+    item_count.min(limit).min(9)
+}
+
 unsafe fn compute_layout(dc: HDC, items: &[Item]) -> Layout {
     let f_text = font(TEXT_PX);
     let f_anno = font(ANNO_PX);
     let f_idx = font(INDEX_PX);
     let pad = sc(PAD);
     let gap = sc(GAP);
-    let nth = items.len().min(9);
+    let nth = visible_count(items.len(), crate::settings::max_cands());
 
     let mut index_w = 0;
     let mut word_w = 0;
-    let mut pinyin_w = 0;
     let mut ru_w = 0;
     let mut row_h = 0;
     let mut line_h = 0;
     let mut item_w: Vec<i32> = Vec::new();
-    for (i, it) in items.iter().take(crate::settings::max_cands()).enumerate() {
+    for (i, it) in items.iter().take(nth).enumerate() {
         let idx = format!("{}.", i + 1);
         let a = measure(dc, f_idx, &idx).0;
         let (bw, bh) = measure(dc, f_text, &it.word);
-        let c = measure(dc, f_anno, &it.pinyin).0;
         let d = measure(dc, f_anno, &gloss_of(it)).0;
         if a > index_w { index_w = a; }
         if bw > word_w { word_w = bw; }
-        if c > pinyin_w { pinyin_w = c; }
         if d > ru_w { ru_w = d; }
         let rh = bh + sc(ROW_PAD) * 2;
         if rh > row_h { row_h = rh; }
@@ -241,26 +239,15 @@ unsafe fn compute_layout(dc: HDC, items: &[Item]) -> Layout {
         row_h = sc(TEXT_PX) + sc(ROW_PAD) * 2;
     }
 
-    // 高亮项的注释行（横排时另起一行）
-    let mut anno_w = 0;
-    let mut anno_h = 0;
-    if let Some(it) = items.get(SEL.load(Ordering::Relaxed)) {
-        let s = format!("{}   {}", it.pinyin, gloss_of(it));
-        anno_w = measure(dc, f_anno, &s).0;
-        anno_h = measure(dc, f_anno, "x").1 + sc(ROW_PAD);
-    }
+    // 按整页释义预留注释区域，切换选中项时不裁字、不改变窗口大小。
+    // 整页都没有释义时，不保留空注释行。
+    let anno_w = ru_w;
+    let anno_h = if anno_w > 0 { measure(dc, f_anno, "x").1 + sc(ROW_PAD) } else { 0 };
 
-    let pre = PREEDIT.lock().unwrap().clone();
     let sent = SENTENCE.lock().unwrap().clone();
-    let has_top = !pre.is_empty() || sent.is_some();
-    let top_w = if !has_top { 0 } else {
-        let mut w = if pre.is_empty() { 0 } else { measure(dc, f_anno, &pre).0 };
-        if let Some(s) = sent.as_ref() {
-            w += gap + measure(dc, f_anno, "☁").0 + gap / 2 + measure(dc, f_anno, s).0;
-        }
-        w
-    };
-    let pre_h = if !has_top { 0 } else { measure(dc, f_anno, "x").1 + sc(ROW_PAD) * 2 };
+    let top_w = sent.as_ref().map_or(0, |s|
+        measure(dc, f_anno, "☁").0 + gap / 2 + measure(dc, f_anno, s).0);
+    let top_h = if sent.is_some() { measure(dc, f_anno, "x").1 + sc(ROW_PAD) * 2 } else { 0 };
 
     // 右下角页码「▲▼ 2/59」——只有一页时不出，老尺寸完全不变
     let pages = PAGE_TOT.load(Ordering::Relaxed);
@@ -278,17 +265,17 @@ unsafe fn compute_layout(dc: HDC, items: &[Item]) -> Layout {
             if i > 0 { w += gap; }
             w += iw;
         }
-        let h = pad * 2 + pre_h + row_h + if anno_h > 0 { anno_h } else { 0 } + footer_h;
+        let h = pad * 2 + top_h + row_h + if anno_h > 0 { anno_h } else { 0 } + footer_h;
         (w.max(pad * 2 + anno_w).max(pad * 2 + top_w).max(pad * 2 + footer_w).max(sc(120)), h)
     } else {
-        let w = (pad * 2 + index_w + gap + word_w + gap + pinyin_w + gap + ru_w)
+        let w = (pad * 2 + index_w + gap + word_w + gap + ru_w)
             .max(pad * 2 + top_w)
             .max(pad * 2 + footer_w);
-        let h = pad * 2 + pre_h + (nth as i32) * row_h + footer_h;
+        let h = pad * 2 + top_h + (nth as i32) * row_h + footer_h;
         (w, h)
     };
 
-    Layout { index_w, word_w, pinyin_w, ru_w, item_w, row_h, line_h, anno_w, anno_h, width, height }
+    Layout { index_w, word_w, ru_w, item_w, row_h, line_h, anno_w, anno_h, width, height }
 }
 
 pub unsafe fn detect_theme() {
@@ -344,30 +331,20 @@ unsafe extern "system" fn proc_cand(h: HWND, msg: u32, w: WPARAM, l: LPARAM) -> 
             let gap = sc(GAP);
             let mut y = pad;
 
-            // 顶行：左边是正在输入的拼音，右边是「☁ 补全」（照青简的整句补全位）
-            let pre = PREEDIT.lock().unwrap().clone();
+            // 顶行只显示中文补全或整句翻译提示，不显示拼音。
             let sent = SENTENCE.lock().unwrap().clone();
-            if !pre.is_empty() || sent.is_some() {
+            if let Some(s) = sent.as_ref() {
                 let (_, ph) = measure(dc, f_anno, "x");
                 let ty = y + sc(ROW_PAD);
                 SelectObject(dc, f_anno);
                 let mut tx = pad;
-                if !pre.is_empty() {
-                    SetTextColor(dc, p.gloss);
-                    let s: Vec<u16> = pre.encode_utf16().collect();
-                    TextOutW(dc, tx, ty, &s);
-                    tx += measure(dc, f_anno, &pre).0;
-                }
-                if let Some(s) = sent.as_ref() {
-                    tx += gap;
-                    SetTextColor(dc, p.cloud);
-                    let c: Vec<u16> = "☁".encode_utf16().collect();
-                    TextOutW(dc, tx, ty, &c);
-                    tx += measure(dc, f_anno, "☁").0 + gap / 2;
-                    SetTextColor(dc, p.gloss);
-                    let g: Vec<u16> = s.encode_utf16().collect();
-                    TextOutW(dc, tx, ty, &g);
-                }
+                SetTextColor(dc, p.cloud);
+                let c: Vec<u16> = "☁".encode_utf16().collect();
+                TextOutW(dc, tx, ty, &c);
+                tx += measure(dc, f_anno, "☁").0 + gap / 2;
+                SetTextColor(dc, p.gloss);
+                let g: Vec<u16> = s.encode_utf16().collect();
+                TextOutW(dc, tx, ty, &g);
                 y += ph + sc(ROW_PAD) * 2;
             }
 
@@ -379,7 +356,8 @@ unsafe extern "system" fn proc_cand(h: HWND, msg: u32, w: WPARAM, l: LPARAM) -> 
                 let inset = sc(PAD) / 2;
                 let mut x = pad + inset;
                 let baseline = y + sc(ROW_PAD);
-                for (i, it) in items.iter().take(crate::settings::max_cands()).enumerate() {
+                let nth = visible_count(items.len(), crate::settings::max_cands());
+                for (i, it) in items.iter().take(nth).enumerate() {
                     let iw = lay.item_w.get(i).copied().unwrap_or(0);
                     if i == sel {
                         let hb = CreateSolidBrush(p.highlight);
@@ -402,8 +380,8 @@ unsafe extern "system" fn proc_cand(h: HWND, msg: u32, w: WPARAM, l: LPARAM) -> 
                     x += iw + gap;
                 }
                 if lay.anno_h > 0 {
-                    if let Some(it) = items.get(sel) {
-                        let s = format!("{}   {}", it.pinyin, gloss_of(it));
+                    if let Some(it) = items.get(sel).filter(|_| sel < nth) {
+                        let s = gloss_of(it);
                         SelectObject(dc, f_anno);
                         SetTextColor(dc, if it.fresh { p.fresh } else { p.gloss });
                         let g: Vec<u16> = s.encode_utf16().collect();
@@ -413,9 +391,8 @@ unsafe extern "system" fn proc_cand(h: HWND, msg: u32, w: WPARAM, l: LPARAM) -> 
             } else {
                 let x_index = pad;
                 let x_word = x_index + lay.index_w + gap;
-                let x_pinyin = x_word + lay.word_w + gap;
-                let x_ru = x_pinyin + lay.pinyin_w + gap;
-                for (i, it) in items.iter().take(crate::settings::max_cands()).enumerate() {
+                let x_ru = x_word + lay.word_w + gap;
+                for (i, it) in items.iter().take(visible_count(items.len(), crate::settings::max_cands())).enumerate() {
                     let ry = y + (i as i32) * lay.row_h;
                     if i == sel {
                         let hb = CreateSolidBrush(p.highlight);
@@ -438,10 +415,6 @@ unsafe extern "system" fn proc_cand(h: HWND, msg: u32, w: WPARAM, l: LPARAM) -> 
                     TextOutW(dc, x_word, ty, &word);
 
                     SelectObject(dc, f_anno);
-                    SetTextColor(dc, p.index);
-                    let py: Vec<u16> = it.pinyin.encode_utf16().collect();
-                    TextOutW(dc, x_pinyin, ty + small_anno, &py);
-
                     SetTextColor(dc, if it.fresh { p.fresh } else { p.gloss });
                     let gloss: Vec<u16> = gloss_of(it).encode_utf16().collect();
                     TextOutW(dc, x_ru, ty + small_anno, &gloss);
@@ -543,8 +516,6 @@ pub unsafe fn page_info() -> (usize, usize) {
     (PAGE_CUR.load(Ordering::Relaxed), PAGE_TOT.load(Ordering::Relaxed))
 }
 
-pub unsafe fn set_preedit(s: &str) { *PREEDIT.lock().unwrap() = s.to_string(); }
-
 pub unsafe fn set_sentence(s: Option<String>) { *SENTENCE.lock().unwrap() = s; }
 
 /// 蓝条现在选中哪一侧（true = 俄语侧）。提交路径据此决定上屏中文还是俄语。
@@ -558,8 +529,61 @@ pub unsafe fn set_ru_sel(v: bool) {
     if alive() { let _ = InvalidateRect(hwnd(), None, TRUE); }
 }
 
+fn horizontal_item_rect(index: usize, widths: &[i32], origin: (i32, i32), row_h: i32, spacing: (i32, i32)) -> Option<RECT> {
+    let width = *widths.get(index)?;
+    if width <= 0 || row_h <= 0 { return None; }
+    let (gap, inset) = spacing;
+    let x = widths[..index].iter().fold(origin.0, |x, width| x.saturating_add(*width).saturating_add(gap));
+    Some(RECT {
+        left: x.saturating_sub(inset), top: origin.1,
+        right: x.saturating_add(width).saturating_add(inset), bottom: origin.1.saturating_add(row_h),
+    })
+}
+
+fn horizontal_hit(point: (i32, i32), widths: &[i32], origin: (i32, i32), row_h: i32, spacing: (i32, i32)) -> Option<usize> {
+    (0..widths.len()).find(|&i| {
+        horizontal_item_rect(i, widths, origin, row_h, spacing).map_or(false, |r|
+            contains_point(r, point))
+    })
+}
+
+fn contains_point(rect: RECT, point: (i32, i32)) -> bool {
+    point.0 >= rect.left && point.0 < rect.right && point.1 >= rect.top && point.1 < rect.bottom
+}
+
+fn clip_rect(rect: RECT, client: RECT) -> Option<RECT> {
+    let clipped = RECT {
+        left: rect.left.max(client.left), top: rect.top.max(client.top),
+        right: rect.right.min(client.right), bottom: rect.bottom.min(client.bottom),
+    };
+    (clipped.left < clipped.right && clipped.top < clipped.bottom).then_some(clipped)
+}
+
+fn exclude_footer(client: RECT, footer_space: i32) -> RECT {
+    RECT { bottom: client.bottom.saturating_sub(footer_space.max(0)).max(client.top), ..client }
+}
+
+unsafe fn candidate_client(dc: HDC, client: RECT) -> RECT {
+    let footer_space = if PAGE_TOT.load(Ordering::Relaxed) > 1 {
+        sc(PAD) + measure(dc, font(ANNO_PX), "x").1 + sc(ROW_PAD)
+    } else { 0 };
+    exclude_footer(client, footer_space)
+}
+
+/// origin 为 (俄语列 x, 首行 y)；俄语侧只覆盖这一行实际显示的释义。
+fn vertical_item_rect(index: usize, count: usize, russian_side: bool, origin: (i32, i32), row_h: i32, gloss_w: i32, client: RECT) -> Option<RECT> {
+    if index >= count || row_h <= 0 { return None; }
+    let (x_ru, y0) = origin;
+    let top = y0.saturating_add((index as i32).saturating_mul(row_h));
+    clip_rect(RECT {
+        left: if russian_side { x_ru } else { client.left }, top,
+        right: if russian_side { x_ru.saturating_add(gloss_w.max(0)) } else { x_ru },
+        bottom: top.saturating_add(row_h),
+    }, client)
+}
+
 /// 竖排几何（和 WM_PAINT 同一套算法）：首行 y、行高、词列 x、俄语列 x。
-/// 顶行（拼音 / ☁ 提示）占多高就先加多高，这样点击和画的位置对得上。
+/// 顶行的 ☁ 提示占多高就先加多高，这样点击和画的位置对得上。
 unsafe fn v_geom(dc: HDC) -> Option<(i32, i32, i32, i32)> {
     let items = ITEMS.lock().unwrap();
     if items.is_empty() { return None; }
@@ -568,15 +592,14 @@ unsafe fn v_geom(dc: HDC) -> Option<(i32, i32, i32, i32)> {
     let pad = sc(PAD);
     let gap = sc(GAP);
     let mut y = pad;
-    let pre = PREEDIT.lock().unwrap().clone();
     let sent = SENTENCE.lock().unwrap().clone();
-    if !pre.is_empty() || sent.is_some() {
+    if sent.is_some() {
         let f_anno = font(ANNO_PX);
         let (_, ph) = measure(dc, f_anno, "x");
         y += ph + sc(ROW_PAD) * 2;
     }
     let x_word = pad + lay.index_w + gap;
-    let x_ru = x_word + lay.word_w + gap + lay.pinyin_w + gap;
+    let x_ru = x_word + lay.word_w + gap;
     Some((y, lay.row_h, x_word, x_ru))
 }
 
@@ -584,37 +607,68 @@ unsafe fn v_geom(dc: HDC) -> Option<(i32, i32, i32, i32)> {
 /// 点不到候选行返回 None。索引列和词列都算中文侧。
 pub unsafe fn hit_test(x: i32, y: i32) -> Option<(usize, bool)> {
     let h = hwnd();
+    let mut client = RECT::default();
+    if GetClientRect(h, &mut client).is_err() || !contains_point(client, (x, y)) { return None; }
     let dc = GetDC(h);
     if dc.0 == 0 { return None; }
-    let r = v_geom(dc);
-    if dc.0 != 0 { let _ = ReleaseDC(h, dc); }
-    let (y0, row_h, _x_word, x_ru) = r?;
-    let dy = y - y0;
-    if dy < 0 { return None; }
-    let i = (dy / row_h) as usize;
-    if i >= ITEMS.lock().unwrap().len() { return None; }
-    if x >= x_ru {
-        Some((i, true))
-    } else if x >= 0 {
-        // 俄语列左边整块（含序号、词、拼音列）都算中文侧，点空白也能选
-        Some((i, false))
-    } else {
+    let result = (|| {
+        let client = candidate_client(dc, client);
+        if !contains_point(client, (x, y)) { return None; }
+        let (y0, row_h, _x_word, x_ru) = v_geom(dc)?;
+        if crate::settings::horizontal() {
+            let items = ITEMS.lock().unwrap();
+            let lay = compute_layout(dc, &items);
+            let pad = sc(PAD);
+            return horizontal_hit((x, y), &lay.item_w, (pad + pad / 2, y0), row_h, (sc(GAP), pad / 2))
+                .map(|i| (i, false));
+        }
+        let dy = y - y0;
+        if dy < 0 || row_h <= 0 { return None; }
+        let i = (dy / row_h) as usize;
+        let items = ITEMS.lock().unwrap();
+        let count = visible_count(items.len(), crate::settings::max_cands());
+        if i >= count { return None; }
+        let gloss_w = measure(dc, font(ANNO_PX), &gloss_of(&items[i])).0;
+        for ru in [true, false] {
+            if vertical_item_rect(i, count, ru, (x_ru, y0), row_h, gloss_w, client)
+                .map_or(false, |rect| contains_point(rect, (x, y))) {
+                return Some((i, ru));
+            }
+        }
         None
-    }
+    })();
+    let _ = ReleaseDC(h, dc);
+    result
 }
 
 /// 第 row 行中文侧/俄语侧的可点击矩形（客户区坐标），测试台架算点击点用。
 pub unsafe fn hit_rect(row: usize, ru: bool) -> Option<(i32, i32, i32, i32)> {
     let h = hwnd();
+    let mut client = RECT::default();
+    if GetClientRect(h, &mut client).is_err() { return None; }
     let dc = GetDC(h);
     if dc.0 == 0 { return None; }
-    let r = v_geom(dc);
-    if dc.0 != 0 { let _ = ReleaseDC(h, dc); }
-    let (y0, row_h, x_word, x_ru) = r?;
-    if row >= ITEMS.lock().unwrap().len() { return None; }
-    let top = y0 + row as i32 * row_h;
-    let l = if ru { x_ru } else { x_word };
-    Some((l, top, l + 60, top + row_h))
+    let result = (|| {
+        let client = candidate_client(dc, client);
+        let (y0, row_h, _x_word, x_ru) = v_geom(dc)?;
+        if crate::settings::horizontal() {
+            if ru { return None; } // 横排只显示一排中文候选，没有可选的俄语侧。
+            let items = ITEMS.lock().unwrap();
+            let lay = compute_layout(dc, &items);
+            let pad = sc(PAD);
+            let r = horizontal_item_rect(row, &lay.item_w, (pad + pad / 2, y0), row_h, (sc(GAP), pad / 2))?;
+            let r = clip_rect(r, client)?;
+            return Some((r.left, r.top, r.right, r.bottom));
+        }
+        let items = ITEMS.lock().unwrap();
+        let count = visible_count(items.len(), crate::settings::max_cands());
+        if row >= count { return None; }
+        let gloss_w = measure(dc, font(ANNO_PX), &gloss_of(&items[row])).0;
+        let r = vertical_item_rect(row, count, ru, (x_ru, y0), row_h, gloss_w, client)?;
+        Some((r.left, r.top, r.right, r.bottom))
+    })();
+    let _ = ReleaseDC(h, dc);
+    result
 }
 
 // ---- 测试台架专用导出（side_e2e 用 GetProcAddress 拿，不挂在正常 API 上）----
@@ -664,13 +718,34 @@ pub unsafe fn at(i: usize) -> Option<String> {
 
 pub unsafe fn count() -> usize { ITEMS.lock().unwrap().len() }
 
+/// 把候选窗放入光标所在显示器的工作区，保留副屏的负坐标，避开任务栏。
+fn fit_popup(anchor: (i32, i32), size: (i32, i32), work: RECT, margin: i32, above_gap: i32) -> RECT {
+    let span_w = work.right.saturating_sub(work.left).max(1);
+    let span_h = work.bottom.saturating_sub(work.top).max(1);
+    let mx = margin.max(0).min((span_w - 1) / 2);
+    let my = margin.max(0).min((span_h - 1) / 2);
+    let left = work.left.saturating_add(mx);
+    let top = work.top.saturating_add(my);
+    let right = work.right.saturating_sub(mx).max(left.saturating_add(1));
+    let bottom = work.bottom.saturating_sub(my).max(top.saturating_add(1));
+    let width = size.0.max(1).min(right.saturating_sub(left).max(1));
+    let height = size.1.max(1).min(bottom.saturating_sub(top).max(1));
+    let x = anchor.0.clamp(left, right.saturating_sub(width).max(left));
+    let y = if anchor.1.saturating_add(height) > bottom {
+        anchor.1.saturating_sub(height).saturating_sub(above_gap.max(0))
+    } else {
+        anchor.1
+    }.clamp(top, bottom.saturating_sub(height).max(top));
+    RECT { left: x, top: y, right: x.saturating_add(width), bottom: y.saturating_add(height) }
+}
+
 pub unsafe fn show_at(x: i32, y: i32) {
     // 每次显示前都确认窗口还在：宿主进程换了线程、原来的窗口没了就重建一个，
     // 而不是直接 return（那会让候选窗永久消失）
     if !alive() { init(); }
     if !alive() { return; }
     let h = hwnd();
-    let n = ITEMS.lock().unwrap().len().min(crate::settings::max_cands());
+    let n = visible_count(ITEMS.lock().unwrap().len(), crate::settings::max_cands());
     if n == 0 { hide(); return; }
     let dc = GetDC(h);
     let (mut cw, mut ch) = (sc(400), sc(40));
@@ -681,14 +756,18 @@ pub unsafe fn show_at(x: i32, y: i32) {
         ch = lay.height;
         let _ = ReleaseDC(h, dc);
     }
-    // 夹进屏幕：右边超出就左移，下方放不下就翻到光标上方
-    let sw = GetSystemMetrics(SM_CXSCREEN);
-    let sh = GetSystemMetrics(SM_CYSCREEN);
-    let mut px = x;
-    let mut py = y;
-    if px + cw > sw - 4 { px = (sw - cw - 4).max(0); }
-    if py + ch > sh - 4 { py = (y - ch - sc(30)).max(0); }
-    if py < 0 { py = 0; }
+    // SM_CXSCREEN/SM_CYSCREEN 只有主屏尺寸，不能用来夹副屏坐标。
+    let monitor = MonitorFromPoint(POINT { x, y }, MONITOR_DEFAULTTONEAREST);
+    let mut info = MONITORINFO { cbSize: std::mem::size_of::<MONITORINFO>() as u32, ..Default::default() };
+    let work = if GetMonitorInfoW(monitor, &mut info).as_bool() {
+        info.rcWork
+    } else {
+        RECT { left: 0, top: 0, right: GetSystemMetrics(SM_CXSCREEN).max(1), bottom: GetSystemMetrics(SM_CYSCREEN).max(1) }
+    };
+    let bounds = fit_popup((x, y), (cw, ch), work, sc(4), sc(30));
+    let (px, py) = (bounds.left, bounds.top);
+    cw = bounds.right - bounds.left;
+    ch = bounds.bottom - bounds.top;
     let rgn = CreateRoundRectRgn(0, 0, cw + 1, ch + 1, sc(RADIUS) * 2, sc(RADIUS) * 2);
     let _ = SetWindowRgn(h, rgn, TRUE);
     // 只在“从隐藏变显示”的那一次抬高到置顶带的最前面（保证能盖住置顶窗口），
@@ -703,3 +782,158 @@ pub unsafe fn show_at(x: i32, y: i32) {
 }
 
 pub unsafe fn hide() { if alive() { let _ = ShowWindow(hwnd(), SW_HIDE); } }
+
+#[cfg(test)]
+mod placement_tests {
+    use super::*;
+
+    fn bounds(anchor: (i32, i32), size: (i32, i32), work: RECT) -> (i32, i32, i32, i32) {
+        let r = fit_popup(anchor, size, work, 4, 30);
+        (r.left, r.top, r.right, r.bottom)
+    }
+
+    #[test]
+    fn right_monitor_keeps_its_screen_coordinates() {
+        let work = RECT { left: 1920, top: 0, right: 3840, bottom: 1040 };
+        assert_eq!(bounds((2500, 100), (400, 200), work), (2500, 100, 2900, 300));
+        assert_eq!(bounds((3800, 100), (400, 200), work), (3436, 100, 3836, 300));
+    }
+
+    #[test]
+    fn left_monitor_preserves_negative_coordinates() {
+        let work = RECT { left: -1920, top: 0, right: 0, bottom: 1040 };
+        assert_eq!(bounds((-1700, 100), (400, 200), work), (-1700, 100, -1300, 300));
+        assert_eq!(bounds((-100, 100), (400, 200), work), (-404, 100, -4, 300));
+    }
+
+    #[test]
+    fn monitor_above_primary_preserves_negative_y() {
+        let work = RECT { left: 0, top: -1200, right: 1920, bottom: -40 };
+        assert_eq!(bounds((200, -1100), (400, 200), work), (200, -1100, 600, -900));
+    }
+
+    #[test]
+    fn bottom_taskbar_moves_popup_above_caret() {
+        let work = RECT { left: 0, top: 0, right: 1920, bottom: 1040 };
+        assert_eq!(bounds((200, 1000), (400, 250), work), (200, 720, 600, 970));
+    }
+
+    #[test]
+    fn top_and_left_taskbars_define_the_usable_origin() {
+        let work = RECT { left: 80, top: 40, right: 1920, bottom: 1080 };
+        assert_eq!(bounds((5, 5), (400, 200), work), (84, 44, 484, 244));
+    }
+
+    #[test]
+    fn oversized_popup_is_bounded_by_small_work_area() {
+        let work = RECT { left: -800, top: -600, right: 0, bottom: 0 };
+        assert_eq!(bounds((-300, -100), (2000, 1500), work), (-796, -596, -4, -4));
+    }
+
+    #[test]
+    fn tiny_work_area_and_empty_size_do_not_panic() {
+        let work = RECT { left: -10, top: -10, right: -9, bottom: -9 };
+        assert_eq!(bounds((0, 0), (0, 0), work), (-10, -10, -9, -9));
+    }
+
+    #[test]
+    fn horizontal_clicks_select_the_candidate_under_the_pointer() {
+        let widths = [80, 120, 60];
+        for (point, expected) in [((12, 35), 0), ((150, 35), 1), ((260, 35), 2)] {
+            assert_eq!(horizontal_hit(point, &widths, (12, 30), 24, (8, 4)), Some(expected));
+        }
+    }
+
+    #[test]
+    fn horizontal_header_annotation_and_outer_padding_are_not_candidates() {
+        for point in [(12, 29), (12, 54), (7, 35), (292, 35), (-1, 35)] {
+            assert_eq!(horizontal_hit(point, &[80, 120, 60], (12, 30), 24, (8, 4)), None);
+        }
+    }
+
+    #[test]
+    fn horizontal_shared_edge_belongs_to_the_next_candidate() {
+        assert_eq!(horizontal_hit((95, 35), &[80, 120], (12, 30), 24, (8, 4)), Some(0));
+        assert_eq!(horizontal_hit((96, 35), &[80, 120], (12, 30), 24, (8, 4)), Some(1));
+    }
+
+    #[test]
+    fn horizontal_hit_rect_matches_the_painted_candidate_extent() {
+        let r = horizontal_item_rect(1, &[80, 120, 60], (12, 30), 24, (8, 4)).unwrap();
+        assert_eq!((r.left, r.top, r.right, r.bottom), (96, 30, 224, 54));
+        assert!(horizontal_item_rect(3, &[80, 120, 60], (12, 30), 24, (8, 4)).is_none());
+    }
+
+    #[test]
+    fn visible_candidates_respect_page_setting_and_digit_limit() {
+        for (items, limit, expected) in [(0, 9, 0), (9, 3, 3), (2, 7, 2), (12, 20, 9)] {
+            assert_eq!(visible_count(items, limit), expected);
+        }
+    }
+
+    #[test]
+    fn clipped_horizontal_rect_excludes_invisible_candidates() {
+        let client = RECT { left: 0, top: 0, right: 150, bottom: 80 };
+        let second = horizontal_item_rect(1, &[80, 120, 60], (12, 30), 24, (8, 4)).unwrap();
+        let second = clip_rect(second, client).unwrap();
+        assert_eq!((second.left, second.top, second.right, second.bottom), (96, 30, 150, 54));
+        assert!(contains_point(second, (149, 53)));
+        assert!(!contains_point(second, (150, 53)));
+        let third = horizontal_item_rect(2, &[80, 120, 60], (12, 30), 24, (8, 4)).unwrap();
+        assert!(clip_rect(third, client).is_none());
+    }
+
+    #[test]
+    fn short_gloss_target_matches_its_visible_width() {
+        let client = RECT { left: 0, top: 0, right: 132, bottom: 80 };
+        let r = vertical_item_rect(0, 3, true, (100, 30), 24, 18, client).unwrap();
+        assert_eq!((r.left, r.top, r.right, r.bottom), (100, 30, 118, 54));
+        assert!(contains_point(r, (100, 30)));
+        assert!(contains_point(r, (117, 53)));
+        for point in [(99, 40), (118, 40), (110, 54)] {
+            assert!(!contains_point(r, point));
+        }
+    }
+
+    #[test]
+    fn empty_gloss_has_no_russian_target_and_hidden_rows_have_no_target() {
+        let client = RECT { left: 0, top: 0, right: 132, bottom: 200 };
+        assert!(vertical_item_rect(0, 3, true, (100, 30), 24, 0, client).is_none());
+        let chinese = vertical_item_rect(0, 3, false, (100, 30), 24, 0, client).unwrap();
+        assert!(contains_point(chinese, (5, 40))); // 序号列也可选中文。
+        assert!(!contains_point(chinese, (100, 40)));
+        for ru in [false, true] {
+            assert!(vertical_item_rect(3, 3, ru, (100, 30), 24, 18, client).is_none());
+        }
+    }
+
+    #[test]
+    fn clipped_vertical_rectangles_preserve_side_boundary() {
+        let client = RECT { left: 0, top: 0, right: 105, bottom: 43 };
+        let chinese = vertical_item_rect(0, 3, false, (100, 30), 24, 18, client).unwrap();
+        let russian = vertical_item_rect(0, 3, true, (100, 30), 24, 18, client).unwrap();
+        assert_eq!((chinese.left, chinese.top, chinese.right, chinese.bottom), (0, 30, 100, 43));
+        assert_eq!((russian.left, russian.top, russian.right, russian.bottom), (100, 30, 105, 43));
+        assert!(!contains_point(chinese, (100, 40)));
+        assert!(contains_point(russian, (100, 40)));
+        assert!(!contains_point(russian, (105, 40)));
+        assert!(vertical_item_rect(1, 3, false, (100, 30), 24, 18, client).is_none());
+    }
+
+    #[test]
+    fn clipped_popup_footer_cannot_commit_the_candidate_beneath_it() {
+        let client = RECT { left: 0, top: 0, right: 160, bottom: 70 };
+        let candidates = exclude_footer(client, 24);
+        assert_eq!(candidates.bottom, 46);
+        assert!(contains_point(client, (30, 50)));
+        assert!(!contains_point(candidates, (30, 50)));
+        let vertical = vertical_item_rect(0, 3, false, (100, 30), 24, 18, candidates).unwrap();
+        let horizontal = horizontal_item_rect(0, &[80], (12, 30), 24, (8, 4)).unwrap();
+        let horizontal = clip_rect(horizontal, candidates).unwrap();
+        for rect in [vertical, horizontal] {
+            assert_eq!(rect.bottom, 46);
+            assert!(contains_point(rect, (30, 45)));
+            assert!(!contains_point(rect, (30, 46)));
+        }
+    }
+}

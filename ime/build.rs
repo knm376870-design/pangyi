@@ -19,6 +19,9 @@ fn windres_name(target: &str) -> &'static str {
 }
 
 fn find_windres(manifest: &Path, target: &str) -> PathBuf {
+    if let Some(path) = std::env::var_os("PANGYI_WINDRES") {
+        return PathBuf::from(path);
+    }
     let mut cands: Vec<PathBuf> = Vec::new();
     if let Some(root) = manifest.parent() {
         let bin = root.join("tools").join("llvm-mingw").join("bin");
@@ -56,6 +59,9 @@ fn main() {
     let ico = manifest.join("payload").join("pangyi.ico");
     println!("cargo:rerun-if-changed=payload/pangyi.ico");
     println!("cargo:rerun-if-changed=build.rs");
+    println!("cargo:rerun-if-env-changed=PANGYI_WINDRES");
+    println!("cargo:rerun-if-env-changed=TMP");
+    println!("cargo:rerun-if-env-changed=TEMP");
     println!("cargo:rerun-if-changed=payload/pangyi_ime.dll");
     println!("cargo:rerun-if-changed=payload/pangyi_ime-x86.dll");
 
@@ -66,6 +72,9 @@ fn main() {
 
     let target = std::env::var("TARGET").unwrap_or_default();
     let out_dir = PathBuf::from(std::env::var("OUT_DIR").unwrap());
+    // GNU 资源工具无法可靠打开含中文路径的图标；随构建输出暂存后再引用。
+    let resource_ico = out_dir.join("pangyi.ico");
+    std::fs::copy(&ico, &resource_ico).expect("暂存安装程序图标失败");
     let ver = std::env::var("CARGO_PKG_VERSION").unwrap_or_else(|_| "0.0.0".into());
     let (v0, v1, v2) = parse_ver(&ver);
 
@@ -74,7 +83,7 @@ fn main() {
         "#pragma code_page(65001)\n\
          1 ICON \"{ico}\"\n\
          \n\
-         VS_VERSION_INFO VERSIONINFO\n\
+         1 VERSIONINFO\n\
          \x20FILEVERSION {v0},{v1},{v2},0\n\
          \x20PRODUCTVERSION {v0},{v1},{v2},0\n\
          \x20FILEFLAGSMASK 0x3fL\n\
@@ -102,7 +111,7 @@ fn main() {
          \x20       VALUE \"Translation\", 0x804, 1200\n\
          \x20   END\n\
          END\n",
-        ico = quote(&ico)
+        ico = quote(&resource_ico)
     );
 
     let rc_path = out_dir.join("pangyi.rc");
@@ -113,7 +122,7 @@ fn main() {
 
     let obj = out_dir.join("pangyi_res.o");
     let windres = find_windres(&manifest, &target);
-    let status = Command::new(&windres)
+    let output = Command::new(&windres)
         .arg("--codepage=65001")
         .arg("-O")
         .arg("coff")
@@ -121,19 +130,21 @@ fn main() {
         .arg(&rc_path)
         .arg("-o")
         .arg(&obj)
-        .status();
+        .output();
 
-    match status {
-        Ok(s) if s.success() && obj.is_file() => {
+    match output {
+        Ok(output) if output.status.success() && obj.is_file() => {
             // 只贴到 setup 这个 bin 上（桌面上的「旁译.exe」就是它），DLL 不带资源
             println!("cargo:rustc-link-arg-bin=setup={}", quote(&obj));
         }
-        other => {
+        Ok(output) => {
             println!(
-                "cargo:warning=windres 资源编译失败({:?})，exe 将使用默认图标",
-                other
+                "cargo:warning=windres 资源编译失败({}): {}",
+                output.status,
+                String::from_utf8_lossy(&output.stderr).replace('\n', " ").trim()
             );
         }
+        Err(error) => println!("cargo:warning=无法运行 windres: {error}"),
     }
 }
 
