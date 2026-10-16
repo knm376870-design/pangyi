@@ -18,7 +18,6 @@ pub struct Item {
 }
 
 static ITEMS: Mutex<Vec<Item>> = Mutex::new(Vec::new());
-static PREEDIT: Mutex<String> = Mutex::new(String::new());
 static SENTENCE: Mutex<Option<String>> = Mutex::new(None);
 static SEL: AtomicUsize = AtomicUsize::new(0);
 /// 蓝条选中哪一侧：false = 中文（默认），true = 俄语侧 —— 上屏只出俄语，
@@ -245,17 +244,10 @@ unsafe fn compute_layout(dc: HDC, items: &[Item]) -> Layout {
     let anno_w = ru_w;
     let anno_h = if anno_w > 0 { measure(dc, f_anno, "x").1 + sc(ROW_PAD) } else { 0 };
 
-    let pre = PREEDIT.lock().unwrap().clone();
     let sent = SENTENCE.lock().unwrap().clone();
-    let has_top = !pre.is_empty() || sent.is_some();
-    let top_w = if !has_top { 0 } else {
-        let mut w = if pre.is_empty() { 0 } else { measure(dc, f_anno, &pre).0 };
-        if let Some(s) = sent.as_ref() {
-            w += gap + measure(dc, f_anno, "☁").0 + gap / 2 + measure(dc, f_anno, s).0;
-        }
-        w
-    };
-    let pre_h = if !has_top { 0 } else { measure(dc, f_anno, "x").1 + sc(ROW_PAD) * 2 };
+    let top_w = sent.as_ref().map_or(0, |s|
+        measure(dc, f_anno, "☁").0 + gap / 2 + measure(dc, f_anno, s).0);
+    let top_h = if sent.is_some() { measure(dc, f_anno, "x").1 + sc(ROW_PAD) * 2 } else { 0 };
 
     // 右下角页码「▲▼ 2/59」——只有一页时不出，老尺寸完全不变
     let pages = PAGE_TOT.load(Ordering::Relaxed);
@@ -273,13 +265,13 @@ unsafe fn compute_layout(dc: HDC, items: &[Item]) -> Layout {
             if i > 0 { w += gap; }
             w += iw;
         }
-        let h = pad * 2 + pre_h + row_h + if anno_h > 0 { anno_h } else { 0 } + footer_h;
+        let h = pad * 2 + top_h + row_h + if anno_h > 0 { anno_h } else { 0 } + footer_h;
         (w.max(pad * 2 + anno_w).max(pad * 2 + top_w).max(pad * 2 + footer_w).max(sc(120)), h)
     } else {
         let w = (pad * 2 + index_w + gap + word_w + gap + ru_w)
             .max(pad * 2 + top_w)
             .max(pad * 2 + footer_w);
-        let h = pad * 2 + pre_h + (nth as i32) * row_h + footer_h;
+        let h = pad * 2 + top_h + (nth as i32) * row_h + footer_h;
         (w, h)
     };
 
@@ -339,30 +331,20 @@ unsafe extern "system" fn proc_cand(h: HWND, msg: u32, w: WPARAM, l: LPARAM) -> 
             let gap = sc(GAP);
             let mut y = pad;
 
-            // 顶行：左边是正在输入的拼音，右边是「☁ 补全」（照青简的整句补全位）
-            let pre = PREEDIT.lock().unwrap().clone();
+            // 顶行只显示中文补全或整句翻译提示，不显示拼音。
             let sent = SENTENCE.lock().unwrap().clone();
-            if !pre.is_empty() || sent.is_some() {
+            if let Some(s) = sent.as_ref() {
                 let (_, ph) = measure(dc, f_anno, "x");
                 let ty = y + sc(ROW_PAD);
                 SelectObject(dc, f_anno);
                 let mut tx = pad;
-                if !pre.is_empty() {
-                    SetTextColor(dc, p.gloss);
-                    let s: Vec<u16> = pre.encode_utf16().collect();
-                    TextOutW(dc, tx, ty, &s);
-                    tx += measure(dc, f_anno, &pre).0;
-                }
-                if let Some(s) = sent.as_ref() {
-                    tx += gap;
-                    SetTextColor(dc, p.cloud);
-                    let c: Vec<u16> = "☁".encode_utf16().collect();
-                    TextOutW(dc, tx, ty, &c);
-                    tx += measure(dc, f_anno, "☁").0 + gap / 2;
-                    SetTextColor(dc, p.gloss);
-                    let g: Vec<u16> = s.encode_utf16().collect();
-                    TextOutW(dc, tx, ty, &g);
-                }
+                SetTextColor(dc, p.cloud);
+                let c: Vec<u16> = "☁".encode_utf16().collect();
+                TextOutW(dc, tx, ty, &c);
+                tx += measure(dc, f_anno, "☁").0 + gap / 2;
+                SetTextColor(dc, p.gloss);
+                let g: Vec<u16> = s.encode_utf16().collect();
+                TextOutW(dc, tx, ty, &g);
                 y += ph + sc(ROW_PAD) * 2;
             }
 
@@ -534,8 +516,6 @@ pub unsafe fn page_info() -> (usize, usize) {
     (PAGE_CUR.load(Ordering::Relaxed), PAGE_TOT.load(Ordering::Relaxed))
 }
 
-pub unsafe fn set_preedit(s: &str) { *PREEDIT.lock().unwrap() = s.to_string(); }
-
 pub unsafe fn set_sentence(s: Option<String>) { *SENTENCE.lock().unwrap() = s; }
 
 /// 蓝条现在选中哪一侧（true = 俄语侧）。提交路径据此决定上屏中文还是俄语。
@@ -603,7 +583,7 @@ fn vertical_item_rect(index: usize, count: usize, russian_side: bool, origin: (i
 }
 
 /// 竖排几何（和 WM_PAINT 同一套算法）：首行 y、行高、词列 x、俄语列 x。
-/// 顶行（拼音 / ☁ 提示）占多高就先加多高，这样点击和画的位置对得上。
+/// 顶行的 ☁ 提示占多高就先加多高，这样点击和画的位置对得上。
 unsafe fn v_geom(dc: HDC) -> Option<(i32, i32, i32, i32)> {
     let items = ITEMS.lock().unwrap();
     if items.is_empty() { return None; }
@@ -612,9 +592,8 @@ unsafe fn v_geom(dc: HDC) -> Option<(i32, i32, i32, i32)> {
     let pad = sc(PAD);
     let gap = sc(GAP);
     let mut y = pad;
-    let pre = PREEDIT.lock().unwrap().clone();
     let sent = SENTENCE.lock().unwrap().clone();
-    if !pre.is_empty() || sent.is_some() {
+    if sent.is_some() {
         let f_anno = font(ANNO_PX);
         let (_, ph) = measure(dc, f_anno, "x");
         y += ph + sc(ROW_PAD) * 2;

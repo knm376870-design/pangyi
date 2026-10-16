@@ -365,7 +365,6 @@ impl TextService {
             }
             return;
         }
-        unsafe { cand::set_preedit(&key); }
         set_all_cands(dict::lookup(&key));
         sentence_hint(&key);
         // 候选窗重画：set_items 只改内存，不触发 WM_PAINT。
@@ -570,7 +569,6 @@ impl ITfCompositionSink_Impl for TextService {
         *PENDING_CAND.lock().unwrap() = None;
         SENT.lock().unwrap().clear();
         unsafe {
-            cand::set_preedit("");
             cand::set_sentence(None);
             cand::set_items(Vec::new());
             cand::set_page(0, 1);
@@ -723,7 +721,6 @@ impl ITfKeyEventSink_Impl for TextService {
             if crate::settings::english() { return Ok(BOOL(0)); }
             self.buf.borrow_mut().push(ch.to_ascii_lowercase());
             let key = self.buf.borrow().clone();
-            unsafe { cand::set_preedit(&key); }
             set_all_cands(dict::lookup(&key));
             sentence_hint(&key);
             if let Some(ctx) = pic {

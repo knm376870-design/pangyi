@@ -172,7 +172,6 @@ fn host_termination_clears_preedit_and_candidates() {
     PAGE.store(3, Ordering::Relaxed);
     *PENDING_CAND.lock().unwrap() = Some((42, 100));
     unsafe {
-        cand::set_preedit("ni");
         cand::set_items(vec![cand::Item {
             word: "你".into(), ru: "ты".into(), fresh: false,
         }]);
