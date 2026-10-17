@@ -1,9 +1,10 @@
-//! 候选窗 —— v4.7.0 换成设置面板同款设计语言：圆角卡片 + 青色选中条 +
-//! 悬停高亮 + 页码药丸（配色照 settings.rs 的 Palette）。
+//! 候选窗 —— v4.7.0 换成设置面板同款设计语言：圆角卡片 + 强调色选中条 +
+//! 悬停高亮 + 页码药丸（配色照 settings.rs 的 Palette/ACCENTS）。
 //! 排版仍是青简同款：竖排为「序号 中文 俄语」三列对齐，
 //! 横排为「序号 中文」一行排开、当前项的俄语另起一行。
 //! v4.8.0：去掉拼音列（拼音只在顶行输入串里显示，候选词旁不再展示）。
 //! v4.9.0：俄语义项选择 —— 多义项词在俄语侧按 → 循环挑义项 / 鼠标点义项上屏。
+//! v4.10.0：多配色 —— 选中条/☁提示/页码药丸随 settings.txt 的 accent（0..4）走。
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicIsize, AtomicUsize, Ordering};
 use windows::core::{PCWSTR, w};
@@ -63,7 +64,8 @@ pub unsafe fn alive() -> bool {
     h.0 != 0 && IsWindow(h).as_bool()
 }
 
-// ---- v4.7.0 配色：设置面板同款设计语言（与 settings.rs Palette 同名字段同值）----
+// ---- v4.7.0 配色：设置面板同款设计语言（与 settings.rs Palette 同名字段同值）。
+// v4.10.0 强调位（bar_fill/bar_text/cloud）改从 settings::ACCENTS 取，随配色走。----
 struct Palette {
     text: COLORREF,     // 主文字（词）
     faint: COLORREF,    // 次要文字（拼音/序号/页码/未选中俄语）
@@ -80,8 +82,8 @@ const fn rgb(r: u8, g: u8, b: u8) -> COLORREF {
     COLORREF((r as u32) | ((g as u32) << 8) | ((b as u32) << 16))
 }
 
-fn palette(dark: bool) -> Palette {
-    if dark {
+fn palette(accent: i32, dark: bool) -> Palette {
+    let mut p = if dark {
         Palette {
             text: rgb(0xf5, 0xf5, 0xf7),
             faint: rgb(0xae, 0xae, 0xb2),
@@ -105,7 +107,13 @@ fn palette(dark: bool) -> Palette {
             bar_text: rgb(0x17, 0x60, 0x6c),
             hover: rgb(0xe9, 0xeb, 0xee),
         }
-    }
+    };
+    // v4.10.0 配色：只覆写强调位（选中条 + ☁ 提示），基板全配色共用
+    let a = &crate::settings::ACCENTS[accent as usize][dark as usize];
+    p.bar_fill = a.fill;
+    p.bar_text = a.text;
+    p.cloud = a.strong;
+    p
 }
 
 pub fn is_dark() -> bool {
@@ -473,7 +481,10 @@ unsafe extern "system" fn proc_cand(h: HWND, msg: u32, w: WPARAM, l: LPARAM) -> 
         WM_PAINT => {
             let mut ps = PAINTSTRUCT::default();
             let dc = BeginPaint(h, &mut ps);
-            let p = palette(crate::settings::dark(DARK.load(Ordering::Relaxed)));
+            let p = palette(
+                crate::settings::accent(),
+                crate::settings::dark(DARK.load(Ordering::Relaxed)),
+            );
             let mut rc = RECT::default();
             let _ = GetClientRect(h, &mut rc);
             // 窗口本体 = 一张圆角卡片：先铺卡片底色，最后描一圈 1px 边框
@@ -627,17 +638,18 @@ unsafe extern "system" fn proc_cand(h: HWND, msg: u32, w: WPARAM, l: LPARAM) -> 
                 let s = format!("▲▼ {}/{}", PAGE_CUR.load(Ordering::Relaxed) + 1, pages);
                 let (_, hh) = measure(dc, f_anno, "x");
                 let wpx = measure(dc, f_anno, &s).0;
-                // 页码装进一个小药丸（灰底 + 细描边），文字位置和老版完全一样
+                // 页码装进一个小药丸（配色底 + 细描边），文字位置和老版完全一样
                 let pill = RECT {
                     left: rc.right - pad - wpx - sc(PAGE_PAD_X) * 2,
                     top: rc.bottom - pad - hh - sc(ROW_PAD) / 2 - sc(PAGE_PAD_Y),
                     right: rc.right - pad,
                     bottom: rc.bottom - pad - sc(ROW_PAD) / 2 + sc(PAGE_PAD_Y),
                 };
-                fill_round(dc, &pill, sc(BAR_RADIUS), p.hover);
+                // v4.10.0：页码药丸随配色（选中条同款底色 + 条上字色）
+                fill_round(dc, &pill, sc(BAR_RADIUS), p.bar_fill);
                 frame_round(dc, &pill, sc(BAR_RADIUS), p.border);
                 SelectObject(dc, f_anno);
-                SetTextColor(dc, p.faint);
+                SetTextColor(dc, p.bar_text);
                 let t: Vec<u16> = s.encode_utf16().collect();
                 TextOutW(dc, pill.left + sc(PAGE_PAD_X), pill.top + sc(PAGE_PAD_Y), &t);
             }

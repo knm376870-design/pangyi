@@ -4,6 +4,7 @@
 //! 用 SendMessageW 同步投 WM_LBUTTONDOWN 到 layout() 算出的药丸矩形中心，
 //! 断言 settings.txt 里对应配置真的变了 —— 专防「画的是一块、点的是另一块」
 //! （v4.5.0 的教训）和「点药丸把窗口点关了」这类回归。
+//! v4.10.0 加「配色」行后补 T6（点「粉」→ accent=1，点回「青」收尾）。
 //!
 //! 用例：
 //!   T1 点「5」        -> max=5
@@ -11,7 +12,8 @@
 //!   T3 点「深色」      -> theme=2（顺带跑一遍深色重绘路径）
 //!   T4 点「整句」      -> trmode=2
 //!   T5 点「标点 关」    -> cnpunct=0
-//!   T6 点「关闭」      -> 窗口真关（IsWindow=false）
+//!   T6 点「粉」       -> accent=1（v4.10.0 配色行；点完点回「青」收尾）
+//!   T7 点「关闭」      -> 窗口真关（IsWindow=false）
 //!
 //! 用法：settings_e2e.exe [新DLL路径]（LOCALAPPDATA 重定向由启动器环境做）
 #![allow(non_snake_case)]
@@ -70,7 +72,7 @@ fn main() {
         let base = std::env::var("LOCALAPPDATA").unwrap_or_default();
         let dir = format!("{base}\\Pangyi");
         let _ = std::fs::create_dir_all(&dir);
-        let cfg = "max=9\nscale=100\nlayout=v\ntheme=0\nenglish=0\ndebug=0\ncnpunct=1\ntrmode=0\n";
+        let cfg = "max=9\nscale=100\nlayout=v\ntheme=0\nenglish=0\ndebug=0\ncnpunct=1\ntrmode=0\naccent=0\n";
         let _ = std::fs::write(format!("{dir}\\settings.txt"), cfg);
 
         let dll = std::env::args().nth(1).unwrap_or_default();
@@ -151,10 +153,16 @@ fn main() {
         click!(14);
         check("T5", "cnpunct=0");
 
-        logline("=== T6 点「关闭」: 窗口真关 ===");
+        logline("=== T6 点「粉」: 配色=粉（accent=1）===");
+        click!(19);
+        check("T6", "accent=1");
+        logline("  点回「青」收尾（accent=0，老用户默认色）");
+        click!(18);
+
+        logline("=== T7 点「关闭」: 窗口真关 ===");
         click!(0);
         let gone = IsWindow(hwnd).as_bool() == false;
-        logline(&format!("T6: IsWindow={}  {} ", !gone, if gone { "✓" } else { "✗ 窗口还活着!" }));
+        logline(&format!("T7: IsWindow={}  {} ", !gone, if gone { "✓" } else { "✗ 窗口还活着!" }));
         if gone { PASS += 1; } else { FAIL += 1; }
 
         logline(&format!("=== 完：{PASS} 过 / {FAIL} 不过 ==="));

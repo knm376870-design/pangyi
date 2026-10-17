@@ -352,12 +352,13 @@ impl TextService {
         }
         // 先读设置：log() 要靠 settings::debug() 决定要不要写，顺序不能反
         unsafe { settings::load(); }
-        log("Activate v4.9.0");
+        log("Activate v4.10.0");
         log(&format!(
-            "cnpunct={} english={} trmode={}",
+            "cnpunct={} english={} trmode={} accent={}",
             crate::settings::cnpunct(),
             crate::settings::english(),
-            crate::settings::trmode()
+            crate::settings::trmode(),
+            crate::settings::accent()
         ));
 
         // 后台预热词典索引，避免第一次打字时卡一下（只跑一次）
