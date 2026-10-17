@@ -13,9 +13,13 @@
 //!   T5  nihao+→+。       -> привет。（标点跟俄语走）
 //!   T6  wo+空格          -> 我（新一组候选自动回到中文侧）
 //!   T7  ni+[鼠标点0行中文] -> 你（点中文词上屏）
-//!   T8  ni+[鼠标点0行俄语] -> ты, вы（点俄语上屏）
+//!   T8  ni+[鼠标点0行义项0] -> ты, вы（点俄语义项上屏）
 //!   T9  ni+[鼠标点1行中文] -> 泥（点别的行也准）
 //!   T10 ←→(无拼音)+ni+空格 -> 你（无拼音时方向键直通给应用）
+//!   T11 nihao+→+→+空格    -> здравствуй（俄语侧→循环到义项2）
+//!   T12 nihao+→+[点0行义项3] -> добрый день（鼠标精确点义项）
+//!   T13 nihao+→+→+←+空格  -> 你好（←回到中文侧）
+//!   T14 nihao+→×5+空格    -> привет（义项循环回绕）
 //!
 //! 鼠标点击用 PostMessage 直接投 WM_LBUTTONDOWN 到候选窗（同进程，走和
 //! 真鼠标完全一样的窗口过程），点击坐标用 DLL 的 cand_hit_rect_export 算。
@@ -252,6 +256,45 @@ unsafe fn click_cand(row: u32, ru: bool) -> bool {
     true
 }
 
+/// 往候选窗投一个点击：第 row 行第 sense 个俄语义项的跨度中心（v4.9.0）。
+/// 坐标由 DLL 导出的 cand_sense_rect_export 按窗口自己的排版算，不会点歪。
+unsafe fn click_sense(row: u32, sense: u32) -> bool {
+    let Some(dll) = KEEP_DLL else {
+        logline("没有 DLL 句柄，无法点击义项");
+        return false;
+    };
+    type HwndFn = unsafe extern "system" fn() -> isize;
+    type RectFn = unsafe extern "system" fn(u32, u32, *mut i32) -> u32;
+    let Some(fh) = GetProcAddress(dll, s!("cand_hwnd_export")) else {
+        logline("DLL 没有导出 cand_hwnd_export");
+        return false;
+    };
+    let Some(fr) = GetProcAddress(dll, s!("cand_sense_rect_export")) else {
+        logline("DLL 没有导出 cand_sense_rect_export");
+        return false;
+    };
+    let get_hwnd: HwndFn = std::mem::transmute(fh);
+    let get_rect: RectFn = std::mem::transmute(fr);
+    let h = HWND(get_hwnd());
+    if h.0 == 0 {
+        logline("候选窗句柄是 0（还没建窗？）");
+        return false;
+    }
+    let mut rect = [0i32; 4];
+    if get_rect(row, sense, rect.as_mut_ptr()) == 0 {
+        logline(&format!("cand_sense_rect_export(row={row}, sense={sense}) 失败"));
+        return false;
+    }
+    let (l, t, r, b) = (rect[0], rect[1], rect[2], rect[3]);
+    let x = (l + r) / 2;
+    let y = (t + b) / 2;
+    let lp = ((y as isize) << 16) | (x as isize & 0xFFFF);
+    logline(&format!("点击 候选窗 row={row} 义项{sense} @({x},{y})"));
+    // wParam = MK_LBUTTON (0x0001)
+    let _ = PostMessageW(h, WM_LBUTTONDOWN, WPARAM(1), LPARAM(lp));
+    true
+}
+
 unsafe fn tick(h: HWND) {
     if QI < QUEUE.len() {
         if QI == 0 {
@@ -347,7 +390,9 @@ unsafe fn tick(h: HWND) {
             PHASE = 9;
         }
         9 => {
-            click_cand(0, true);
+            // v4.9.0 起你（ты, вы | твой, ваш）是 2 义项：点义项 0 精确矩形，
+            // 不再赌俄语侧 60px 中心恰好落在义项 0 内（余量只有几像素）
+            click_sense(0, 0);
             PHASE = 10;
         }
         10 => {
@@ -372,6 +417,42 @@ unsafe fn tick(h: HWND) {
         }
         13 => {
             let _ = result("T10", "「你」", text_of() == "你");
+            clear_edit();
+            logline("=== T11 俄语侧→循环义项: nihao+→+→+空格 -> здравствуй ===");
+            QUEUE = vec![0x4E, 0x49, 0x48, 0x41, 0x4F, 0x27, 0x27, 0x20];
+            QI = 0;
+            PHASE = 14;
+        }
+        14 => {
+            let _ = result("T11", "「здравствуй」", text_of() == "здравствуй");
+            clear_edit();
+            logline("=== T12 鼠标精确点义项: nihao+→+点0行义项3 -> добрый день ===");
+            QUEUE = vec![0x4E, 0x49, 0x48, 0x41, 0x4F, 0x27];
+            QI = 0;
+            PHASE = 15;
+        }
+        15 => {
+            click_sense(0, 2);
+            PHASE = 16;
+        }
+        16 => {
+            let _ = result("T12", "「добрый день」", text_of() == "добрый день");
+            clear_edit();
+            logline("=== T13 ←回到中文侧: nihao+→+→+←+空格 -> 你好 ===");
+            QUEUE = vec![0x4E, 0x49, 0x48, 0x41, 0x4F, 0x27, 0x27, 0x25, 0x20];
+            QI = 0;
+            PHASE = 17;
+        }
+        17 => {
+            let _ = result("T13", "「你好」", text_of() == "你好");
+            clear_edit();
+            logline("=== T14 义项循环回绕: nihao+→×5+空格 -> привет ===");
+            QUEUE = vec![0x4E, 0x49, 0x48, 0x41, 0x4F, 0x27, 0x27, 0x27, 0x27, 0x27, 0x20];
+            QI = 0;
+            PHASE = 18;
+        }
+        18 => {
+            let _ = result("T14", "「привет」", text_of() == "привет");
             logline("=== 进程内 pangyi 模块（应只有 target\\release 的新 DLL）===");
             log_modules();
             logline("=== 完 ===");

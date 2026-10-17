@@ -3,6 +3,7 @@
 //! 排版仍是青简同款：竖排为「序号 中文 俄语」三列对齐，
 //! 横排为「序号 中文」一行排开、当前项的俄语另起一行。
 //! v4.8.0：去掉拼音列（拼音只在顶行输入串里显示，候选词旁不再展示）。
+//! v4.9.0：俄语义项选择 —— 多义项词在俄语侧按 → 循环挑义项 / 鼠标点义项上屏。
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicIsize, AtomicUsize, Ordering};
 use windows::core::{PCWSTR, w};
@@ -27,6 +28,9 @@ static SEL: AtomicUsize = AtomicUsize::new(0);
 /// 青条选中哪一侧：false = 中文（默认），true = 俄语侧 —— 上屏只出俄语，
 /// 中文不输入。←/→ 切换，鼠标点俄语列同样进入；每次换新候选组自动回中文侧。
 static RU_SEL: AtomicBool = AtomicBool::new(false);
+/// 俄语侧选中第几个义项（0 起）。只在 ru_sel 且该行义项 ≥2 时有意义；
+/// 换候选组 / 换行 / 切侧都归零，→ 循环、鼠标点哪个义项就落在哪个（v4.9.0）。
+static RU_SENSE: AtomicUsize = AtomicUsize::new(0);
 /// 鼠标悬停哪一行（-1 = 没有）。只影响悬停高亮和手型光标，不碰选中/提交。
 static HOT_ROW: AtomicI32 = AtomicI32::new(-1);
 /// 悬停行落在哪一侧（和 RU_SEL 同一套 x_ru 判定，画悬停条用）
@@ -228,6 +232,97 @@ fn truncate(s: &str, max_chars: usize) -> String {
 
 fn gloss_of(it: &Item) -> String {
     truncate(&it.ru.replace('|', " · "), MAX_RU_CHARS)
+}
+
+// ---- v4.9.0 俄语义项选择（多义项挑一个上屏）----
+
+/// 义项列表（trim + 去空）。注意与显示串是两回事：显示串由 gloss_of 截断，
+/// 提交/计数一律用这里的完整义项。
+fn senses_of(it: &Item) -> Vec<&str> {
+    it.ru.split('|').map(str::trim).filter(|s| !s.is_empty()).collect()
+}
+
+/// 显示串 gloss_of(it) 的精确切分：(片段文本, 相对俄语列左缘的偏移, 右缘)。
+/// 对显示串本身按 " · " 切分 —— 与 WM_PAINT 画的是同一字符串、同一字体，
+/// 点画一致由构造保证（不是从原始 ru 重算，那样要复刻 truncate 的截断语义）。
+/// 末段右缘 = 显示串总宽（截断截到一半的义项也能点到最后）。
+fn sense_spans(dc: HDC, f: HFONT, it: &Item) -> Vec<(String, i32, i32)> {
+    let d = gloss_of(it);
+    let sep_w = measure(dc, f, " · ").0;
+    let mut x = 0i32;
+    let mut out = Vec::new();
+    for p in d.split(" · ") {
+        let w = measure(dc, f, p).0;
+        out.push((p.to_string(), x, x + w));
+        x += w + sep_w;
+    }
+    out
+}
+
+/// 客户区 x 落在第 i 行俄语列的哪个义项：段内取该段；段间空隙取近侧；
+/// 两端夹紧（首段前取 0、末段后取最后一段）。义项数 ≤1 时恒 0。
+/// 注意锁序：ITEMS 锁必须释放后才调 v_geom（它内部也要锁 ITEMS，Mutex 不可重入）。
+unsafe fn sense_at(i: usize, client_x: i32) -> usize {
+    let h = hwnd();
+    let dc = GetDC(h);
+    if dc.0 == 0 { return 0; }
+    let g = ITEMS.lock().unwrap();
+    let n = g.get(i).map(|it| senses_of(it).len()).unwrap_or(0);
+    if n <= 1 {
+        drop(g);
+        let _ = ReleaseDC(h, dc);
+        return 0;
+    }
+    let f = font(ANNO_PX);
+    let spans = sense_spans(dc, f, &g[i]);
+    drop(g);
+    let x_ru = v_geom(dc).map(|(_, _, _, xr, _)| xr).unwrap_or(0);
+    let _ = ReleaseDC(h, dc);
+    let x = client_x - x_ru;
+    if spans.is_empty() { return 0; }
+    if x < spans[0].2 { return 0; }
+    for k in 1..spans.len() {
+        let l = spans[k].1;
+        let r = spans[k].2;
+        if x < l {
+            // 落在分隔符空隙：离前段右缘近取前段，离后段左缘近取后段
+            let pr = spans[k - 1].2;
+            return if x * 2 < pr + l { k - 1 } else { k };
+        }
+        if x < r { return k; }
+    }
+    (spans.len() - 1).min(n - 1)
+}
+
+/// 当前高亮的是第几个义项（0 起；无义项/中文侧无意义时为 0）。
+pub fn ru_sense() -> usize {
+    RU_SENSE.load(Ordering::Relaxed)
+}
+
+/// → 在俄语侧时循环到下一个义项（回绕）；义项 ≤1 时无操作。只自增不切侧。
+pub unsafe fn ru_sense_next() {
+    let n = {
+        let g = ITEMS.lock().unwrap();
+        let sel = SEL.load(Ordering::Relaxed);
+        g.get(sel).map(|it| senses_of(it).len()).unwrap_or(0)
+    };
+    if n <= 1 { return; }
+    RU_SENSE.store((RU_SENSE.load(Ordering::Relaxed) + 1) % n, Ordering::Relaxed);
+    if alive() { let _ = InvalidateRect(hwnd(), None, TRUE); }
+}
+
+/// pick_text 用：word 上屏时的俄语串。规则：
+/// 在 ITEMS 找到该词且它是高亮行（按词比对，防页面里同词重复候选）且
+/// 俄语侧选中 → 当前义项；找到但非高亮行（数字键选别的行）→ 义项 0；
+/// 找不到 → None（调用方回退 dict::ru_of）；无义项 → None（回退词本身）。
+pub unsafe fn ru_commit_for(word: &str) -> Option<String> {
+    let g = ITEMS.lock().unwrap();
+    let it = g.iter().find(|it| it.word == word)?;
+    let senses = senses_of(it);
+    if senses.is_empty() { return None; }
+    let is_sel = g.get(SEL.load(Ordering::Relaxed)).map(|x| x.word == word).unwrap_or(false);
+    let k = if is_sel && ru_sel() { RU_SENSE.load(Ordering::Relaxed) % senses.len() } else { 0 };
+    Some(senses[k].to_string())
 }
 
 fn measure(dc: HDC, f: HFONT, s: &str) -> (i32, i32) {
@@ -503,9 +598,25 @@ unsafe extern "system" fn proc_cand(h: HWND, msg: u32, w: WPARAM, l: LPARAM) -> 
 
                     // 压着青条的列一律用条上文字色（生词橙在浅色青底上对比太弱）；
                     // 非选中行的生词照旧橙色
-                    SetTextColor(dc, if on_bar_ru { p.bar_text } else if it.fresh { p.fresh } else { p.faint });
                     let gloss: Vec<u16> = gloss_of(it).encode_utf16().collect();
-                    TextOutW(dc, x_ru, ty + small_anno, &gloss);
+                    // v4.9.0 多义项 + 俄语侧选中：整串 faint 打底、当前义项
+                    // bar_text 覆盖（覆盖段与整串同位置同文本，点画一致）；
+                    // 中文侧选中或义项 ≤1 时照旧整串一条
+                    if ru && i == sel && senses_of(it).len() >= 2 {
+                        let spans = sense_spans(dc, f_anno, it);
+                        SetTextColor(dc, p.faint);
+                        TextOutW(dc, x_ru, ty + small_anno, &gloss);
+                        // 首义项超长截断成 1 段时 % spans.len() 防覆盖越界
+                        let k = RU_SENSE.load(Ordering::Relaxed) % spans.len().max(1);
+                        if let Some((piece, l, _)) = spans.get(k) {
+                            SetTextColor(dc, p.bar_text);
+                            let g: Vec<u16> = piece.encode_utf16().collect();
+                            TextOutW(dc, x_ru + l, ty + small_anno, &g);
+                        }
+                    } else {
+                        SetTextColor(dc, if on_bar_ru { p.bar_text } else if it.fresh { p.fresh } else { p.faint });
+                        TextOutW(dc, x_ru, ty + small_anno, &gloss);
+                    }
                 }
             }
 
@@ -609,6 +720,11 @@ unsafe extern "system" fn proc_cand(h: HWND, msg: u32, w: WPARAM, l: LPARAM) -> 
             if let Some((i, ru)) = hit_test(x, y) {
                 select(i);
                 set_ru_sel(ru && !crate::settings::horizontal());
+                // 点俄语列时记下点中的义项（v4.9.0）：必须先 set_ru_sel 再 store，
+                // 顺序承重 —— set_ru_sel 内部会归零，先 store 会被抹掉
+                if ru && !crate::settings::horizontal() {
+                    RU_SENSE.store(sense_at(i, x), Ordering::Relaxed);
+                }
                 click_commit();
             }
             LRESULT(0)
@@ -662,6 +778,7 @@ pub unsafe fn set_items(items: Vec<Item>) {
     SEL.store(0, Ordering::Relaxed);
     // 新一组候选重新从中文侧开始（上次 ←→ 选中的俄语侧不再沿用）
     RU_SEL.store(false, Ordering::Relaxed);
+    RU_SENSE.store(0, Ordering::Relaxed);
     // 悬停状态跟着清掉（行数可能变了，旧行号没意义）
     HOT_ROW.store(-1, Ordering::Relaxed);
     HOT_RU.store(false, Ordering::Relaxed);
@@ -692,8 +809,11 @@ pub fn ru_sel() -> bool {
 }
 
 /// ←/→ 切换选中侧：青条从整行挪到俄语那一列（或挪回来），触发重画。
+/// 切侧同时把义项选择归零（v4.9.0：点选路径会在调完本函数后再存点击到的义项，
+/// 顺序承重 —— RU_SENSE 的 store 必须放在 set_ru_sel 之后，否则被这里抹掉）。
 pub unsafe fn set_ru_sel(v: bool) {
     RU_SEL.store(v, Ordering::Relaxed);
+    RU_SENSE.store(0, Ordering::Relaxed);
     if alive() { let _ = InvalidateRect(hwnd(), None, TRUE); }
 }
 
@@ -812,6 +932,38 @@ pub unsafe extern "system" fn cand_hit_rect_export(row: u32, ru: u32, out: *mut 
     }
 }
 
+/// 第 row 行第 sense 个义项的点击矩形写进 out[4] = l,t,r,b（客户区坐标）。
+/// v4.9.0 台架精确点击义项用（和 WM_PAINT/sense_at 同一套 sense_spans）。
+/// sense 超出显示段数返回 0。
+#[no_mangle]
+pub unsafe extern "system" fn cand_sense_rect_export(row: u32, sense: u32, out: *mut i32) -> u32 {
+    if out.is_null() { return 0; }
+    let h = hwnd();
+    let dc = GetDC(h);
+    if dc.0 == 0 { return 0; }
+    let r = v_geom(dc);
+    let (y0, row_h, _xw, x_ru, _lay) = match r {
+        Some(v) => v,
+        None => { let _ = ReleaseDC(h, dc); return 0; }
+    };
+    let g = ITEMS.lock().unwrap();
+    let Some(it) = g.get(row as usize) else {
+        drop(g);
+        let _ = ReleaseDC(h, dc);
+        return 0;
+    };
+    let spans = sense_spans(dc, font(ANNO_PX), it);
+    drop(g);
+    let _ = ReleaseDC(h, dc);
+    let Some((_, l, rr)) = spans.get(sense as usize) else { return 0 };
+    let top = y0 + row as i32 * row_h;
+    *out.add(0) = x_ru + l;
+    *out.add(1) = top;
+    *out.add(2) = x_ru + rr;
+    *out.add(3) = top + row_h;
+    1
+}
+
 /// 横排第 row 条目的悬停跨度 (l, r) 写进 out[2]（竖排没有跨度，返回 0）。
 /// 台架横排悬停模拟用 —— hit_rect 是竖排几何，横排条目没有对应矩形，只能走跨度。
 #[no_mangle]
@@ -837,6 +989,9 @@ pub unsafe fn select(i: usize) {
     let n = ITEMS.lock().unwrap().len();
     if n > 0 {
         SEL.store(i.min(n - 1), Ordering::Relaxed);
+        // 换行后俄语侧保持（↑↓ 不动侧是既有行为），义项归零（v4.9.0）；
+        // 点击路径随后会存点击到的义项，覆盖这里
+        RU_SENSE.store(0, Ordering::Relaxed);
         if alive() { let _ = InvalidateRect(hwnd(), None, TRUE); }
     }
 }

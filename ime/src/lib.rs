@@ -278,11 +278,14 @@ impl TextService {
         }
     }
 
-    /// ←/→ 选中「俄语侧」时，上屏内容换成该词的俄语第一释义；
+    /// ←/→ 选中「俄语侧」时，上屏内容换成该词的俄语释义：v4.9.0 起多个义项
+    /// 按候选窗里高亮的那个义项上屏（→ 循环 / 鼠标点哪个义项出哪个）；
     /// 没译文的词照旧上中文（它的俄语列本来就是空的）。
     fn pick_text(word: &str) -> String {
         if unsafe { cand::ru_sel() } && !crate::settings::horizontal() {
-            dict::ru_of(word).map(|r| r.to_string()).unwrap_or_else(|| word.to_string())
+            unsafe { cand::ru_commit_for(word) }
+                .or_else(|| dict::ru_of(word).map(|r| r.to_string()))
+                .unwrap_or_else(|| word.to_string())
         } else {
             word.to_string()
         }
@@ -349,7 +352,7 @@ impl TextService {
         }
         // 先读设置：log() 要靠 settings::debug() 决定要不要写，顺序不能反
         unsafe { settings::load(); }
-        log("Activate v4.8.0");
+        log("Activate v4.9.0");
         log(&format!(
             "cnpunct={} english={} trmode={}",
             crate::settings::cnpunct(),
@@ -719,10 +722,16 @@ impl ITfKeyEventSink_Impl for TextService {
             if crate::settings::horizontal() {
                 let right = (wparam.0 as u32) == 0x27;
                 move_sel(if right { 1 } else { -1 });
+            } else if (wparam.0 as u32) == 0x27 {
+                // v4.9.0：已在俄语侧时 → 循环义项（多义项挑一个），
+                // 中文侧时 → 照旧进俄语侧
+                unsafe {
+                    if cand::ru_sel() { cand::ru_sense_next(); } else { cand::set_ru_sel(true); }
+                }
             } else {
-                unsafe { cand::set_ru_sel((wparam.0 as u32) == 0x27); }
+                unsafe { cand::set_ru_sel(false); }
             }
-            dlog!("←/→ wparam={} 现在 ru_sel={}", wparam.0, unsafe { cand::ru_sel() });
+            dlog!("←/→ wparam={} 现在 ru_sel={} ru_sense={}", wparam.0, unsafe { cand::ru_sel() }, unsafe { cand::ru_sense() });
             return Ok(BOOL(1));
         }
 

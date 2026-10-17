@@ -2,6 +2,7 @@
 //! 窗口挂 30 秒给外部截屏（cap-top.ps1 抓图 + mapc.ps1 ASCII 色图验收新卡片风）。
 //! 主题/布局由重定向后的 LOCALAPPDATA\Pangyi\settings.txt 控制（theme=1 浅 / 2 深）。
 //! argv[1] = "ru" 时选中条挪到俄语侧（验收两侧选中条）；默认中文侧。
+//! argv[1] = "senses" 多义项高亮（v4.9.0），argv[2] = 高亮义项序号（默认 1）。
 //! argv[2] = 悬停行号（默认 1；横排变体传 0 —— 横排只有一行）。
 //! 全程不发任何真实按键（悬停用 PostMessageW 发给自己的窗口），不打扰用户。
 #![allow(non_snake_case)]
@@ -26,6 +27,21 @@ fn main() {
                 pangyi_ime::cand::Item { word: "岳不群".into(), ru: "".into(), fresh: false },
                 pangyi_ime::cand::Item { word: "苹果".into(), ru: "яблоко".into(), fresh: false },
             ]);
+        } else if std::env::args().nth(1).as_deref() == Some("senses") {
+            // v4.9.0 多义项变体：俄语侧选中 + 义项 2（здравствуй）高亮，
+            // 其余义项 faint —— 验收「→ 循环挑义项」的视觉态
+            pangyi_ime::cand::set_items(vec![
+                pangyi_ime::cand::Item { word: "你好".into(), ru: "привет | здравствуй | добрый день | здравствуйте".into(), fresh: false },
+                pangyi_ime::cand::Item { word: "朋友".into(), ru: "друг | товарищ".into(), fresh: false },
+                pangyi_ime::cand::Item { word: "苹果".into(), ru: "яблоко".into(), fresh: false },
+            ]);
+            pangyi_ime::cand::set_ru_sel(true);
+            // argv[2] = 高亮义项序号（默认 1），截 k=0/k=1 两张图做像素 diff
+            // 验收「高亮段随 RU_SENSE 移动」——diff 区域应恰为两个义项的字段
+            let k: usize = std::env::args().nth(2).and_then(|s| s.parse().ok()).unwrap_or(1);
+            for _ in 0..k {
+                pangyi_ime::cand::ru_sense_next();
+            }
         } else {
             pangyi_ime::cand::set_items(vec![
                 pangyi_ime::cand::Item { word: "朋友".into(), ru: "друг · товарищ".into(), fresh: false },
@@ -41,7 +57,12 @@ fn main() {
         pangyi_ime::cand::show_at(600, 400);
         // 模拟鼠标悬停：竖排悬停 hrow 行中文侧；横排所有条目共一行，
         // 用跨度导出悬停第 1 条（第 0 条就是选中条，悬停条被压住看不到）
-        let hrow: u32 = std::env::args().nth(2).and_then(|s| s.parse().ok()).unwrap_or(1);
+        // senses 变体固定悬停第 1 行（argv[2] 是义项序号）；其余变体 argv[2] 是悬停行
+        let hrow: u32 = if std::env::args().nth(1).as_deref() == Some("senses") {
+            1
+        } else {
+            std::env::args().nth(2).and_then(|s| s.parse().ok()).unwrap_or(1)
+        };
         let ch = HWND(pangyi_ime::cand::cand_hwnd_export());
         let mut out = [0i32; 4];
         let (mut cx, mut cy) = (0, 0);
