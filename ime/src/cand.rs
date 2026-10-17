@@ -1,5 +1,6 @@
-//! 候选窗 —— 视觉与排版照青简（apps/windows/server/src/ui/candidates）：
-//! 同一套配色/字体/间距/圆角；竖排为「序号 中文 拼音 俄语」四列对齐，
+//! 候选窗 —— v4.7.0 换成设置面板同款设计语言：圆角卡片 + 青色选中条 +
+//! 悬停高亮 + 页码药丸（配色照 settings.rs 的 Palette）。
+//! 排版仍是青简同款：竖排为「序号 中文 拼音 俄语」四列对齐，
 //! 横排为「序号 中文」一行排开、当前项的拼音与俄语另起一行。
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicIsize, AtomicUsize, Ordering};
@@ -8,6 +9,7 @@ use windows::Win32::Foundation::*;
 use windows::Win32::Graphics::Gdi::*;
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     SendInput, INPUT, INPUT_KEYBOARD, KEYEVENTF_KEYUP, VK_RETURN,
+    TrackMouseEvent, TRACKMOUSEEVENT, TME_LEAVE,
 };
 use windows::Win32::UI::WindowsAndMessaging::*;
 
@@ -22,9 +24,15 @@ static ITEMS: Mutex<Vec<Item>> = Mutex::new(Vec::new());
 static PREEDIT: Mutex<String> = Mutex::new(String::new());
 static SENTENCE: Mutex<Option<String>> = Mutex::new(None);
 static SEL: AtomicUsize = AtomicUsize::new(0);
-/// 蓝条选中哪一侧：false = 中文（默认），true = 俄语侧 —— 上屏只出俄语，
+/// 青条选中哪一侧：false = 中文（默认），true = 俄语侧 —— 上屏只出俄语，
 /// 中文不输入。←/→ 切换，鼠标点俄语列同样进入；每次换新候选组自动回中文侧。
 static RU_SEL: AtomicBool = AtomicBool::new(false);
+/// 鼠标悬停哪一行（-1 = 没有）。只影响悬停高亮和手型光标，不碰选中/提交。
+static HOT_ROW: AtomicI32 = AtomicI32::new(-1);
+/// 悬停行落在哪一侧（和 RU_SEL 同一套 x_ru 判定，画悬停条用）
+static HOT_RU: AtomicBool = AtomicBool::new(false);
+/// 已经申请过 TrackMouseEvent 了；申请一次就能收到 WM_MOUSELEAVE（防重复挂）
+static TRACKED: AtomicBool = AtomicBool::new(false);
 /// 当前页号（0 起）和总页数，画右下角那个「▲▼ 2/59」用。总页数 1 就不画。
 static PAGE_CUR: AtomicUsize = AtomicUsize::new(0);
 static PAGE_TOT: AtomicUsize = AtomicUsize::new(1);
@@ -51,15 +59,17 @@ pub unsafe fn alive() -> bool {
     h.0 != 0 && IsWindow(h).as_bool()
 }
 
-// ---- 青简配色（palette.rs 一字不差）----
+// ---- v4.7.0 配色：设置面板同款设计语言（与 settings.rs Palette 同名字段同值）----
 struct Palette {
-    text: COLORREF,
-    gloss: COLORREF,
-    index: COLORREF,
-    fresh: COLORREF,
-    cloud: COLORREF,
-    background: COLORREF,
-    highlight: COLORREF,
+    text: COLORREF,     // 主文字（词）
+    faint: COLORREF,    // 次要文字（拼音/序号/页码/未选中俄语）
+    fresh: COLORREF,    // 生词橙色（语义色，两主题保持一致）
+    cloud: COLORREF,    // ☁ 整句提示（= 面板 accent）
+    card: COLORREF,     // 窗口卡片底
+    border: COLORREF,   // 卡片 1px 描边
+    bar_fill: COLORREF, // 选中条填充（= 面板 pill_sel_fill）
+    bar_text: COLORREF, // 选中条上的文字（= 面板 pill_sel_text）
+    hover: COLORREF,    // 悬停行填充（= 面板 pill_hover）
 }
 
 const fn rgb(r: u8, g: u8, b: u8) -> COLORREF {
@@ -70,22 +80,26 @@ fn palette(dark: bool) -> Palette {
     if dark {
         Palette {
             text: rgb(0xf5, 0xf5, 0xf7),
-            gloss: rgb(0xae, 0xae, 0xb2),
-            index: rgb(0x8e, 0x8e, 0x93),
+            faint: rgb(0xae, 0xae, 0xb2),
             fresh: rgb(0xff, 0x9f, 0x0a),
             cloud: rgb(0x40, 0xc8, 0xe0),
-            background: rgb(0x2a, 0x2a, 0x2c),
-            highlight: rgb(0x2f, 0x4d, 0x72),
+            card: rgb(0x2a, 0x2a, 0x2d),
+            border: rgb(0x3a, 0x3a, 0x3e),
+            bar_fill: rgb(0x1e, 0x3a, 0x44),
+            bar_text: rgb(0xb7, 0xe6, 0xf0),
+            hover: rgb(0x33, 0x33, 0x37),
         }
     } else {
         Palette {
             text: rgb(0x1d, 0x1d, 0x1f),
-            gloss: rgb(0x6b, 0x6b, 0x70),
-            index: rgb(0xa0, 0xa0, 0xa6),
+            faint: rgb(0x6b, 0x6b, 0x70),
             fresh: rgb(0xff, 0x95, 0x00),
-            cloud: rgb(0x30, 0xb0, 0xc7),
-            background: rgb(0xf8, 0xf8, 0xf8),
-            highlight: rgb(0xcf, 0xe4, 0xf9),
+            cloud: rgb(0x2f, 0xb8, 0xcc),
+            card: rgb(0xff, 0xff, 0xff),
+            border: rgb(0xe3, 0xe6, 0xea),
+            bar_fill: rgb(0xdd, 0xf2, 0xf6),
+            bar_text: rgb(0x17, 0x60, 0x6c),
+            hover: rgb(0xe9, 0xeb, 0xee),
         }
     }
 }
@@ -118,6 +132,33 @@ pub unsafe fn refresh_settings() {
 
 fn sc(px: i32) -> i32 {
     (px * dpi()) / 96
+}
+
+// ---- 绘制助手（照 settings.rs 同款：区域/刷子成对创建删除，GDI 对象不漏）----
+
+/// 圆角矩形填充
+unsafe fn fill_round(dc: HDC, r: &RECT, radius: i32, color: COLORREF) {
+    let rb = CreateSolidBrush(color);
+    let rgn = CreateRoundRectRgn(r.left, r.top, r.right, r.bottom, radius, radius);
+    FillRgn(dc, rgn, rb);
+    let _ = DeleteObject(rgn);
+    let _ = DeleteObject(rb);
+}
+
+/// 圆角矩形 1px 描边（画在矩形内侧）
+unsafe fn frame_round(dc: HDC, r: &RECT, radius: i32, color: COLORREF) {
+    let rb = CreateSolidBrush(color);
+    let rgn = CreateRoundRectRgn(r.left, r.top, r.right, r.bottom, radius, radius);
+    let _ = FrameRgn(dc, rgn, rb, 1, 1);
+    let _ = DeleteObject(rgn);
+    let _ = DeleteObject(rb);
+}
+
+/// 无边框矩形填充
+unsafe fn fill_rect(dc: HDC, l: i32, t: i32, r: i32, b: i32, color: COLORREF) {
+    let rb = CreateSolidBrush(color);
+    FillRect(dc, &RECT { left: l, top: t, right: r, bottom: b }, rb);
+    let _ = DeleteObject(rb);
 }
 
 /// 字体缓存。
@@ -164,7 +205,13 @@ pub fn clear_font_cache() {
 const PAD: i32 = 8;
 const ROW_PAD: i32 = 4;
 const GAP: i32 = 8;
-const RADIUS: i32 = 8;
+/// 窗口圆角（卡片风）：SetWindowRgn 的角椭圆直径 = WIN_RADIUS*2
+const WIN_RADIUS: i32 = 10;
+/// 选中条 / 悬停条 / 页码药丸的圆角
+const BAR_RADIUS: i32 = 8;
+/// 页码药丸的内边距
+const PAGE_PAD_X: i32 = 6;
+const PAGE_PAD_Y: i32 = 2;
 const TEXT_PX: i32 = 16;
 const ANNO_PX: i32 = 12;
 const INDEX_PX: i32 = 11;
@@ -199,6 +246,8 @@ struct Layout {
     pinyin_w: i32,
     ru_w: i32,
     item_w: Vec<i32>,
+    /// 横排时每条目的命中 x 跨度 (l, r)，和 WM_PAINT 同一套累加；竖排空着
+    hitem: Vec<(i32, i32)>,
     row_h: i32,
     line_h: i32,
     anno_w: i32,
@@ -266,17 +315,23 @@ unsafe fn compute_layout(dc: HDC, items: &[Item]) -> Layout {
     let pages = PAGE_TOT.load(Ordering::Relaxed);
     let (footer_w, footer_h) = if pages > 1 {
         let s = format!("▲▼ {}/{}", PAGE_CUR.load(Ordering::Relaxed) + 1, pages);
-        (measure(dc, f_anno, &s).0, measure(dc, f_anno, "x").1 + sc(ROW_PAD))
+        // v4.7.0 页码装进小药丸：宽度加药丸左右内边距，高度不变
+        (measure(dc, f_anno, &s).0 + sc(PAGE_PAD_X) * 2, measure(dc, f_anno, "x").1 + sc(ROW_PAD))
     } else {
         (0, 0)
     };
 
+    let mut hitem: Vec<(i32, i32)> = Vec::new();
     let (width, height) = if crate::settings::horizontal() {
         let inset = sc(PAD) / 2;
         let mut w = pad * 2 + inset * 2;
+        let mut x = pad + inset;
         for (i, iw) in item_w.iter().take(nth).enumerate() {
             if i > 0 { w += gap; }
             w += iw;
+            // 条目的悬停跨度 = 选中条矩形（x-inset .. x+iw+inset）
+            hitem.push((x - inset, x + iw + inset));
+            x += iw + gap;
         }
         let h = pad * 2 + pre_h + row_h + if anno_h > 0 { anno_h } else { 0 } + footer_h;
         (w.max(pad * 2 + anno_w).max(pad * 2 + top_w).max(pad * 2 + footer_w).max(sc(120)), h)
@@ -288,7 +343,7 @@ unsafe fn compute_layout(dc: HDC, items: &[Item]) -> Layout {
         (w, h)
     };
 
-    Layout { index_w, word_w, pinyin_w, ru_w, item_w, row_h, line_h, anno_w, anno_h, width, height }
+    Layout { index_w, word_w, pinyin_w, ru_w, item_w, hitem, row_h, line_h, anno_w, anno_h, width, height }
 }
 
 pub unsafe fn detect_theme() {
@@ -330,9 +385,8 @@ unsafe extern "system" fn proc_cand(h: HWND, msg: u32, w: WPARAM, l: LPARAM) -> 
             let p = palette(crate::settings::dark(DARK.load(Ordering::Relaxed)));
             let mut rc = RECT::default();
             let _ = GetClientRect(h, &mut rc);
-            let bg = CreateSolidBrush(p.background);
-            FillRect(dc, &rc, bg);
-            let _ = DeleteObject(bg);
+            // 窗口本体 = 一张圆角卡片：先铺卡片底色，最后描一圈 1px 边框
+            fill_rect(dc, 0, 0, rc.right, rc.bottom, p.card);
             SetBkMode(dc, TRANSPARENT);
 
             let items = ITEMS.lock().unwrap();
@@ -353,7 +407,7 @@ unsafe extern "system" fn proc_cand(h: HWND, msg: u32, w: WPARAM, l: LPARAM) -> 
                 SelectObject(dc, f_anno);
                 let mut tx = pad;
                 if !pre.is_empty() {
-                    SetTextColor(dc, p.gloss);
+                    SetTextColor(dc, p.faint);
                     let s: Vec<u16> = pre.encode_utf16().collect();
                     TextOutW(dc, tx, ty, &s);
                     tx += measure(dc, f_anno, &pre).0;
@@ -364,14 +418,18 @@ unsafe extern "system" fn proc_cand(h: HWND, msg: u32, w: WPARAM, l: LPARAM) -> 
                     let c: Vec<u16> = "☁".encode_utf16().collect();
                     TextOutW(dc, tx, ty, &c);
                     tx += measure(dc, f_anno, "☁").0 + gap / 2;
-                    SetTextColor(dc, p.gloss);
+                    SetTextColor(dc, p.faint);
                     let g: Vec<u16> = s.encode_utf16().collect();
                     TextOutW(dc, tx, ty, &g);
                 }
                 y += ph + sc(ROW_PAD) * 2;
+                // 顶行和候选之间的分隔线：画在顶行自带的下留白里，不改变几何
+                fill_rect(dc, pad, y - sc(ROW_PAD), rc.right - pad, y - sc(ROW_PAD) + 1, p.border);
             }
 
             let sel = SEL.load(Ordering::Relaxed);
+            let hot = HOT_ROW.load(Ordering::Relaxed);
+            let hot_ru = HOT_RU.load(Ordering::Relaxed);
             let small_idx = ((lay.line_h - measure(dc, f_idx, "x").1) / 2).max(0);
             let small_anno = ((lay.line_h - measure(dc, f_anno, "x").1) / 2).max(0);
 
@@ -381,22 +439,22 @@ unsafe extern "system" fn proc_cand(h: HWND, msg: u32, w: WPARAM, l: LPARAM) -> 
                 let baseline = y + sc(ROW_PAD);
                 for (i, it) in items.iter().take(crate::settings::max_cands()).enumerate() {
                     let iw = lay.item_w.get(i).copied().unwrap_or(0);
+                    let bar = RECT { left: x - inset, top: y, right: x + iw + inset, bottom: y + lay.row_h };
                     if i == sel {
-                        let hb = CreateSolidBrush(p.highlight);
-                        let rgn = CreateRoundRectRgn(x - inset, y, x + iw + inset, y + lay.row_h, sc(RADIUS), sc(RADIUS));
-                        FillRgn(dc, rgn, hb);
-                        let _ = DeleteObject(rgn);
-                        let _ = DeleteObject(hb);
+                        fill_round(dc, &bar, sc(BAR_RADIUS), p.bar_fill);
+                    } else if i as i32 == hot {
+                        fill_round(dc, &bar, sc(BAR_RADIUS), p.hover);
                     }
                     let idx = format!("{}.", i + 1);
                     let iwid = measure(dc, f_idx, &idx).0;
+                    let on_bar = i == sel;
                     SelectObject(dc, f_idx);
-                    SetTextColor(dc, p.index);
+                    SetTextColor(dc, if on_bar { p.bar_text } else { p.faint });
                     let n: Vec<u16> = idx.encode_utf16().collect();
                     TextOutW(dc, x, baseline + small_idx, &n);
 
                     SelectObject(dc, f_text);
-                    SetTextColor(dc, p.text);
+                    SetTextColor(dc, if on_bar { p.bar_text } else { p.text });
                     let word: Vec<u16> = it.word.encode_utf16().collect();
                     TextOutW(dc, x + iwid + gap / 2, baseline, &word);
                     x += iw + gap;
@@ -405,7 +463,7 @@ unsafe extern "system" fn proc_cand(h: HWND, msg: u32, w: WPARAM, l: LPARAM) -> 
                     if let Some(it) = items.get(sel) {
                         let s = format!("{}   {}", it.pinyin, gloss_of(it));
                         SelectObject(dc, f_anno);
-                        SetTextColor(dc, if it.fresh { p.fresh } else { p.gloss });
+                        SetTextColor(dc, if it.fresh { p.fresh } else { p.faint });
                         let g: Vec<u16> = s.encode_utf16().collect();
                         TextOutW(dc, pad, y + lay.row_h + sc(ROW_PAD) / 2, &g);
                     }
@@ -417,32 +475,41 @@ unsafe extern "system" fn proc_cand(h: HWND, msg: u32, w: WPARAM, l: LPARAM) -> 
                 let x_ru = x_pinyin + lay.pinyin_w + gap;
                 for (i, it) in items.iter().take(crate::settings::max_cands()).enumerate() {
                     let ry = y + (i as i32) * lay.row_h;
+                    let ru = RU_SEL.load(Ordering::Relaxed);
+                    // 选中俄语侧时青条只罩住俄语那一列（←→/点俄语列进入）
+                    let bar_l = |ru_side: bool| if ru_side { x_ru - pad / 2 } else { pad / 2 };
+                    let bar = RECT { left: 0, top: ry, right: rc.right - pad / 2, bottom: ry + lay.row_h };
                     if i == sel {
-                        let hb = CreateSolidBrush(p.highlight);
-                        // 选中俄语侧时蓝条只罩住俄语那一列（←→/点俄语列进入）
-                        let l = if RU_SEL.load(Ordering::Relaxed) { x_ru - pad / 2 } else { pad / 2 };
-                        let rgn = CreateRoundRectRgn(l, ry, rc.right - pad / 2, ry + lay.row_h, sc(RADIUS), sc(RADIUS));
-                        FillRgn(dc, rgn, hb);
-                        let _ = DeleteObject(rgn);
-                        let _ = DeleteObject(hb);
+                        let mut b = bar;
+                        b.left = bar_l(ru);
+                        fill_round(dc, &b, sc(BAR_RADIUS), p.bar_fill);
+                    } else if i as i32 == hot {
+                        let mut b = bar;
+                        b.left = bar_l(hot_ru);
+                        fill_round(dc, &b, sc(BAR_RADIUS), p.hover);
                     }
+                    // 中文侧选中：序号/词/拼音都压在青条上；俄语列两种选中侧都压着
+                    let on_bar_word = i == sel && !ru;
+                    let on_bar_ru = i == sel;
                     let ty = ry + sc(ROW_PAD);
                     SelectObject(dc, f_idx);
-                    SetTextColor(dc, p.index);
+                    SetTextColor(dc, if on_bar_word { p.bar_text } else { p.faint });
                     let n: Vec<u16> = format!("{}.", i + 1).encode_utf16().collect();
                     TextOutW(dc, x_index, ty + small_idx, &n);
 
                     SelectObject(dc, f_text);
-                    SetTextColor(dc, p.text);
+                    SetTextColor(dc, if on_bar_word { p.bar_text } else { p.text });
                     let word: Vec<u16> = it.word.encode_utf16().collect();
                     TextOutW(dc, x_word, ty, &word);
 
                     SelectObject(dc, f_anno);
-                    SetTextColor(dc, p.index);
+                    SetTextColor(dc, if on_bar_word { p.bar_text } else { p.faint });
                     let py: Vec<u16> = it.pinyin.encode_utf16().collect();
                     TextOutW(dc, x_pinyin, ty + small_anno, &py);
 
-                    SetTextColor(dc, if it.fresh { p.fresh } else { p.gloss });
+                    // 压着青条的列一律用条上文字色（生词橙在浅色青底上对比太弱）；
+                    // 非选中行的生词照旧橙色
+                    SetTextColor(dc, if on_bar_ru { p.bar_text } else if it.fresh { p.fresh } else { p.faint });
                     let gloss: Vec<u16> = gloss_of(it).encode_utf16().collect();
                     TextOutW(dc, x_ru, ty + small_anno, &gloss);
                 }
@@ -455,17 +522,88 @@ unsafe extern "system" fn proc_cand(h: HWND, msg: u32, w: WPARAM, l: LPARAM) -> 
                 let s = format!("▲▼ {}/{}", PAGE_CUR.load(Ordering::Relaxed) + 1, pages);
                 let (_, hh) = measure(dc, f_anno, "x");
                 let wpx = measure(dc, f_anno, &s).0;
-                let ty = rc.bottom - pad - hh - sc(ROW_PAD) / 2;
+                // 页码装进一个小药丸（灰底 + 细描边），文字位置和老版完全一样
+                let pill = RECT {
+                    left: rc.right - pad - wpx - sc(PAGE_PAD_X) * 2,
+                    top: rc.bottom - pad - hh - sc(ROW_PAD) / 2 - sc(PAGE_PAD_Y),
+                    right: rc.right - pad,
+                    bottom: rc.bottom - pad - sc(ROW_PAD) / 2 + sc(PAGE_PAD_Y),
+                };
+                fill_round(dc, &pill, sc(BAR_RADIUS), p.hover);
+                frame_round(dc, &pill, sc(BAR_RADIUS), p.border);
                 SelectObject(dc, f_anno);
-                SetTextColor(dc, p.index);
+                SetTextColor(dc, p.faint);
                 let t: Vec<u16> = s.encode_utf16().collect();
-                TextOutW(dc, rc.right - pad - wpx, ty, &t);
+                TextOutW(dc, pill.left + sc(PAGE_PAD_X), pill.top + sc(PAGE_PAD_Y), &t);
             }
+
+            // 卡片外描边最后画，盖在所有内容上（窗口区域是圆角的，描边跟着圆角走）
+            frame_round(dc, &RECT { left: 0, top: 0, right: rc.right, bottom: rc.bottom }, sc(WIN_RADIUS) * 2, p.border);
 
             // 注意：f_text / f_anno / f_idx 是缓存的字体对象，这里不能删
             let _ = (f_text, f_anno, f_idx);
             let _ = EndPaint(h, &ps);
             LRESULT(0)
+        }
+        // 悬停高亮 + 手型光标（v4.7.0）：只改视觉，不碰选中/提交。
+        // 悬停行用 hit_test 同一套几何，画的和点的一致（v4.5.0 教训）。
+        WM_MOUSEMOVE => {
+            let x = (l.0 & 0xFFFF) as i16 as i32;
+            let y = ((l.0 >> 16) & 0xFFFF) as i16 as i32;
+            let (nr, nru) = match hover_at(x, y) {
+                Some((i, ru)) => (i as i32, ru),
+                None => (-1, false),
+            };
+            if nr != HOT_ROW.load(Ordering::Relaxed) || nru != HOT_RU.load(Ordering::Relaxed) {
+                HOT_ROW.store(nr, Ordering::Relaxed);
+                HOT_RU.store(nru, Ordering::Relaxed);
+                // FALSE = 不擦背景只重画，防闪
+                let _ = InvalidateRect(h, None, FALSE);
+            }
+            // 只挂一次 MouseLeave 追踪（TRACKED 防重复挂）。而且只有光标真在
+            // 客户区里才挂：光标本来在窗外时（比如台架 PostMessage 模拟的
+            // WM_MOUSEMOVE），TrackMouseEvent 会立刻回发 WM_MOUSELEAVE，
+            // 悬停刚设上就被清掉。光标在窗外时由本消息自己负责清悬停。
+            if !TRACKED.load(Ordering::Relaxed) {
+                let mut cp = POINT::default();
+                if GetCursorPos(&mut cp).is_ok() && ScreenToClient(h, &mut cp).as_bool() {
+                    let mut cr = RECT::default();
+                    if GetClientRect(h, &mut cr).is_ok()
+                        && cp.x >= 0 && cp.y >= 0 && cp.x < cr.right && cp.y < cr.bottom
+                    {
+                        TRACKED.store(true, Ordering::Relaxed);
+                        let mut tme = TRACKMOUSEEVENT {
+                            cbSize: std::mem::size_of::<TRACKMOUSEEVENT>() as u32,
+                            dwFlags: TME_LEAVE,
+                            hwndTrack: h,
+                            dwHoverTime: 0,
+                        };
+                        let _ = TrackMouseEvent(&mut tme);
+                    }
+                }
+            }
+            LRESULT(0)
+        }
+        // windows-rs 0.52 的 WM_MOUSELEAVE 是复合常量表达式，不能当 match 模式：
+        // rustc 会把它当通配臂、把后面所有臂判成不可达直接从二进制里删掉（v4.6.0 大坑）。
+        // 这里用字面量 0x02A3（= WM_MOUSELEAVE）。
+        0x02A3 => {
+            HOT_ROW.store(-1, Ordering::Relaxed);
+            HOT_RU.store(false, Ordering::Relaxed);
+            TRACKED.store(false, Ordering::Relaxed);
+            let _ = InvalidateRect(h, None, FALSE);
+            LRESULT(0)
+        }
+        WM_SETCURSOR => {
+            // 悬停在候选行上时给手型光标
+            if ((l.0 & 0xFFFF) as u16 as u32) == HTCLIENT && HOT_ROW.load(Ordering::Relaxed) >= 0 {
+                if let Ok(cur) = LoadCursorW(None, IDC_HAND) {
+                    let _ = SetCursor(cur);
+                }
+                LRESULT(1)
+            } else {
+                DefWindowProcW(h, msg, w, l)
+            }
         }
         // 鼠标点候选直接上屏：点哪条选哪条；竖排点俄语列＝选中俄语侧。
         // 然后合成一次回车，走和真键盘完全一样的 TSF 提交路径 —— 自学习、
@@ -530,12 +668,19 @@ pub unsafe fn set_items(items: Vec<Item>) {
     SEL.store(0, Ordering::Relaxed);
     // 新一组候选重新从中文侧开始（上次 ←→ 选中的俄语侧不再沿用）
     RU_SEL.store(false, Ordering::Relaxed);
+    // 悬停状态跟着清掉（行数可能变了，旧行号没意义）
+    HOT_ROW.store(-1, Ordering::Relaxed);
+    HOT_RU.store(false, Ordering::Relaxed);
+    // 数据变了立即重画：翻页键（PageDown/-/=）只走 set_items/set_page，
+    // 以前不重画，窗口要等别的重绘触发才更新（v4.7.0 修）
+    if alive() { let _ = InvalidateRect(hwnd(), None, TRUE); }
 }
 
 /// 记下页码（画右下角的「▲▼ n/总」）。cur 是 0 起的页号。
 pub unsafe fn set_page(cur: usize, total: usize) {
     PAGE_CUR.store(cur, Ordering::Relaxed);
     PAGE_TOT.store(total.max(1), Ordering::Relaxed);
+    if alive() { let _ = InvalidateRect(hwnd(), None, TRUE); }
 }
 
 /// 给测试台架用：当前页号和总页数
@@ -552,7 +697,7 @@ pub fn ru_sel() -> bool {
     RU_SEL.load(Ordering::Relaxed)
 }
 
-/// ←/→ 切换选中侧：蓝条从整行挪到俄语那一列（或挪回来），触发重画。
+/// ←/→ 切换选中侧：青条从整行挪到俄语那一列（或挪回来），触发重画。
 pub unsafe fn set_ru_sel(v: bool) {
     RU_SEL.store(v, Ordering::Relaxed);
     if alive() { let _ = InvalidateRect(hwnd(), None, TRUE); }
@@ -560,7 +705,7 @@ pub unsafe fn set_ru_sel(v: bool) {
 
 /// 竖排几何（和 WM_PAINT 同一套算法）：首行 y、行高、词列 x、俄语列 x。
 /// 顶行（拼音 / ☁ 提示）占多高就先加多高，这样点击和画的位置对得上。
-unsafe fn v_geom(dc: HDC) -> Option<(i32, i32, i32, i32)> {
+unsafe fn v_geom(dc: HDC) -> Option<(i32, i32, i32, i32, Layout)> {
     let items = ITEMS.lock().unwrap();
     if items.is_empty() { return None; }
     let lay = compute_layout(dc, &items);
@@ -577,7 +722,7 @@ unsafe fn v_geom(dc: HDC) -> Option<(i32, i32, i32, i32)> {
     }
     let x_word = pad + lay.index_w + gap;
     let x_ru = x_word + lay.word_w + gap + lay.pinyin_w + gap;
-    Some((y, lay.row_h, x_word, x_ru))
+    Some((y, lay.row_h, x_word, x_ru, lay))
 }
 
 /// 鼠标点 (x, y)（客户区坐标）落在哪一行、哪一侧：(行号, 是否俄语列)。
@@ -588,7 +733,7 @@ pub unsafe fn hit_test(x: i32, y: i32) -> Option<(usize, bool)> {
     if dc.0 == 0 { return None; }
     let r = v_geom(dc);
     if dc.0 != 0 { let _ = ReleaseDC(h, dc); }
-    let (y0, row_h, _x_word, x_ru) = r?;
+    let (y0, row_h, _x_word, x_ru, _lay) = r?;
     let dy = y - y0;
     if dy < 0 { return None; }
     let i = (dy / row_h) as usize;
@@ -603,6 +748,37 @@ pub unsafe fn hit_test(x: i32, y: i32) -> Option<(usize, bool)> {
     }
 }
 
+/// 鼠标悬停命中（只画高亮，不改变点击语义）：竖排直接走 hit_test；
+/// 横排所有条目共一行，hit_test 的 y→行公式会把整行都判成第 0 条 ——
+/// 改按条目 x 跨度找（compute_layout 里和 WM_PAINT 同一套累加）。
+unsafe fn hover_at(x: i32, y: i32) -> Option<(usize, bool)> {
+    if !crate::settings::horizontal() {
+        return hit_test(x, y);
+    }
+    let h = hwnd();
+    let dc = GetDC(h);
+    if dc.0 == 0 { return None; }
+    let items = ITEMS.lock().unwrap();
+    if items.is_empty() { drop(items); let _ = ReleaseDC(h, dc); return None; }
+    let lay = compute_layout(dc, &items);
+    drop(items);
+    // 和 v_geom 同款：顶行（拼音 / ☁ 提示）占多高就先加多高
+    let mut y0 = sc(PAD);
+    let pre = PREEDIT.lock().unwrap().clone();
+    let sent = SENTENCE.lock().unwrap().clone();
+    if !pre.is_empty() || sent.is_some() {
+        let f_anno = font(ANNO_PX);
+        let (_, ph) = measure(dc, f_anno, "x");
+        y0 += ph + sc(ROW_PAD) * 2;
+    }
+    let _ = ReleaseDC(h, dc);
+    if y < y0 || y >= y0 + lay.row_h { return None; }
+    for (i, (l, r)) in lay.hitem.iter().enumerate() {
+        if x >= *l && x < *r { return Some((i, false)); }
+    }
+    None
+}
+
 /// 第 row 行中文侧/俄语侧的可点击矩形（客户区坐标），测试台架算点击点用。
 pub unsafe fn hit_rect(row: usize, ru: bool) -> Option<(i32, i32, i32, i32)> {
     let h = hwnd();
@@ -610,7 +786,7 @@ pub unsafe fn hit_rect(row: usize, ru: bool) -> Option<(i32, i32, i32, i32)> {
     if dc.0 == 0 { return None; }
     let r = v_geom(dc);
     if dc.0 != 0 { let _ = ReleaseDC(h, dc); }
-    let (y0, row_h, x_word, x_ru) = r?;
+    let (y0, row_h, x_word, x_ru, _lay) = r?;
     if row >= ITEMS.lock().unwrap().len() { return None; }
     let top = y0 + row as i32 * row_h;
     let l = if ru { x_ru } else { x_word };
@@ -635,6 +811,27 @@ pub unsafe extern "system" fn cand_hit_rect_export(row: u32, ru: u32, out: *mut 
             *out.add(1) = t;
             *out.add(2) = r;
             *out.add(3) = b;
+            1
+        }
+        None => 0,
+    }
+}
+
+/// 横排第 row 条目的悬停跨度 (l, r) 写进 out[2]（竖排没有跨度，返回 0）。
+/// 台架横排悬停模拟用 —— hit_rect 只有 60px 中文侧矩形，点不中第 1 条。
+#[no_mangle]
+pub unsafe extern "system" fn cand_span_export(row: u32, out: *mut i32) -> u32 {
+    if out.is_null() { return 0; }
+    let h = hwnd();
+    let dc = GetDC(h);
+    if dc.0 == 0 { return 0; }
+    let r = v_geom(dc);
+    let _ = ReleaseDC(h, dc);
+    let (_y0, _row_h, _xw, _xr, lay) = match r { Some(v) => v, None => return 0 };
+    match lay.hitem.get(row as usize) {
+        Some((l, rr)) => {
+            *out.add(0) = *l;
+            *out.add(1) = *rr;
             1
         }
         None => 0,
@@ -689,7 +886,7 @@ pub unsafe fn show_at(x: i32, y: i32) {
     if px + cw > sw - 4 { px = (sw - cw - 4).max(0); }
     if py + ch > sh - 4 { py = (y - ch - sc(30)).max(0); }
     if py < 0 { py = 0; }
-    let rgn = CreateRoundRectRgn(0, 0, cw + 1, ch + 1, sc(RADIUS) * 2, sc(RADIUS) * 2);
+    let rgn = CreateRoundRectRgn(0, 0, cw + 1, ch + 1, sc(WIN_RADIUS) * 2, sc(WIN_RADIUS) * 2);
     let _ = SetWindowRgn(h, rgn, TRUE);
     // 只在“从隐藏变显示”的那一次抬高到置顶带的最前面（保证能盖住置顶窗口），
     // 后续按键只挪位置、不动 z 序——每次按键都抢顶层会让某些宿主丢焦点、上屏失败。
@@ -702,4 +899,11 @@ pub unsafe fn show_at(x: i32, y: i32) {
     let _ = InvalidateRect(h, None, TRUE);
 }
 
-pub unsafe fn hide() { if alive() { let _ = ShowWindow(hwnd(), SW_HIDE); } }
+pub unsafe fn hide() {
+    // 窗口可能是在鼠标下面被藏掉的（那样发不出 WM_MOUSELEAVE）：
+    // 悬停状态在这里清掉，不然下次显示会闪一下残留的悬停条
+    HOT_ROW.store(-1, Ordering::Relaxed);
+    HOT_RU.store(false, Ordering::Relaxed);
+    TRACKED.store(false, Ordering::Relaxed);
+    if alive() { let _ = ShowWindow(hwnd(), SW_HIDE); }
+}

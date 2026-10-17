@@ -349,7 +349,7 @@ impl TextService {
         }
         // 先读设置：log() 要靠 settings::debug() 决定要不要写，顺序不能反
         unsafe { settings::load(); }
-        log("Activate v4.5.0");
+        log("Activate v4.7.0");
         log(&format!(
             "cnpunct={} english={} trmode={}",
             crate::settings::cnpunct(),
