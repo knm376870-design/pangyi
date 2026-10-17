@@ -19,11 +19,20 @@ fn main() {
         pangyi_ime::cand::init();
         pangyi_ime::cand::set_preedit("pengyou");
         pangyi_ime::cand::set_sentence(Some("朋友 一起 学习".to_string()));
-        pangyi_ime::cand::set_items(vec![
-            pangyi_ime::cand::Item { word: "朋友".into(), pinyin: "peng you".into(), ru: "друг · товарищ".into(), fresh: false },
-            pangyi_ime::cand::Item { word: "苹果".into(), pinyin: "ping guo".into(), ru: "яблоко".into(), fresh: false },
-            pangyi_ime::cand::Item { word: "便宜".into(), pinyin: "pian yi".into(), ru: "дешёвый · выгодный".into(), fresh: true },
-        ]);
+        if std::env::args().nth(1).as_deref() == Some("nogloss") {
+            // v4.8.0 无释义条目变体：选中第 0 条（岳不群无俄语释义），
+            // 横排下第二行应为空（去拼音后没内容可画，不能留一行空白）
+            pangyi_ime::cand::set_items(vec![
+                pangyi_ime::cand::Item { word: "岳不群".into(), ru: "".into(), fresh: false },
+                pangyi_ime::cand::Item { word: "苹果".into(), ru: "яблоко".into(), fresh: false },
+            ]);
+        } else {
+            pangyi_ime::cand::set_items(vec![
+                pangyi_ime::cand::Item { word: "朋友".into(), ru: "друг · товарищ".into(), fresh: false },
+                pangyi_ime::cand::Item { word: "苹果".into(), ru: "яблоко".into(), fresh: false },
+                pangyi_ime::cand::Item { word: "便宜".into(), ru: "дешёвый · выгодный".into(), fresh: true },
+            ]);
+        }
         pangyi_ime::cand::set_page(1, 5);
         if std::env::args().nth(1).as_deref() == Some("ru") {
             // 验收俄语侧选中条（←→ 后的样子）

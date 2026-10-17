@@ -1,7 +1,8 @@
 //! 候选窗 —— v4.7.0 换成设置面板同款设计语言：圆角卡片 + 青色选中条 +
 //! 悬停高亮 + 页码药丸（配色照 settings.rs 的 Palette）。
-//! 排版仍是青简同款：竖排为「序号 中文 拼音 俄语」四列对齐，
-//! 横排为「序号 中文」一行排开、当前项的拼音与俄语另起一行。
+//! 排版仍是青简同款：竖排为「序号 中文 俄语」三列对齐，
+//! 横排为「序号 中文」一行排开、当前项的俄语另起一行。
+//! v4.8.0：去掉拼音列（拼音只在顶行输入串里显示，候选词旁不再展示）。
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicIsize, AtomicUsize, Ordering};
 use windows::core::{PCWSTR, w};
@@ -15,7 +16,6 @@ use windows::Win32::UI::WindowsAndMessaging::*;
 
 pub struct Item {
     pub word: String,
-    pub pinyin: String,
     pub ru: String,
     pub fresh: bool,
 }
@@ -243,14 +243,11 @@ fn measure(dc: HDC, f: HFONT, s: &str) -> (i32, i32) {
 struct Layout {
     index_w: i32,
     word_w: i32,
-    pinyin_w: i32,
-    ru_w: i32,
     item_w: Vec<i32>,
     /// 横排时每条目的命中 x 跨度 (l, r)，和 WM_PAINT 同一套累加；竖排空着
     hitem: Vec<(i32, i32)>,
     row_h: i32,
     line_h: i32,
-    anno_w: i32,
     anno_h: i32,
     width: i32,
     height: i32,
@@ -266,7 +263,6 @@ unsafe fn compute_layout(dc: HDC, items: &[Item]) -> Layout {
 
     let mut index_w = 0;
     let mut word_w = 0;
-    let mut pinyin_w = 0;
     let mut ru_w = 0;
     let mut row_h = 0;
     let mut line_h = 0;
@@ -275,11 +271,9 @@ unsafe fn compute_layout(dc: HDC, items: &[Item]) -> Layout {
         let idx = format!("{}.", i + 1);
         let a = measure(dc, f_idx, &idx).0;
         let (bw, bh) = measure(dc, f_text, &it.word);
-        let c = measure(dc, f_anno, &it.pinyin).0;
         let d = measure(dc, f_anno, &gloss_of(it)).0;
         if a > index_w { index_w = a; }
         if bw > word_w { word_w = bw; }
-        if c > pinyin_w { pinyin_w = c; }
         if d > ru_w { ru_w = d; }
         let rh = bh + sc(ROW_PAD) * 2;
         if rh > row_h { row_h = rh; }
@@ -290,13 +284,15 @@ unsafe fn compute_layout(dc: HDC, items: &[Item]) -> Layout {
         row_h = sc(TEXT_PX) + sc(ROW_PAD) * 2;
     }
 
-    // 高亮项的注释行（横排时另起一行）
+    // 高亮项的注释行（横排时另起一行）；无释义的条目不占这行（v4.8.0 去拼音后没内容可画）
     let mut anno_w = 0;
     let mut anno_h = 0;
     if let Some(it) = items.get(SEL.load(Ordering::Relaxed)) {
-        let s = format!("{}   {}", it.pinyin, gloss_of(it));
-        anno_w = measure(dc, f_anno, &s).0;
-        anno_h = measure(dc, f_anno, "x").1 + sc(ROW_PAD);
+        let s = gloss_of(it);
+        if !s.is_empty() {
+            anno_w = measure(dc, f_anno, &s).0;
+            anno_h = measure(dc, f_anno, "x").1 + sc(ROW_PAD);
+        }
     }
 
     let pre = PREEDIT.lock().unwrap().clone();
@@ -336,14 +332,14 @@ unsafe fn compute_layout(dc: HDC, items: &[Item]) -> Layout {
         let h = pad * 2 + pre_h + row_h + if anno_h > 0 { anno_h } else { 0 } + footer_h;
         (w.max(pad * 2 + anno_w).max(pad * 2 + top_w).max(pad * 2 + footer_w).max(sc(120)), h)
     } else {
-        let w = (pad * 2 + index_w + gap + word_w + gap + pinyin_w + gap + ru_w)
+        let w = (pad * 2 + index_w + gap + word_w + gap + ru_w)
             .max(pad * 2 + top_w)
             .max(pad * 2 + footer_w);
         let h = pad * 2 + pre_h + (nth as i32) * row_h + footer_h;
         (w, h)
     };
 
-    Layout { index_w, word_w, pinyin_w, ru_w, item_w, hitem, row_h, line_h, anno_w, anno_h, width, height }
+    Layout { index_w, word_w, item_w, hitem, row_h, line_h, anno_h, width, height }
 }
 
 pub unsafe fn detect_theme() {
@@ -461,7 +457,7 @@ unsafe extern "system" fn proc_cand(h: HWND, msg: u32, w: WPARAM, l: LPARAM) -> 
                 }
                 if lay.anno_h > 0 {
                     if let Some(it) = items.get(sel) {
-                        let s = format!("{}   {}", it.pinyin, gloss_of(it));
+                        let s = gloss_of(it);
                         SelectObject(dc, f_anno);
                         SetTextColor(dc, if it.fresh { p.fresh } else { p.faint });
                         let g: Vec<u16> = s.encode_utf16().collect();
@@ -471,8 +467,7 @@ unsafe extern "system" fn proc_cand(h: HWND, msg: u32, w: WPARAM, l: LPARAM) -> 
             } else {
                 let x_index = pad;
                 let x_word = x_index + lay.index_w + gap;
-                let x_pinyin = x_word + lay.word_w + gap;
-                let x_ru = x_pinyin + lay.pinyin_w + gap;
+                let x_ru = x_word + lay.word_w + gap;
                 for (i, it) in items.iter().take(crate::settings::max_cands()).enumerate() {
                     let ry = y + (i as i32) * lay.row_h;
                     let ru = RU_SEL.load(Ordering::Relaxed);
@@ -488,7 +483,7 @@ unsafe extern "system" fn proc_cand(h: HWND, msg: u32, w: WPARAM, l: LPARAM) -> 
                         b.left = bar_l(hot_ru);
                         fill_round(dc, &b, sc(BAR_RADIUS), p.hover);
                     }
-                    // 中文侧选中：序号/词/拼音都压在青条上；俄语列两种选中侧都压着
+                    // 中文侧选中：序号/词都压在青条上；俄语列两种选中侧都压着
                     let on_bar_word = i == sel && !ru;
                     let on_bar_ru = i == sel;
                     let ty = ry + sc(ROW_PAD);
@@ -502,10 +497,9 @@ unsafe extern "system" fn proc_cand(h: HWND, msg: u32, w: WPARAM, l: LPARAM) -> 
                     let word: Vec<u16> = it.word.encode_utf16().collect();
                     TextOutW(dc, x_word, ty, &word);
 
+                    // 俄语列字体（v4.8.0 去拼音列后这行 SelectObject 仍要给下面的
+                    // 俄语 TextOutW 用，不能跟拼音块一起删）
                     SelectObject(dc, f_anno);
-                    SetTextColor(dc, if on_bar_word { p.bar_text } else { p.faint });
-                    let py: Vec<u16> = it.pinyin.encode_utf16().collect();
-                    TextOutW(dc, x_pinyin, ty + small_anno, &py);
 
                     // 压着青条的列一律用条上文字色（生词橙在浅色青底上对比太弱）；
                     // 非选中行的生词照旧橙色
@@ -721,7 +715,7 @@ unsafe fn v_geom(dc: HDC) -> Option<(i32, i32, i32, i32, Layout)> {
         y += ph + sc(ROW_PAD) * 2;
     }
     let x_word = pad + lay.index_w + gap;
-    let x_ru = x_word + lay.word_w + gap + lay.pinyin_w + gap;
+    let x_ru = x_word + lay.word_w + gap;
     Some((y, lay.row_h, x_word, x_ru, lay))
 }
 
@@ -741,7 +735,7 @@ pub unsafe fn hit_test(x: i32, y: i32) -> Option<(usize, bool)> {
     if x >= x_ru {
         Some((i, true))
     } else if x >= 0 {
-        // 俄语列左边整块（含序号、词、拼音列）都算中文侧，点空白也能选
+        // 俄语列左边整块（含序号、词列）都算中文侧，点空白也能选
         Some((i, false))
     } else {
         None
@@ -789,8 +783,9 @@ pub unsafe fn hit_rect(row: usize, ru: bool) -> Option<(i32, i32, i32, i32)> {
     let (y0, row_h, x_word, x_ru, _lay) = r?;
     if row >= ITEMS.lock().unwrap().len() { return None; }
     let top = y0 + row as i32 * row_h;
-    let l = if ru { x_ru } else { x_word };
-    Some((l, top, l + 60, top + row_h))
+    // v4.8.0 去拼音列后中文侧矩形跨整个词列（x_word..x_ru），中心必落在中文侧；
+    // 旧固定 60px 宽在窄词（word_w+gap<30）时中心会越过 x_ru 翻到俄语侧
+    Some(if ru { (x_ru, top, x_ru + 60, top + row_h) } else { (x_word, top, x_ru, top + row_h) })
 }
 
 // ---- 测试台架专用导出（side_e2e 用 GetProcAddress 拿，不挂在正常 API 上）----
@@ -818,7 +813,7 @@ pub unsafe extern "system" fn cand_hit_rect_export(row: u32, ru: u32, out: *mut 
 }
 
 /// 横排第 row 条目的悬停跨度 (l, r) 写进 out[2]（竖排没有跨度，返回 0）。
-/// 台架横排悬停模拟用 —— hit_rect 只有 60px 中文侧矩形，点不中第 1 条。
+/// 台架横排悬停模拟用 —— hit_rect 是竖排几何，横排条目没有对应矩形，只能走跨度。
 #[no_mangle]
 pub unsafe extern "system" fn cand_span_export(row: u32, out: *mut i32) -> u32 {
     if out.is_null() { return 0; }

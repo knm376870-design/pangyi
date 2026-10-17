@@ -66,7 +66,7 @@ impl CompSlot {
 static COMPOSITION: CompSlot = CompSlot(Mutex::new(None));
 static UI_CANDS: Mutex<Vec<(String, String)>> = Mutex::new(Vec::new());
 /// 全部候选（翻页用）以及当前页号
-static ALL_CANDS: Mutex<Vec<(String, String, String)>> = Mutex::new(Vec::new());
+static ALL_CANDS: Mutex<Vec<(String, String)>> = Mutex::new(Vec::new());
 static PAGE: AtomicUsize = AtomicUsize::new(0);
 /// 整句翻译：当前句子缓冲（自上个句末标点/回车以来已上屏的中文词序列）。
 /// 只在整句模式（trmode=2）里写；句末收尾后清空。
@@ -176,7 +176,7 @@ fn set_all_cands(hits: Vec<dict::Hit>) {
         g.clear();
         // 直接把 lookup 的结果移进来（原来是逐条 clone），
         // 候选池放大到几百条之后这一步不能再白拷一份
-        g.extend(hits.into_iter().map(|h| (h.word, h.pinyin, h.ru)));
+        g.extend(hits.into_iter().map(|h| (h.word, h.ru)));
     }
     PAGE.store(0, std::sync::atomic::Ordering::Relaxed);
     refresh_page();
@@ -199,9 +199,9 @@ fn refresh_page() {
         let slice = &all[start..end];
         let items: Vec<cand::Item> = slice
             .iter()
-            .map(|(w, p, r)| cand::Item { word: w.clone(), pinyin: p.clone(), ru: r.clone(), fresh: false })
+            .map(|(w, r)| cand::Item { word: w.clone(), ru: r.clone(), fresh: false })
             .collect();
-        let ui: Vec<(String, String)> = slice.iter().map(|(w, _p, r)| (w.clone(), r.clone())).collect();
+        let ui: Vec<(String, String)> = slice.iter().map(|(w, r)| (w.clone(), r.clone())).collect();
         (items, ui, page, pages)
     };
     unsafe {
@@ -349,7 +349,7 @@ impl TextService {
         }
         // 先读设置：log() 要靠 settings::debug() 决定要不要写，顺序不能反
         unsafe { settings::load(); }
-        log("Activate v4.7.0");
+        log("Activate v4.8.0");
         log(&format!(
             "cnpunct={} english={} trmode={}",
             crate::settings::cnpunct(),
