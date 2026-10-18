@@ -24,6 +24,10 @@
 //!   T15 fan+→+空格       -> противоположность（v4.11.0 义项拆到单词级：
 //!                            反的义项0原来是 "противоположность; анти"）
 //!   T16 fan+→+→+空格     -> анти（循环到下一个单词义项）
+//!   T17 fan+→×5+空格     -> бунтовать（v4.12.0 滑动窗：越出截断点后窗口滑过去，
+//!                            探测义项4可见+义项0滑出；上屏仍是一个单词）
+//!   T18 fan+→×6+空格     -> противоположность（义项循环回绕，窗口回锚定态）
+//!   T19 fan+↓+→×8+空格   -> виновник（犯8个义项滑动，探测义项7可见+义项4滑出）
 //!
 //! 鼠标点击用 PostMessage 直接投 WM_LBUTTONDOWN 到候选窗（同进程，走和
 //! 真鼠标完全一样的窗口过程），点击坐标用 DLL 的 cand_hit_rect_export 算。
@@ -299,6 +303,29 @@ unsafe fn click_sense(row: u32, sense: u32) -> bool {
     true
 }
 
+/// v4.12.0 滑动窗探针：第 row 行第 sense 个义项（全量序号）当前是否可见。
+/// cand_sense_rect_export 在义项滑出当前窗口 [a..b] 时返回 0 —— 用它验收
+/// 「高亮越过截断点后，后面的单词自动出现、前面的让位」的窗口状态。
+unsafe fn sense_visible(row: u32, sense: u32) -> bool {
+    let Some(dll) = KEEP_DLL else {
+        logline("没有 DLL 句柄，无法探测义项可见性");
+        return false;
+    };
+    type RectFn = unsafe extern "system" fn(u32, u32, *mut i32) -> u32;
+    let Some(fr) = GetProcAddress(dll, s!("cand_sense_rect_export")) else {
+        logline("DLL 没有导出 cand_sense_rect_export");
+        return false;
+    };
+    let get_rect: RectFn = std::mem::transmute(fr);
+    let mut rect = [0i32; 4];
+    let ok = get_rect(row, sense, rect.as_mut_ptr()) != 0;
+    logline(&format!(
+        "探测 义项可见性 row={row} sense={sense} -> {}",
+        if ok { "可见" } else { "滑出窗口" }
+    ));
+    ok
+}
+
 unsafe fn tick(h: HWND) {
     if QI < QUEUE.len() {
         if QI == 0 {
@@ -473,6 +500,52 @@ unsafe fn tick(h: HWND) {
         }
         20 => {
             let _ = result("T16", "「анти」", text_of() == "анти");
+            clear_edit();
+            logline("=== T17 滑动窗: fan+→×5+空格 -> бунтовать（越出截断点，后面的词自动出现） ===");
+            // 第一个 → 切到俄语侧不推进义项，→×5 = 切侧 + 4 步 = 义项 4
+            QUEUE = vec![0x46, 0x41, 0x4E, 0x27, 0x27, 0x27, 0x27, 0x27];
+            QI = 0;
+            PHASE = 21;
+        }
+        21 => {
+            // 高亮义项 4 时窗口应滑到 [1..4]：义项 4 已滑入可见，义项 0 让位滑出
+            let vis4 = sense_visible(0, 4);
+            let vis0 = sense_visible(0, 0);
+            let _ = result("T17 窗口状态", "义项4可见且义项0滑出", vis4 && !vis0);
+            QUEUE = vec![0x20];
+            QI = 0;
+            PHASE = 22;
+        }
+        22 => {
+            let _ = result("T17", "「бунтовать」", text_of() == "бунтовать");
+            clear_edit();
+            logline("=== T18 回绕: fan+→×6+空格 -> противоположность（义项循环回绕） ===");
+            // 反 5 个义项：→×6 = 切侧 + 5 步，5 % 5 = 0 回绕到义项 0
+            QUEUE = vec![0x46, 0x41, 0x4E, 0x27, 0x27, 0x27, 0x27, 0x27, 0x27, 0x20];
+            QI = 0;
+            PHASE = 23;
+        }
+        23 => {
+            let _ = result("T18", "「противоположность」", text_of() == "противоположность");
+            clear_edit();
+            logline("=== T19 滑动窗(犯): fan+↓+→×8+空格 -> виновник（多义项滑动） ===");
+            // ↓ 到第 2 行（犯），→×8 = 切侧 + 7 步 = 义项 7
+            QUEUE = vec![0x46, 0x41, 0x4E, 0x28, 0x27, 0x27, 0x27, 0x27, 0x27, 0x27, 0x27, 0x27];
+            QI = 0;
+            PHASE = 24;
+        }
+        24 => {
+            // 犯在第 1 行（↓ 后）：8 个义项、高亮 7 时窗口 [5..7]，
+            // 义项 7 可见，义项 4 已滑出
+            let vis7 = sense_visible(1, 7);
+            let vis4 = sense_visible(1, 4);
+            let _ = result("T19 窗口状态", "义项7可见且义项4滑出", vis7 && !vis4);
+            QUEUE = vec![0x20];
+            QI = 0;
+            PHASE = 25;
+        }
+        25 => {
+            let _ = result("T19", "「виновник」", text_of() == "виновник");
             logline("=== 进程内 pangyi 模块（应只有 target\\release 的新 DLL）===");
             log_modules();
             logline("=== 完 ===");

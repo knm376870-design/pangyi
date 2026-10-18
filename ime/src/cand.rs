@@ -7,6 +7,8 @@
 //! v4.10.0：多配色 —— 选中条/☁提示/页码药丸随 settings.txt 的 accent（0..4）走。
 //! v4.11.0：义项拆到单词级 —— `|`/`;`/`,` 都当义项分隔符（括号内不动），
 //! 一格 = 一个俄语单词（dict::split_senses）。
+//! v4.12.0：义项滑动窗 —— 高亮义项越出 44 字符截断点时显示串滑窗跟进
+//! （sense_window），被藏起的义项随 → 循环逐个现身，左 "…" 让位。
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicIsize, AtomicUsize, Ordering};
 use windows::core::{PCWSTR, w};
@@ -240,10 +242,54 @@ fn truncate(s: &str, max_chars: usize) -> String {
     out
 }
 
+/// v4.12.0 义项滑动窗：(起始义项 a, 结束义项 b, 显示串头有没有左省略号, 显示串)。
+/// k = 当前高亮义项（全义项序号）。k 在锚定视图内（老版显示，左无省略号）→ 窗口不变；
+/// k 越过右缘 → 窗口右移包住 k（先向右贪心扩给后文，再向左贪心扩留前文），
+/// 左边让出的义项由 "…" 占位 —— 用户报「选中省略号前一个单词后，后面的单词自动出现」。
+/// 预算 = MAX_RU_CHARS 字符（含省略号与 " · " 分隔）；单词本身超预算退化为截断单字。
+/// 显示串是唯一真源：sense_spans/sense_at/上屏高亮全部由它切分，点画一致。
+fn sense_window(it: &Item, k: usize) -> (usize, usize, bool, String) {
+    let senses = senses_of(it);
+    let n = senses.len();
+    if n == 0 { return (0, 0, false, String::new()); }
+    let k = k.min(n - 1);
+    let fits = |v: &[&str]| -> bool {
+        v.iter().map(|s| s.chars().count()).sum::<usize>()
+            + 3 * v.len().saturating_sub(1) <= MAX_RU_CHARS
+    };
+    let build = |a: usize, b: usize| -> Vec<&str> {
+        let mut v: Vec<&str> = Vec::new();
+        if a > 0 { v.push("…"); }
+        v.extend(&senses[a..=b]);
+        if b < n - 1 { v.push("…"); }
+        v
+    };
+    if !fits(&build(0, 0)) {
+        return (0, 0, false, truncate(senses[0], MAX_RU_CHARS));
+    }
+    // 锚定视图：从 0 起放得下的最长义项段（截断让位给 "…"，不再把单词腰斩）
+    let mut b0 = 0usize;
+    while b0 + 1 < n && fits(&build(0, b0 + 1)) { b0 += 1; }
+    if k <= b0 {
+        return (0, b0, false, truncate(&build(0, b0).join(" · "), MAX_RU_CHARS));
+    }
+    // 滑窗：右扩优先（后文先出现），再左扩；都进不去就只显示这个单词的截断
+    let mut a = k;
+    let mut b = k;
+    while b + 1 < n && fits(&build(a, b + 1)) { b += 1; }
+    while a > 0 && fits(&build(a - 1, b)) { a -= 1; }
+    let v = build(a, b);
+    if !fits(&v) {
+        return (k, k, false, truncate(senses[k], MAX_RU_CHARS));
+    }
+    (a, b, a > 0, truncate(&v.join(" · "), MAX_RU_CHARS))
+}
+
 fn gloss_of(it: &Item) -> String {
     // v4.11.0 义项拆到单词级：显示串由 senses_of join 出来（而不是对原始 ru
-    // 做字符替换）—— sense_spans 按 " · " 切的就是这些段，点画一致由构造保证
-    truncate(&crate::dict::split_senses(&it.ru).join(" · "), MAX_RU_CHARS)
+    // 做字符替换）—— sense_spans 按 " · " 切的就是这些段，点画一致由构造保证。
+    // v4.12.0 起非选中路径（中文侧/横排/布局测量）一律取锚定视图（k=0）。
+    sense_window(it, 0).3
 }
 
 // ---- v4.9.0 俄语义项选择（多义项挑一个上屏）----
@@ -258,16 +304,16 @@ fn senses_of(it: &Item) -> Vec<&str> {
     crate::dict::split_senses(&it.ru)
 }
 
-/// 显示串 gloss_of(it) 的精确切分：(片段文本, 相对俄语列左缘的偏移, 右缘)。
+/// 显示串 disp（sense_window 出品）的精确切分：(片段文本, 相对俄语列左缘的偏移, 右缘)。
 /// 对显示串本身按 " · " 切分 —— 与 WM_PAINT 画的是同一字符串、同一字体，
 /// 点画一致由构造保证（不是从原始 ru 重算，那样要复刻 truncate 的截断语义）。
 /// 末段右缘 = 显示串总宽（截断截到一半的义项也能点到最后）。
-fn sense_spans(dc: HDC, f: HFONT, it: &Item) -> Vec<(String, i32, i32)> {
-    let d = gloss_of(it);
+/// v4.12.0 起调用方把 sense_window 的显示串传进来（含左右 "…" 伪段）。
+fn sense_spans(dc: HDC, f: HFONT, disp: &str) -> Vec<(String, i32, i32)> {
     let sep_w = measure(dc, f, " · ").0;
     let mut x = 0i32;
     let mut out = Vec::new();
-    for p in d.split(" · ") {
+    for p in disp.split(" · ") {
         let w = measure(dc, f, p).0;
         out.push((p.to_string(), x, x + w));
         x += w + sep_w;
@@ -275,8 +321,11 @@ fn sense_spans(dc: HDC, f: HFONT, it: &Item) -> Vec<(String, i32, i32)> {
     out
 }
 
-/// 客户区 x 落在第 i 行俄语列的哪个义项：段内取该段；段间空隙取近侧；
-/// 两端夹紧（首段前取 0、末段后取最后一段）。义项数 ≤1 时恒 0。
+/// 客户区 x 落在第 i 行俄语列的哪个义项（返回**全义项序号**）：段内取该段；
+/// 段间空隙取近侧；两端夹紧（首段前取 0、末段后取最后一段）。义项数 ≤1 时恒 0。
+/// v4.12.0 滑窗：按当前高亮义项取显示窗（和 WM_PAINT 同一套 sense_window），
+/// span 序号映射回全义项序号 —— 左 "…" 伪段取首可见义项，右 "…" 伪段取
+/// 第一个被藏起的义项（点了正好滑窗揭示）。
 /// 注意锁序：ITEMS 锁必须释放后才调 v_geom（它内部也要锁 ITEMS，Mutex 不可重入）。
 unsafe fn sense_at(i: usize, client_x: i32) -> usize {
     let h = hwnd();
@@ -290,24 +339,30 @@ unsafe fn sense_at(i: usize, client_x: i32) -> usize {
         return 0;
     }
     let f = font(ANNO_PX);
-    let spans = sense_spans(dc, f, &g[i]);
+    let k = RU_SENSE.load(Ordering::Relaxed);
+    let (a, _b, left_off, disp) = sense_window(&g[i], k);
+    let spans = sense_spans(dc, f, &disp);
     drop(g);
     let x_ru = v_geom(dc).map(|(_, _, _, xr, _)| xr).unwrap_or(0);
     let _ = ReleaseDC(h, dc);
     let x = client_x - x_ru;
     if spans.is_empty() { return 0; }
-    if x < spans[0].2 { return 0; }
-    for k in 1..spans.len() {
-        let l = spans[k].1;
-        let r = spans[k].2;
-        if x < l {
-            // 落在分隔符空隙：离前段右缘近取前段，离后段左缘近取后段
-            let pr = spans[k - 1].2;
-            return if x * 2 < pr + l { k - 1 } else { k };
+    let s = if x < spans[0].2 { 0 } else {
+        let mut s = spans.len() - 1;
+        for t in 1..spans.len() {
+            let l = spans[t].1;
+            let r = spans[t].2;
+            if x < l {
+                // 落在分隔符空隙：离前段右缘近取前段，离后段左缘近取后段
+                let pr = spans[t - 1].2;
+                s = if x * 2 < pr + l { t - 1 } else { t };
+                break;
+            }
+            if x < r { s = t; break; }
         }
-        if x < r { return k; }
-    }
-    (spans.len() - 1).min(n - 1)
+        s
+    };
+    if left_off && s == 0 { a } else { (a + s - (left_off as usize)).min(n - 1) }
 }
 
 /// 当前高亮的是第几个义项（0 起；无义项/中文侧无意义时为 0）。
@@ -382,7 +437,12 @@ unsafe fn compute_layout(dc: HDC, items: &[Item]) -> Layout {
         let idx = format!("{}.", i + 1);
         let a = measure(dc, f_idx, &idx).0;
         let (bw, bh) = measure(dc, f_text, &it.word);
-        let d = measure(dc, f_anno, &gloss_of(it)).0;
+        // v4.12.0 滑窗：选中行俄语侧按当前高亮义项取窗，其余行锚定视图
+        // （窗恒 ≤ MAX_RU_CHARS，不会比老版更宽）
+        let k = if i == SEL.load(Ordering::Relaxed) && RU_SEL.load(Ordering::Relaxed) {
+            RU_SENSE.load(Ordering::Relaxed)
+        } else { 0 };
+        let d = measure(dc, f_anno, &sense_window(it, k).3).0;
         if a > index_w { index_w = a; }
         if bw > word_w { word_w = bw; }
         if d > ru_w { ru_w = d; }
@@ -617,22 +677,26 @@ unsafe extern "system" fn proc_cand(h: HWND, msg: u32, w: WPARAM, l: LPARAM) -> 
 
                     // 压着青条的列一律用条上文字色（生词橙在浅色青底上对比太弱）；
                     // 非选中行的生词照旧橙色
-                    let gloss: Vec<u16> = gloss_of(it).encode_utf16().collect();
                     // v4.9.0 多义项 + 俄语侧选中：整串 faint 打底、当前义项
                     // bar_text 覆盖（覆盖段与整串同位置同文本，点画一致）；
-                    // 中文侧选中或义项 ≤1 时照旧整串一条
+                    // 中文侧选中或义项 ≤1 时照旧整串一条。
+                    // v4.12.0 高亮义项越出截断点时显示串滑动跟进（sense_window），
+                    // 覆盖段索引 = k - a + 左 "…" 伪段，恒落在窗口内
                     if ru && i == sel && senses_of(it).len() >= 2 {
-                        let spans = sense_spans(dc, f_anno, it);
+                        let k = RU_SENSE.load(Ordering::Relaxed);
+                        let (a, _b, left_off, disp) = sense_window(it, k);
+                        let gloss: Vec<u16> = disp.encode_utf16().collect();
+                        let spans = sense_spans(dc, f_anno, &disp);
                         SetTextColor(dc, p.faint);
                         TextOutW(dc, x_ru, ty + small_anno, &gloss);
-                        // 首义项超长截断成 1 段时 % spans.len() 防覆盖越界
-                        let k = RU_SENSE.load(Ordering::Relaxed) % spans.len().max(1);
-                        if let Some((piece, l, _)) = spans.get(k) {
+                        let si = (k - a) + (left_off as usize);
+                        if let Some((piece, l, _)) = spans.get(si) {
                             SetTextColor(dc, p.bar_text);
                             let g: Vec<u16> = piece.encode_utf16().collect();
                             TextOutW(dc, x_ru + l, ty + small_anno, &g);
                         }
                     } else {
+                        let gloss: Vec<u16> = gloss_of(it).encode_utf16().collect();
                         SetTextColor(dc, if on_bar_ru { p.bar_text } else if it.fresh { p.fresh } else { p.faint });
                         TextOutW(dc, x_ru, ty + small_anno, &gloss);
                     }
@@ -952,9 +1016,10 @@ pub unsafe extern "system" fn cand_hit_rect_export(row: u32, ru: u32, out: *mut 
     }
 }
 
-/// 第 row 行第 sense 个义项的点击矩形写进 out[4] = l,t,r,b（客户区坐标）。
-/// v4.9.0 台架精确点击义项用（和 WM_PAINT/sense_at 同一套 sense_spans）。
-/// sense 超出显示段数返回 0。
+/// 第 row 行第 sense 个义项（**全义项序号**）的点击矩形写进 out[4] = l,t,r,b
+/// （客户区坐标）。v4.9.0 台架精确点击义项用（和 WM_PAINT/sense_at 同一套
+/// sense_window + sense_spans）。v4.12.0 起 sense 不在当前显示窗内（滑窗让位后）
+/// 返回 0 —— 台架借此断言滑窗状态。
 #[no_mangle]
 pub unsafe extern "system" fn cand_sense_rect_export(row: u32, sense: u32, out: *mut i32) -> u32 {
     if out.is_null() { return 0; }
@@ -972,10 +1037,17 @@ pub unsafe extern "system" fn cand_sense_rect_export(row: u32, sense: u32, out: 
         let _ = ReleaseDC(h, dc);
         return 0;
     };
-    let spans = sense_spans(dc, font(ANNO_PX), it);
+    let (a, b, left_off, disp) = sense_window(it, RU_SENSE.load(Ordering::Relaxed));
+    let s = sense as usize;
+    if s < a || s > b {
+        drop(g);
+        let _ = ReleaseDC(h, dc);
+        return 0;
+    }
+    let spans = sense_spans(dc, font(ANNO_PX), &disp);
     drop(g);
     let _ = ReleaseDC(h, dc);
-    let Some((_, l, rr)) = spans.get(sense as usize) else { return 0 };
+    let Some((_, l, rr)) = spans.get(s - a + (left_off as usize)) else { return 0 };
     let top = y0 + row as i32 * row_h;
     *out.add(0) = x_ru + l;
     *out.add(1) = top;

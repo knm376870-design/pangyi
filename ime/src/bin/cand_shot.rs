@@ -44,12 +44,18 @@ fn main() {
             }
         } else if std::env::args().nth(1).as_deref() == Some("split") {
             // v4.11.0 义项拆到单词级变体：反/犯 的 | 和 ; 全拆成单词格，
-            // 验收「一格一个俄语单词」的显示态（用户报：一次选中上屏两个俄语单词）
+            // 验收「一格一个俄语单词」的显示态（用户报：一次选中上屏两个俄语单词）。
+            // v4.12.0：argv[2] = 高亮义项序号（默认 0），>0 时先按 → 循环过去 ——
+            // 越出截断点即触发滑动窗，验收「后面的单词自动出现」的显示态
             pangyi_ime::cand::set_items(vec![
                 pangyi_ime::cand::Item { word: "反".into(), ru: "противоположность; анти | повторить | отомстить | бунтовать".into(), fresh: false },
                 pangyi_ime::cand::Item { word: "犯".into(), ru: "нарушать; атаковать; посягать | совершить (преступление); нарушать | преступник; правонарушитель; виновник".into(), fresh: false },
             ]);
             pangyi_ime::cand::set_ru_sel(true);
+            let k: usize = std::env::args().nth(2).and_then(|s| s.parse().ok()).unwrap_or(0);
+            for _ in 0..k {
+                pangyi_ime::cand::ru_sense_next();
+            }
         } else {
             pangyi_ime::cand::set_items(vec![
                 pangyi_ime::cand::Item { word: "朋友".into(), ru: "друг · товарищ".into(), fresh: false },
@@ -65,8 +71,10 @@ fn main() {
         pangyi_ime::cand::show_at(600, 400);
         // 模拟鼠标悬停：竖排悬停 hrow 行中文侧；横排所有条目共一行，
         // 用跨度导出悬停第 1 条（第 0 条就是选中条，悬停条被压住看不到）
-        // senses 变体固定悬停第 1 行（argv[2] 是义项序号）；其余变体 argv[2] 是悬停行
-        let hrow: u32 = if std::env::args().nth(1).as_deref() == Some("senses") {
+        // senses/split 变体固定悬停第 1 行（argv[2] 是义项序号）；其余变体 argv[2] 是悬停行
+        let hrow: u32 = if std::env::args().nth(1).as_deref() == Some("senses")
+            || std::env::args().nth(1).as_deref() == Some("split")
+        {
             1
         } else {
             std::env::args().nth(2).and_then(|s| s.parse().ok()).unwrap_or(1)
