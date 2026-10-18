@@ -9,13 +9,16 @@
 //!   T1  逐字: ni+空格       -> 你 ты
 //!   T2  逐字: nihao+空格    -> 你好 привет
 //!   T3  逐字: nihao+。      -> 你好 привет。
-//!   T4  整句: wo ai ni+。   -> 我爱你。 я любить ты.
+//!   T4  整句: wo ai ni+。   -> 我爱你。 я любить ты.（v4.11.0 义项拆到
+//!                            单词级：я; мне; мой -> я、ты, вы -> ты）
 //!   T5  整句: nihao+回车    -> 你好 привет（回车收尾，不换行）
 //!   T6  整句: nihao+。      -> 你好。 привет.
 //!   T7  关:   nihao+，      -> 你好，（无翻译）
 //!   T8  逐字: jintian+空格  -> 今天 сегодня
 //!   T9  整句: ni+ESC+。     -> 。（ESC 取消不残留，空句不加翻译）
 //!   T10 关:   ni+空格       -> 你（回归：关模式纯净上屏）
+//!   T11 逐字: fan+空格      -> 反 противоположность（v4.11.0 拆单词：
+//!                            反的义项0原来是 "противоположность; анти"）
 //!
 //! 用法：trans_e2e.exe [新DLL路径]
 #![allow(non_snake_case)]
@@ -239,13 +242,13 @@ unsafe fn tick(h: HWND) {
                 Err(e) => logline(&format!("拿不到 profiles: {e:?}")),
             }
             activate();
-            logline("=== T1 逐字: ni+空格 -> 你 ты, вы ===");
+            logline("=== T1 逐字: ni+空格 -> 你 ты ===");
             QUEUE = vec![0x4E, 0x49, 0x20];
             QI = 0;
             PHASE = 1;
         }
         1 => {
-            let _ = result("T1", "「你 ты, вы」", text_of() == "你 ты, вы");
+            let _ = result("T1", "「你 ты」", text_of() == "你 ты");
             clear_edit();
             logline("=== T2 逐字: nihao+空格 -> 你好 привет ===");
             QUEUE = vec![0x4E, 0x49, 0x48, 0x41, 0x4F, 0x20];
@@ -275,7 +278,7 @@ unsafe fn tick(h: HWND) {
             PHASE = 5;
         }
         5 => {
-            let _ = result("T4", "「我爱你。 я; мне; мой любить ты, вы.」", text_of() == "我爱你。 я; мне; мой любить ты, вы.");
+            let _ = result("T4", "「我爱你。 я любить ты.」", text_of() == "我爱你。 я любить ты.");
             clear_edit();
             logline("=== T5 整句: nihao+回车 -> 你好 привет（回车收尾不上屏换行）===");
             QUEUE = vec![0x4E, 0x49, 0x48, 0x41, 0x4F, 0x20, 0x0D];
@@ -348,6 +351,20 @@ unsafe fn tick(h: HWND) {
         }
         15 => {
             let _ = result("T10", "「你」", text_of() == "你");
+            clear_edit();
+            logline("=== Ctrl+, 切到逐字 ===");
+            QUEUE = vec![0x8011, 0xBC, 0x4011];
+            QI = 0;
+            PHASE = 16;
+        }
+        16 => {
+            logline("=== T11 逐字拆单词: fan+空格 -> 反 противоположность ===");
+            QUEUE = vec![0x46, 0x41, 0x4E, 0x20];
+            QI = 0;
+            PHASE = 17;
+        }
+        17 => {
+            let _ = result("T11", "「反 противоположность」", text_of() == "反 противоположность");
             logline("=== 进程内 pangyi 模块（应只有 target\\release 的新 DLL）===");
             log_modules();
             logline("=== 完 ===");

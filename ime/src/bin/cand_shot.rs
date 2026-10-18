@@ -42,6 +42,14 @@ fn main() {
             for _ in 0..k {
                 pangyi_ime::cand::ru_sense_next();
             }
+        } else if std::env::args().nth(1).as_deref() == Some("split") {
+            // v4.11.0 义项拆到单词级变体：反/犯 的 | 和 ; 全拆成单词格，
+            // 验收「一格一个俄语单词」的显示态（用户报：一次选中上屏两个俄语单词）
+            pangyi_ime::cand::set_items(vec![
+                pangyi_ime::cand::Item { word: "反".into(), ru: "противоположность; анти | повторить | отомстить | бунтовать".into(), fresh: false },
+                pangyi_ime::cand::Item { word: "犯".into(), ru: "нарушать; атаковать; посягать | совершить (преступление); нарушать | преступник; правонарушитель; виновник".into(), fresh: false },
+            ]);
+            pangyi_ime::cand::set_ru_sel(true);
         } else {
             pangyi_ime::cand::set_items(vec![
                 pangyi_ime::cand::Item { word: "朋友".into(), ru: "друг · товарищ".into(), fresh: false },

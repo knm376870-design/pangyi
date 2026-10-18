@@ -818,9 +818,34 @@ fn zh_index() -> &'static ZhIndex {
     })
 }
 
-/// 俄语释义只取第一项（词典里用 | 分隔多个译法，翻译输出只留第一个）。
+/// 义项切分（v4.11.0 义项拆到单词级）：`|`（义项组）、`;` 和 `,`（组内近义词）
+/// 都是分隔符，一格 = 一个俄语单词。括号里的分隔符不动 ——
+/// "(средства, ресурсы)" 里的逗号是用法注释不是近义词。候选窗显示串由
+/// 本函数 join 出来（点画一致），翻译输出只取第一项。
+pub fn split_senses(ru: &str) -> Vec<&str> {
+    let mut out: Vec<&str> = Vec::new();
+    let mut depth = 0i32;
+    let mut start = 0usize;
+    for (i, c) in ru.char_indices() {
+        match c {
+            '(' => depth += 1,
+            ')' => depth = (depth - 1).max(0),
+            '|' | ';' | ',' | '，' if depth == 0 => {
+                out.push(ru[start..i].trim());
+                start = i + c.len_utf8();
+            }
+            _ => {}
+        }
+    }
+    out.push(ru[start..].trim());
+    out.retain(|s| !s.is_empty());
+    out
+}
+
+/// 俄语释义只取第一个单词（v4.11.0 起 | ; , 都算义项分隔，翻译输出只留
+/// 第一个 —— 避免一个中文词后面跟上 "противоположность; анти" 两个单词）。
 fn ru_first(ru: &str) -> &str {
-    ru.split('|').next().unwrap_or(ru).trim()
+    split_senses(ru).first().copied().unwrap_or("")
 }
 
 /// 查一个词的俄语第一释义。逐字模式用：词上屏时跟在后面。

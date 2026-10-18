@@ -5,6 +5,8 @@
 //! v4.8.0：去掉拼音列（拼音只在顶行输入串里显示，候选词旁不再展示）。
 //! v4.9.0：俄语义项选择 —— 多义项词在俄语侧按 → 循环挑义项 / 鼠标点义项上屏。
 //! v4.10.0：多配色 —— 选中条/☁提示/页码药丸随 settings.txt 的 accent（0..4）走。
+//! v4.11.0：义项拆到单词级 —— `|`/`;`/`,` 都当义项分隔符（括号内不动），
+//! 一格 = 一个俄语单词（dict::split_senses）。
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicIsize, AtomicUsize, Ordering};
 use windows::core::{PCWSTR, w};
@@ -239,15 +241,21 @@ fn truncate(s: &str, max_chars: usize) -> String {
 }
 
 fn gloss_of(it: &Item) -> String {
-    truncate(&it.ru.replace('|', " · "), MAX_RU_CHARS)
+    // v4.11.0 义项拆到单词级：显示串由 senses_of join 出来（而不是对原始 ru
+    // 做字符替换）—— sense_spans 按 " · " 切的就是这些段，点画一致由构造保证
+    truncate(&crate::dict::split_senses(&it.ru).join(" · "), MAX_RU_CHARS)
 }
 
 // ---- v4.9.0 俄语义项选择（多义项挑一个上屏）----
 
-/// 义项列表（trim + 去空）。注意与显示串是两回事：显示串由 gloss_of 截断，
+/// 义项列表。注意与显示串是两回事：显示串由 gloss_of 截断，
 /// 提交/计数一律用这里的完整义项。
+/// v4.11.0 起拆到单词级：| ; , 都算分隔符（括号内不动）—— 词典里义项组内
+/// 还有近义词连接（如 反 → "противоположность; анти | повторить"、
+/// 你 → "ты, вы | твой, ваш"），选中一格一次上屏 2~3 个单词 ——
+/// 一格 = 一个俄语单词。切分逻辑在 dict::split_senses。
 fn senses_of(it: &Item) -> Vec<&str> {
-    it.ru.split('|').map(str::trim).filter(|s| !s.is_empty()).collect()
+    crate::dict::split_senses(&it.ru)
 }
 
 /// 显示串 gloss_of(it) 的精确切分：(片段文本, 相对俄语列左缘的偏移, 右缘)。
