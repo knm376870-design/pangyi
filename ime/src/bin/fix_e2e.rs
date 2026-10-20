@@ -36,7 +36,21 @@
 //!    C6 nihaox + ←← + → + Del + 空格 → 你好（→ 右移光标再删尾）
 //!    C7 nihao + Home + 退格 + 空格 → 你好（光标在 0 退格不动）
 //!
-//! 用法：fix_e2e.exe [新DLL路径]  （LOCALAPPDATA 由调用方重定向）
+//! v4.15.0 子套（argv[2] 选，独立进程、独立种子）：
+//!   english E2  a → a（english=1 被 load 读到，直通）；Shift 单击 → 中文，
+//!               a+ESC 无残留；再 Shift 单击 → 英文，a → 文档 aa
+//!   （C/D 两例的 Shift 单击也随 v4.15.0 改成「按住一拍再松开」注入）
+//! v4.16.0 emoji 子套重写（emoji=0 种子起步，全程模拟「面板进程写盘」）：
+//!   E1  写盘 emoji=1 → 等热重载 → aini+空格 → 文档含 ❤（不重启宿主就生效）
+//!   E2  写盘 emoji=0 → aini+空格 → 文档含 爱 不含 ❤（关掉立即生效）
+//!   E3  写盘 emoji=1 → xswl+空格 → 文档含 😂（网红缩写关键词也出表情）
+//!   E4  ai 按 5 → 词典词仍可选（表情占前 4 位不挡路，不影响其他功能）
+//!   E5  xiaom+空格 → 文档非空且零表情（前缀不是关键词就不注入；首选词由
+//!       整句 DP 定，不猜具体词）
+//!   Z1  aini 组合中（候选窗可见）→ 前台被别的进程拿走（起记事本模拟
+//!       「关掉浏览器」）→ 候选窗自动收掉，不残留僵尸窗
+//!
+//! 用法：fix_e2e.exe [新DLL路径] [normal|emoji|english]（LOCALAPPDATA 由调用方重定向）
 #![allow(non_snake_case)]
 use windows::core::{s, GUID, HRESULT, Interface, IUnknown, PCWSTR, Result};
 use windows::Win32::Foundation::*;
@@ -53,18 +67,30 @@ const OUR_PROFILE: GUID = GUID::from_u128(0x5A7C9E12_3D4B_4F8A_B6E1_2C9D7A5E8F34
 const LANG: u16 = 0x0804;
 const OUT: &str =
     r"C:\Users\33354\Documents\Codex\2026-10-08\github-yenharvey-qingjian\work\fix-e2e.txt";
+const OUT_EMOJI: &str =
+    r"C:\Users\33354\Documents\Codex\2026-10-08\github-yenharvey-qingjian\work\fix-emoji-e2e.txt";
+const OUT_ENGLISH: &str =
+    r"C:\Users\33354\Documents\Codex\2026-10-08\github-yenharvey-qingjian\work\fix-english-e2e.txt";
 
 static mut MAIN: HWND = HWND(0);
 static mut EDIT: HWND = HWND(0);
 static mut PHASE: u32 = 0;
 static mut QI: usize = 0;
 static mut QUEUE: Vec<u16> = Vec::new();
+/// 运行模式（argv[2]）：0 = normal 全套 / 1 = emoji 子套 E1 / 2 = english 子套 E2
+static mut MODE: u8 = 0;
 static mut LOG: String = String::new();
 static mut PROFILES: Option<ITfInputProcessorProfiles> = None;
+/// Z1 用的记事本进程（模拟「另一个进程拿走前台」）
+static mut NOTE: Option<std::process::Child> = None;
+/// Z1 等记事本拿前台的拍数（每拍 260ms，最多 20 拍 ~5 秒）
+static mut ZWAIT: i32 = 0;
 static mut KEEP_DLL: Option<HMODULE> = None;
 static mut KEEP_UNK: Option<IUnknown> = None;
 static mut COOKIE: u32 = 0;
 static mut HOOK: HHOOK = HHOOK(0);
+static mut OLD_EDIT_PROC: WNDPROC = None;
+static mut G8_DIGEST: u32 = 0;
 static mut STALL: u32 = 0;
 static mut IN_TICK: bool = false;
 
@@ -90,8 +116,15 @@ fn wide(s: &str) -> Vec<u16> {
 fn logline(s: &str) {
     unsafe { LOG.push_str(s); LOG.push('\n'); }
 }
+/// 三个子套各写各的日志（v4.15.0）：原来共用一个 OUT，后跑的子套把先跑的
+/// 覆盖掉，normal/emoji 的结果根本看不到
 unsafe fn flush() {
-    std::fs::write(OUT, LOG.as_bytes()).ok();
+    let out = match MODE {
+        1 => OUT_EMOJI,
+        2 => OUT_ENGLISH,
+        _ => OUT,
+    };
+    std::fs::write(out, LOG.as_bytes()).ok();
 }
 
 unsafe fn text_of() -> String {
@@ -100,6 +133,31 @@ unsafe fn text_of() -> String {
         as usize;
     String::from_utf16_lossy(&buf[..n.min(buf.len())])
 }
+/// 模拟面板进程写盘：改 settings.txt 里的 emoji= 一行（其余行原样保留），
+/// 触发 status 轮询热重载 —— 验证「面板在别的进程开/关表情模式，宿主
+/// 不用重开就生效」（v4.16.0 修的「表情打不出来」）。
+unsafe fn write_cfg_emoji(on: bool) {
+    let base = std::env::var("LOCALAPPDATA").unwrap_or_default();
+    let path = format!("{base}\\Pangyi\\settings.txt");
+    let s = std::fs::read_to_string(&path).unwrap_or_default();
+    let v = if on { "1" } else { "0" };
+    let mut out = String::new();
+    let mut hit = false;
+    for line in s.lines() {
+        if line.trim_start().starts_with("emoji=") {
+            out.push_str(&format!("emoji={v}\n"));
+            hit = true;
+        } else {
+            out.push_str(line);
+            out.push('\n');
+        }
+    }
+    if !hit {
+        out.push_str(&format!("emoji={v}\n"));
+    }
+    let _ = std::fs::write(path, out);
+}
+
 unsafe fn clear_edit() {
     // 先 ESC 取消可能残留的 TSF 组合（丢键干扰时上一用例的组合没提交，
     // 不清掉会串进下一个用例 —— 2026-10-18 实测 [nigzuo你工作] 连锁），
@@ -165,6 +223,30 @@ unsafe fn focus_ours() {
     std::thread::sleep(std::time::Duration::from_millis(100));
 }
 
+/// 前台窗口的进程 id（没有前台窗口时 0）
+unsafe fn fg_pid() -> u32 {
+    let fg = GetForegroundWindow();
+    if fg.0 == 0 {
+        return 0;
+    }
+    let mut pid: u32 = 0;
+    GetWindowThreadProcessId(fg, Some(&mut pid));
+    pid
+}
+
+/// 本进程的候选窗现在是否可见（按类名找，再验进程 —— 别的宿主进程里
+/// 也可能有 PangyiCandModern，别认错窗口）
+unsafe fn cand_visible() -> bool {
+    let cls: Vec<u16> = "PangyiCandModern\0".encode_utf16().collect();
+    let h = FindWindowW(PCWSTR(cls.as_ptr()), PCWSTR::null());
+    if h.0 == 0 {
+        return false;
+    }
+    let mut pid: u32 = 0;
+    GetWindowThreadProcessId(h, Some(&mut pid));
+    pid == std::process::id() && IsWindowVisible(h).as_bool()
+}
+
 /// 手动泵消息 ms 毫秒：tick 处理器里同步干的活（注入按键、激活 TSF）之后
 /// 队列里的消息要等 tick 返回才会被泵 —— 注入的按键在「激活前」需要先被
 /// 宿主消化掉（比如 G7 的 Caps 要先过宿主队列，Activate 时的 GetKeyState
@@ -178,6 +260,24 @@ unsafe fn pump_ms(ms: u64) {
             DispatchMessageW(&m);
         }
         std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+}
+
+/// 模拟「宿主消化掉 Caps 键」（VK_CAPITAL 不进 TSF，浏览器/聊天应用一类）：
+/// 把 RichEdit 的 wndproc 换成自己，G8_DIGEST 开火期间 Caps 的 down/up 直接
+/// 吞掉不转交 —— IME 的 track_caps 永远看不到 0x14，而 GetAsyncKeyState 的
+/// 「按过沿」是 TSF 按键管理器在 KeyDown 路由时才置位的（2026-10-20 实测：
+/// PeekMessage 取出后=0、wndproc 入口=0、TSF 回调时=1），消化宿主里沿永远
+/// 不置位，路径 2 也哑火。复现用户报的「开着大写还是出中文」。G8_DIGEST 只
+/// 开火两枪（Caps down + up），其余所有消息原样转交，不改变测试其余行为。
+extern "system" fn edit_proc(h: HWND, msg: u32, w: WPARAM, l: LPARAM) -> LRESULT {
+    unsafe {
+        if (msg == WM_KEYDOWN || msg == WM_KEYUP) && w.0 == 0x14 && G8_DIGEST > 0 {
+            G8_DIGEST -= 1;
+            logline(&format!("G8host 宿主消化 Caps {:?} 剩{G8_DIGEST}枪", if msg == WM_KEYDOWN { "down" } else { "up" }));
+            return LRESULT(0); // 宿主自己消化掉，不进 TSF
+        }
+        CallWindowProcW(OLD_EDIT_PROC, h, msg, w, l)
     }
 }
 
@@ -389,7 +489,15 @@ unsafe fn tick(h: HWND) {
             // 才新鲜；真实场景里 Caps 在别的应用按完，焦点切过来时宿主
             // 早已泵过消息，时序就是这样）。
             focus_ours();
-            send_code(0x14);
+            if MODE == 0 {
+                send_code(0x14);
+            } else {
+                // 子套要小写字母进拼音串，先把可能的 Caps 残留关掉（全套
+                // 的 G 系用例结尾都会把 Caps 翻回去，这里只是兜底）
+                if (GetKeyState(VK_CAPITAL.0 as i32) as u16 & 1) != 0 {
+                    send_code(0x14);
+                }
+            }
             pump_ms(200);
             let _ = CoCreateInstance::<_, ITfThreadMgr>(&CLSID_TF_ThreadMgr, None, CLSCTX_INPROC_SERVER)
                 .map(|tm| {
@@ -415,11 +523,136 @@ unsafe fn tick(h: HWND) {
                 return;
             }
             logline("进程内只有新 DLL，开始测");
+            if MODE == 1 {
+                // E1 前置：种子是 emoji=0（默认关）。模拟【面板进程】写盘
+                // emoji=1（settings.txt 的 emoji= 行），宿主进程不重启，
+                // status 轮询热重载应在 ~0.5s 内读到 —— v4.16.0 修的
+                // 「面板开了表情模式，正在打字的宿主一个表情不出」。
+                logline("=== E1: 模拟面板写盘 emoji=1，等热重载，打 aini+空格 —— 表情候选排最前，首选 ❤ ===");
+                write_cfg_emoji(true);
+                pump_ms(1200); // 至少跨两个 500ms 轮询拍
+                QUEUE = vec![0x41, 0x49, 0x4E, 0x49, 0x20]; // a i n i 空格
+                QI = 0;
+                PHASE = 1;
+                return;
+            }
+            if MODE == 2 {
+                logline("=== E2a: english=1 已种，打 a —— 直通出 a ===");
+                QUEUE = vec![0x41]; // a
+                QI = 0;
+                PHASE = 1;
+                return;
+            }
             logline("=== G7: 激活前 Caps 已开，打 A —— 大写 A 直通 ===");
             QUEUE = vec![0x41]; // A
             QI = 0;
             PHASE = 1;
         }
+        // v4.16.0 emoji 子套（MODE=1）：E1-E5 表情热重载 + 注入边界
+        _ if MODE == 1 => match PHASE {
+            1 => {
+                let t = text_of();
+                let _ = result("E1", "文档含 ❤（面板写盘后热重载，表情候选注入并首选上屏）", t.contains('❤'));
+                logline("=== E2: 模拟面板写盘 emoji=0，打 aini+空格 —— 关掉立即生效，正常候选回归 ===");
+                write_cfg_emoji(false);
+                pump_ms(1200);
+                clear_edit();
+                QUEUE = vec![0x41, 0x49, 0x4E, 0x49, 0x20]; // a i n i 空格
+                QI = 0;
+                PHASE = 2;
+            }
+            2 => {
+                let t = text_of();
+                let _ = result("E2", "文档含 爱 且不含 ❤（表情模式关掉后热重载，不再注入）", t.contains('爱') && !t.contains('❤'));
+                logline("=== E3: 写盘 emoji=1，打网红缩写 xswl+空格 —— 缩写关键词也出表情 ===");
+                write_cfg_emoji(true);
+                pump_ms(1200);
+                clear_edit();
+                QUEUE = vec![0x58, 0x53, 0x57, 0x4C, 0x20]; // x s w l 空格
+                QI = 0;
+                PHASE = 3;
+            }
+            3 => {
+                let t = text_of();
+                let _ = result("E3", "文档含 😂（缩写关键词 xswl 出表情，词典无候选时候选窗也开）", t.contains('😂'));
+                logline("=== E4: ai 按 5 —— 表情占前 4 位，第 5 位词典词照常可选 ===");
+                clear_edit();
+                QUEUE = vec![0x41, 0x49, 0x35]; // a i 5
+                QI = 0;
+                PHASE = 4;
+            }
+            4 => {
+                let t = text_of();
+                let _ = result("E4", "文档非空且不含 ❤💕💗（按 5 选到词典词，表情不挡路）", !t.is_empty() && !t.contains('❤') && !t.contains('💕') && !t.contains('💗'));
+                logline("=== E5: xiaom+空格 —— 前缀不是关键词，不注入表情 ===");
+                clear_edit();
+                QUEUE = vec![0x58, 0x49, 0x41, 0x4F, 0x4D, 0x20]; // x i a o m 空格
+                QI = 0;
+                PHASE = 5;
+            }
+            5 => {
+                let t = text_of();
+                // xiaom 是 5 字母串，会走整句 DP（v4.13.0 起），首选词由
+                // 语言模型定（实测「没有」）—— 这里只断言「表情没注入」：
+                // 文档非空且没有任何表情字符（所有 emoji 都在增补平面
+                // U+1F000 以上，BMP 汉字不受影响）。
+                let no_emoji = !t.is_empty() && t.chars().all(|c| (c as u32) < 0x1F000);
+                let _ = result("E5", "文档非空且无表情（xiaom 不是关键词，表情零注入；首选词由 LM 整句 DP 定）", no_emoji);
+                log_modules();
+                logline("=== 完（emoji 子套）===");
+                flush();
+                DestroyWindow(h);
+            }
+            _ => {}
+        },
+        // v4.15.0 english 子套（MODE=2）：E2 settings load 补洞 + Shift 单击切换
+        // （Shift 单击走 status 轮询窗口 50ms 拍：按住 ~120ms 再松，落在
+        // 40~500ms 单击窗里；期间不夹别的键，KEY_ROUTED 不会被置位）
+        _ if MODE == 2 => match PHASE {
+            1 => {
+                let t = text_of();
+                let _ = result("E2a", "正好 a（english=1 被 Activate 读到）", t == "a");
+                send_code(0x8010); // Shift 按住
+                pump_ms(120);
+                send_code(0x4010); // Shift 松开
+                pump_ms(200);
+                logline("=== E2b: Shift 单击切中文，打 a + ESC —— a 进拼音串被取消，文档还是 a ===");
+                QUEUE = vec![0x41, 0x1B]; // a ESC
+                QI = 0;
+                PHASE = 2;
+            }
+            2 => {
+                let t = text_of();
+                let _ = result("E2b", "还是 a（中文模式：a 进拼音、ESC 取消无残留）", t == "a");
+                send_code(0x8010);
+                pump_ms(120);
+                send_code(0x4010);
+                pump_ms(200);
+                logline("=== E2c: Shift 单击切回英文，打 a —— 直通，文档 aa ===");
+                QUEUE = vec![0x41];
+                QI = 0;
+                PHASE = 3;
+            }
+            3 => {
+                let t = text_of();
+                let _ = result("E2c", "正好 aa（切回英文直通）", t == "aa");
+                // E2d 收尾：再单击一次切回中文 —— 既验证 set_english→save
+                // 真写盘，也给链上后面的套（punct 等）留 english=0 的干净房间
+                send_code(0x8010);
+                pump_ms(120);
+                send_code(0x4010);
+                pump_ms(200);
+                let base = std::env::var("LOCALAPPDATA").unwrap_or_default();
+                let s = std::fs::read_to_string(format!("{base}\\Pangyi\\settings.txt"))
+                    .unwrap_or_default();
+                let _ = result("E2d", "settings.txt 落盘 english=0（单击切回中文）", s.contains("english=0"));
+                log_modules();
+                logline("=== 完（english 子套）===");
+                flush();
+                DestroyWindow(h);
+            }
+            _ => {}
+        },
         1 => {
             let t = text_of();
             let _ = result("G7", "正好一个大写 A（激活前开好的 Caps 也能直通）", t == "A");
@@ -442,7 +675,9 @@ unsafe fn tick(h: HWND) {
             let _ = result("B", "空（删空无残留）", text_of().is_empty());
             clear_edit();
             logline("=== C: 单独按一下 Shift，再打 nihao+空格，应是英文直通 ===");
-            QUEUE = vec![0x10]; // Shift 单独按一下
+            // v4.15.0：Shift 单击改由 status 轮询窗口侦测（50ms 拍），单击窗
+            // 40~500ms —— 两拍之间按住 ~260ms 正好落在窗里，模拟真人单击
+            QUEUE = vec![0x8010, 0x4010]; // Shift 按住一拍再松开
             QI = 0;
             PHASE = 4;
         }
@@ -457,7 +692,7 @@ unsafe fn tick(h: HWND) {
             let _ = result("C", "英文直通 nihao、不出「你」", en);
             clear_edit();
             logline("=== D: 再按一下 Shift，回到中文 ===");
-            QUEUE = vec![0x10];
+            QUEUE = vec![0x8010, 0x4010]; // 同上：按住一拍再松开 = 单击
             QI = 0;
             PHASE = 6;
         }
@@ -663,6 +898,64 @@ unsafe fn tick(h: HWND) {
         28 => {
             let t = text_of();
             let _ = result("C7", "正好「你好」", t == "你好");
+            clear_edit();
+            logline("=== G8: 会话中途开 Caps，宿主消化掉 Caps 键（IME 看不见），再打 A —— 仍应大写 A 直通 ===");
+            // 复现浏览器/聊天应用一类宿主：Caps 键被宿主自己消化掉（不进 TSF，
+            // 见 edit_proc 子类化），IME 看不见 0x14，按过沿也永远不置位。
+            // 接着打字母，IME 若只靠沿检测就会漏掉这次 Caps，字母掉进拼音串
+            // 打出中文。
+            G8_DIGEST = 2; // Caps down + up 各消化一枪
+            send_code(0x14); // Caps 开（会话中途）
+            pump_ms(250); // 派发 Caps 键 —— edit_proc 消化掉，不进 TSF
+            QUEUE = vec![0x41]; // A
+            QI = 0;
+            PHASE = 29;
+        }
+        29 => {
+            let t = text_of();
+            let _ = result("G8", "正好一个大写 A（宿主轮询吃掉按键沿，影子也能对齐 Caps）", t == "A");
+            send_code(0x14); // Caps 关（别把翻过来的状态留给用户）
+            pump_ms(200);
+            logline("=== Z1: 拼音打到一半（aini 候选窗开着）前台被别的进程拿走 —— 候选窗必须跟着收掉 ===");
+            clear_edit();
+            QUEUE = vec![0x41, 0x49, 0x4E, 0x49]; // a i n i，不打空格：候选窗开着
+            QI = 0;
+            PHASE = 30;
+        }
+        30 => {
+            // 前置断言：候选窗此刻真的可见（看不见的话这个用例没意义）
+            let _ = result("Z1a", "候选窗可见（aini 组合中）", cand_visible());
+            // 模拟「关掉浏览器」：前台落到另一个进程（浏览器关了前台掉到
+            // 桌面/资源管理器）。起一个记事本，新进程会拿到前台 —— 与用户
+            // 报的场景同构（前台进程 != 宿主进程），看门狗应当收窗。
+            NOTE = std::process::Command::new("notepad.exe").spawn().ok();
+            ZWAIT = 0;
+            PHASE = 31;
+        }
+        31 => {
+            if fg_pid() != std::process::id() {
+                // 记事本已拿前台。多泵一会：看门狗 50ms 一查，300ms 足够
+                // 它跑好几拍；TSF 焦点通知（如果有）也早该到了。
+                pump_ms(300);
+                let _ = result("Z1b", "前台被别的进程拿走 → 候选窗自动收掉（不残留僵尸窗）", !cand_visible());
+                PHASE = 32;
+            } else {
+                ZWAIT += 1;
+                if ZWAIT > 20 {
+                    logline("✗ 记事本 5 秒没拿到前台（环境干扰，按干扰判据重跑再看）—— Z1b 跳过");
+                    PHASE = 32;
+                }
+            }
+        }
+        32 => {
+            // 清理：杀掉我们起的记事本，把前台抢回来
+            if let Some(c) = NOTE.take() {
+                let _ = std::process::Command::new("taskkill")
+                    .args(["/F", "/PID", &c.id().to_string(), "/T"])
+                    .output();
+            }
+            focus_ours();
+            pump_ms(200);
             logline("=== 进程内 pangyi 模块（应只有 target\\release 的新 DLL）===");
             log_modules();
             logline("=== 完 ===");
@@ -695,14 +988,30 @@ fn main() -> Result<()> {
         let md = wide("Msftedit.dll");
         let _ = LoadLibraryW(PCWSTR(md.as_ptr()));
         // 固定测试配置（max=5）——G 那条「候选个数=5」的断言依赖它。
+        // v4.15.0：argv[2] 选子套 —— emoji=1 种子跑 E1（表情候选注入上屏），
+        // english=1 种子跑 E2（load 补洞 + Shift 单击切换）。三个子套各开
+        // 独立进程，种子在激活前就位，互不干扰。
+        let mode = std::env::args().nth(2).unwrap_or_default();
+        MODE = match mode.as_str() {
+            "emoji" => 1,
+            "english" => 2,
+            _ => 0,
+        };
+        logline(&format!("子套模式: {}（0 全套 / 1 emoji / 2 english）", MODE));
         let base = std::env::var("LOCALAPPDATA").unwrap_or_default();
         if !base.is_empty() {
             let dir = format!("{base}\\Pangyi");
             let _ = std::fs::create_dir_all(&dir);
-            let _ = std::fs::write(
-                format!("{dir}\\settings.txt"),
-                "max=5\nscale=100\nlayout=v\ntheme=0\nenglish=0\ndebug=0\ncnpunct=1\n",
-            );
+            // v4.16.0 emoji 子套种子 emoji=0：模拟「用户没开过表情模式」，
+            // 全程靠模拟面板写盘 + 热重载翻开关 —— 翻得动才叫修好
+            let seed = if MODE == 1 {
+                "max=5\nscale=100\nlayout=v\ntheme=0\nenglish=0\ndebug=1\ncnpunct=1\nemoji=0\n"
+            } else if MODE == 2 {
+                "max=5\nscale=100\nlayout=v\ntheme=0\nenglish=1\ndebug=1\ncnpunct=1\nemoji=0\n"
+            } else {
+                "max=5\nscale=100\nlayout=v\ntheme=0\nenglish=0\ndebug=1\ncnpunct=1\nemoji=0\n"
+            };
+            let _ = std::fs::write(format!("{dir}\\settings.txt"), seed);
         }
         // 抢注必须在【建窗/聚焦之前】—— 否则 TSF 聚焦时会先把已安装的旁译
         // （同一个 CLSID）从 Program Files 加载进来，之后抢注换不回来，
@@ -771,6 +1080,10 @@ fn main() -> Result<()> {
                 HHOOK(0)
             }
         };
+        // G8 的「宿主读按键沿」子类化：把 RichEdit 的 wndproc 换成 edit_proc
+        // （Caps 键down 时吃一枪 GetAsyncKeyState 沿，其余原样转交）
+        let old = SetWindowLongPtrW(EDIT, GWLP_WNDPROC, edit_proc as *const () as isize);
+        OLD_EDIT_PROC = std::mem::transmute::<isize, WNDPROC>(old);
         let mut m = MSG::default();
         while GetMessageW(&mut m, None, 0, 0).as_bool() {
             let _ = TranslateMessage(&m);

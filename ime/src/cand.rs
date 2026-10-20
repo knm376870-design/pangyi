@@ -68,6 +68,11 @@ pub unsafe fn alive() -> bool {
     h.0 != 0 && IsWindow(h).as_bool()
 }
 
+/// 窗口现在是否可见（status 看门狗用：宿主丢了前台就收窗）。
+pub unsafe fn visible() -> bool {
+    alive() && IsWindowVisible(hwnd()).as_bool()
+}
+
 // ---- v4.7.0 配色：设置面板同款设计语言（与 settings.rs Palette 同名字段同值）。
 // v4.10.0 强调位（bar_fill/bar_text/cloud）改从 settings::ACCENTS 取，随配色走。----
 struct Palette {
@@ -548,13 +553,19 @@ unsafe extern "system" fn proc_cand(h: HWND, msg: u32, w: WPARAM, l: LPARAM) -> 
         }
         WM_PAINT => {
             let mut ps = PAINTSTRUCT::default();
-            let dc = BeginPaint(h, &mut ps);
+            let wdc = BeginPaint(h, &mut ps);
             let p = palette(
                 crate::settings::accent(),
                 crate::settings::dark(DARK.load(Ordering::Relaxed)),
             );
             let mut rc = RECT::default();
             let _ = GetClientRect(h, &mut rc);
+            // 双缓冲（v4.16.0）：整页先画到内存 DC，再一次 BitBlt 上屏 ——
+            // 悬停/按键刷新再频繁，屏幕上永远只有完整的帧，不闪不撕裂
+            let mem = CreateCompatibleDC(wdc);
+            let bmp = CreateCompatibleBitmap(wdc, rc.right, rc.bottom);
+            let old_bmp = SelectObject(mem, bmp);
+            let dc = mem;
             // 窗口本体 = 一张圆角卡片：先铺卡片底色，最后描一圈 1px 边框
             fill_rect(dc, 0, 0, rc.right, rc.bottom, p.card);
             SetBkMode(dc, TRANSPARENT);
@@ -731,6 +742,11 @@ unsafe extern "system" fn proc_cand(h: HWND, msg: u32, w: WPARAM, l: LPARAM) -> 
 
             // 注意：f_text / f_anno / f_idx 是缓存的字体对象，这里不能删
             let _ = (f_text, f_anno, f_idx);
+            // 内存帧一次上屏，然后释放临时 GDI 对象（成对创建/删除）
+            let _ = BitBlt(wdc, 0, 0, rc.right, rc.bottom, mem, 0, 0, SRCCOPY);
+            SelectObject(mem, old_bmp);
+            let _ = DeleteObject(bmp);
+            let _ = DeleteDC(mem);
             let _ = EndPaint(h, &ps);
             LRESULT(0)
         }

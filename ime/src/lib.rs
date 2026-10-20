@@ -7,14 +7,16 @@
 
 pub mod cand;
 pub mod dict;
+pub mod emoji;
 pub mod settings;
+pub mod status;
 
 use std::cell::{Cell, RefCell};
 use std::os::raw::c_void;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 
 use std::sync::Mutex;
-use windows::core::{implement, ComInterface, Result, GUID, HRESULT};
+use windows::core::{implement, ComInterface, Interface, Result, GUID, HRESULT};
 use windows::Win32::Foundation::RECT;
 use windows::Win32::Graphics::Gdi::*;
 use windows::Win32::UI::WindowsAndMessaging::*;
@@ -29,17 +31,24 @@ use windows::Win32::UI::TextServices::{
     TF_SELECTION,
 };
 
-static SHIFT_DOWN_AT: AtomicU32 = AtomicU32::new(0);
-static SHIFT_DIRTY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-
 /// Caps Lock 影子状态（v4.13.0）：跟踪 0x14 键的按下沿翻转。
 /// 旧的 caps_on() 用 GetKeyState 读队列快照，在 TSF 回调线程上常是过期值
 /// （Caps 早就在别的应用/更早的时候开了，快照还是 false）→ 大写字母全掉进
 /// 拼音串里出不来。影子状态不依赖队列快照：Caps 键经过 TSF 时 OnTestKeyDown
 /// 一定能看见按下沿；看不见的（换焦点回来）由 Activate 时 GetKeyState 兜底。
-static CAPS_SHADOW: AtomicBool = AtomicBool::new(false);
+/// v4.15.0 起多一个维护者：status 轮询窗口（宿主 UI 线程，快照新鲜）。
+pub(crate) static CAPS_SHADOW: AtomicBool = AtomicBool::new(false);
 /// 0x14 键当前是否物理按住（挡自动重复：按住 Caps 会连发 keydown）
 static CAPS_KEY_DOWN: AtomicBool = AtomicBool::new(false);
+/// 上次对账读到的 Caps 开关位（track_caps / caps_on / status 轮询共用：
+/// 对账靠「变了才写影子」只对一次，谁先读到变化谁先写，不会打架）
+pub(crate) static CAPS_GS_LAST: AtomicBool = AtomicBool::new(false);
+/// 「有键进了 TSF」标志（v4.15.0 status Shift 单击侦测用）：
+/// Shift 按住期间任何别的键走 TSF 路由（OnTestKeyDown 看见），就是
+/// Shift+字母 之类的组合键，不算单独按 Shift。轮询窗口读全局异步键态时
+/// 采样是 50ms 一拍的，几十毫秒的字母一按一松可能采不到 —— 这个标志
+/// 在路由当场就置位、由轮询在每次 Shift 按下起点清零，比采样可靠。
+pub(crate) static KEY_ROUTED: AtomicBool = AtomicBool::new(false);
 
 static PENDING_CAND: Mutex<Option<(i32, i32)>> = Mutex::new(None);
 
@@ -87,7 +96,7 @@ const CLASS_E_CLASSNOTAVAILABLE_HR: HRESULT = HRESULT(0x80040111u32 as i32);
 
 /// 写诊断日志。默认关闭 —— 每敲一个键都写文件会明显拖慢输入。
 /// 需要排查时在 %LOCALAPPDATA%\Pangyi\settings.txt 里加一行 debug=1。
-fn log(msg: &str) {
+pub(crate) fn log(msg: &str) {
     if !crate::settings::debug() {
         return;
     }
@@ -185,10 +194,19 @@ impl ITfTextInputProcessorEx_Impl for TextService {
 /// 之前是「持着锁直接调 refresh_page()」，而 refresh_page 也要锁 ALL_CANDS ——
 /// std::sync::Mutex 不可重入，于是敲第一个字母就把输入线程锁死，
 /// 表现就是"切到旁译之后打不出字，得重新开一个程序才行"。
-fn set_all_cands(hits: Vec<dict::Hit>) {
+fn set_all_cands(hits: Vec<dict::Hit>, key: &str) {
     {
         let mut g = ALL_CANDS.lock().unwrap();
         g.clear();
+        // v4.15.0 表情模式：拼音正好撞上表情关键词时，表情候选排最前
+        // （emoji/颜文字 所见即所得；标签进俄语列）。模式关时一个不出。
+        if crate::settings::emoji() {
+            if let Some(list) = emoji::lookup(key) {
+                for e in list {
+                    g.push((e.s.to_string(), e.label.to_string()));
+                }
+            }
+        }
         // 直接把 lookup 的结果移进来（原来是逐条 clone），
         // 候选池放大到几百条之后这一步不能再白拷一份
         g.extend(hits.into_iter().map(|h| (h.word, h.ru)));
@@ -308,7 +326,10 @@ impl TextService {
 
     /// 把某个词上屏（换掉当前组合）
     fn commit_word(&self, pic: Option<&ITfContext>, word: &str) {
-        dict::note_choice(word); // 自学习：下次把这个词排前面
+        // 表情不进自学习：记进 learned.txt 会变成「关掉表情模式还蹦出来」的怪候选
+        if !emoji::is_emoji(word) {
+            dict::note_choice(word); // 自学习：下次把这个词排前面
+        }
         // v4.5.0 选中俄语侧：只上屏俄语，中文不输入（逐字翻译不再重复拼）
         // v4.4.0 逐字翻译：俄语第一释义跟在词后面；整句模式：记进句子缓冲
         dlog!("commit_word word={word} ru_sel={} horizontal={}", unsafe { cand::ru_sel() }, crate::settings::horizontal());
@@ -343,7 +364,7 @@ impl TextService {
             return;
         }
         unsafe { cand::set_preedit(&key); }
-        set_all_cands(dict::lookup(&key));
+        set_all_cands(dict::lookup(&key), &key);
         sentence_hint(&key);
         // 候选窗重画：set_items 只改内存，不触发 WM_PAINT。
         // 缺这一句的话，退格后候选窗还停留在旧拼音的候选上（v4.2.0 的 bug：
@@ -383,13 +404,17 @@ impl TextService {
         unsafe { settings::load(); }
         // Caps 影子状态对表：焦点回来时 Caps 可能早就在别处开好了
         sync_caps();
-        log("Activate v4.14.0");
+        // 状态轮询（Caps 对账 + Shift 单击切中/英）挂在宿主 UI 线程上
+        crate::status::ensure_poller();
+        crate::status::set_active(true);
+        log("Activate v4.16.0");
         log(&format!(
-            "cnpunct={} english={} trmode={} accent={}",
+            "cnpunct={} english={} trmode={} accent={} emoji={}",
             crate::settings::cnpunct(),
             crate::settings::english(),
             crate::settings::trmode(),
-            crate::settings::accent()
+            crate::settings::accent(),
+            crate::settings::emoji()
         ));
 
         // 后台预热词典索引，避免第一次打字时卡一下（只跑一次）
@@ -505,6 +530,8 @@ impl TextService {
 
     fn deactivate(&self) -> Result<()> {
         log("Deactivate");
+        // 轮询窗口留着（宿主进程还在跑），只是不再切换/弹提示
+        crate::status::set_active(false);
         // 先落闸：之后任何焦点事件都不允许再挂接收器
         self.active.set(false);
 
@@ -572,13 +599,14 @@ impl ITfKeyEventSink_Impl for TextService {
         // 而 Shift 不能被 claim（会吞掉 Shift+字母、Shift+方向键）。
         // 测试回调对每个按键都会问一遍，所以放这里最稳。
         if wparam.0 == 0x10 {
-            SHIFT_DOWN_AT.store(now_ms32(), Ordering::Relaxed);
-            // 只有「单独」按 Shift 才算候选切换：有别的修饰键按着（Ctrl+Shift 等）就记脏
-            SHIFT_DIRTY.store(command_modifier_down(), Ordering::Relaxed);
+            // Shift 单击切中/英 由 status 轮询窗口统一侦测（GetAsyncKeyState
+            // 全局态，宿主消化键也看得到）；这里只是不吞 Shift。
             dlog!("KeySink::OnTestKeyDown wparam=16 Shift键 async_shift={} async_caps={}", shift_down(), caps_on());
             return Ok(BOOL(0));
         }
-        SHIFT_DIRTY.store(true, Ordering::Relaxed);
+        // 除了 Shift 之外进到 TSF 的键都记一笔：status 轮询靠它判「Shift
+        // 按住期间有没有夹别的键」（采样 50ms 一拍会漏掉快按快松的字母）
+        KEY_ROUTED.store(true, Ordering::Relaxed);
         // Ctrl+. 切换中文标点（微软同款快捷键）。必须放在「带修饰键放行」之前，
         // 否则永远到不了 OnKeyDown。
         if wparam.0 == 0xBE && ctrl_only() {
@@ -616,15 +644,8 @@ impl ITfKeyEventSink_Impl for TextService {
     fn OnTestKeyUp(&self, _pic: Option<&ITfContext>, w: WPARAM, _l: LPARAM) -> Result<BOOL> {
         // Caps 抬起也跟踪：CAPS_KEY_DOWN 靠它复位，下次按下才能再翻影子状态
         track_caps(w);
-        // 单独按一下 Shift（没夹着别的键、400ms 内松开）= 切中/英。
-        // 放在测试回调而不是 OnKeyUp，原因见 OnTestKeyDown 的注释。
-        if w.0 == 0x10 {
-            let t0 = SHIFT_DOWN_AT.load(Ordering::Relaxed);
-            let dt = now_ms32().wrapping_sub(t0);
-            if !SHIFT_DIRTY.load(Ordering::Relaxed) && t0 != 0 && dt < 400 {
-                status_toggle_english();
-            }
-        }
+        // Shift 单击切中/英 已挪到 status 轮询窗口（v4.15.0）—— 消化宿主里
+        // Shift 的 TestKeyUp 不一定送得到，轮询走全局异步键态才稳。
         Ok(BOOL(0))
     }
     fn OnKeyUp(&self, _pic: Option<&ITfContext>, _w: WPARAM, _l: LPARAM) -> Result<BOOL> {
@@ -682,7 +703,9 @@ impl ITfKeyEventSink_Impl for TextService {
                 let letter = ch.to_ascii_uppercase();
                 match w {
                     Some(w) => {
-                        dict::note_choice(&w);
+                        if !emoji::is_emoji(&w) {
+                            dict::note_choice(&w);
+                        }
                         sent_push(&w);
                         // v4.5.0：选中俄语侧时大写字母也跟在俄语后面
                         self.commit_text(pic, &format!("{}{letter}", Self::pick_text(&w)));
@@ -705,7 +728,7 @@ impl ITfKeyEventSink_Impl for TextService {
             }
             let key = self.buf.borrow().clone();
             unsafe { cand::set_preedit(&key); }
-            set_all_cands(dict::lookup(&key));
+            set_all_cands(dict::lookup(&key), &key);
             sentence_hint(&key);
             if let Some(ctx) = pic {
                 let text: Vec<u16> = key.encode_utf16().collect();
@@ -894,7 +917,9 @@ impl ITfKeyEventSink_Impl for TextService {
             unsafe { cand_hide(); }
             match (w, c) {
                 (Some(w), Some(c)) => {
-                    dict::note_choice(&w);
+                    if !emoji::is_emoji(&w) {
+                        dict::note_choice(&w);
+                    }
                     // v4.5.0：选中俄语侧时只上屏俄语+标点，中文词照旧进句子缓冲
                     if unsafe { cand::ru_sel() } && !crate::settings::horizontal() {
                         self.commit_text(pic, &format!("{}{c}", Self::pick_text(&w)));
@@ -1034,11 +1059,6 @@ fn now_ms32() -> u32 {
         .unwrap_or(0)
 }
 
-/// 切换中/英（原来由状态条上的按钮做）
-fn status_toggle_english() {
-    crate::settings::set_english(!crate::settings::english());
-}
-
 /// 某个虚拟键现在是不是按下的。
 /// 必须用 GetAsyncKeyState：GetKeyState 只反映「调用线程消息队列最后一次
 /// 取消息时」的键盘快照，而 TSF 的按键回调跑在 TSF 自己的键盘管理器线程上，
@@ -1068,10 +1088,21 @@ fn shift_down() -> bool {
 }
 
 /// Caps Lock 灯是不是亮着（亮着时字母应直通英文大写，和微软一样）。
-/// 读影子状态（见 CAPS_SHADOW 的注释）：GetKeyState 的队列快照在 TSF 回调
-/// 线程上会过期，Caps 开在别的应用/更早时刻时读到 false，字母掉进拼音串。
+/// v4.15.0：不再只信影子 —— 消化宿主（Caps 键永不路由进 TSF）里沿路径
+/// 哑火，影子可能卡死。这里当场读一次 GetKeyState 开关位：OnTestKeyDown
+/// 跑在宿主路由按键的线程上，宿主消化 Caps 键必然在自己的消息泵里摸过它，
+/// 快照是新鲜的。影子 OR 上作兜底（沿路径翻过、快照还没刷的场景）。
+/// 顺手对账：变化才写（和 track_caps / status 轮询共用同一个基线）。
 fn caps_on() -> bool {
-    CAPS_SHADOW.load(Ordering::Relaxed)
+    unsafe {
+        let gs = windows::Win32::UI::Input::KeyboardAndMouse::GetKeyState(
+            windows::Win32::UI::Input::KeyboardAndMouse::VK_CAPITAL.0 as i32,
+        ) as u16 & 0x0001 != 0;
+        if gs != CAPS_GS_LAST.swap(gs, Ordering::Relaxed) {
+            CAPS_SHADOW.store(gs, Ordering::Relaxed);
+        }
+        gs || CAPS_SHADOW.load(Ordering::Relaxed)
+    }
 }
 
 /// 跟踪 Caps 按下沿、维护影子状态。OnTestKeyDown/OnTestKeyUp 里每个键都调。
@@ -1090,6 +1121,12 @@ fn track_caps(wparam: WPARAM) {
         let st = windows::Win32::UI::Input::KeyboardAndMouse::GetAsyncKeyState(
             windows::Win32::UI::Input::KeyboardAndMouse::VK_CAPITAL.0 as i32,
         ) as u16;
+        dlog!(
+            "track_caps wparam={:#04x} async={:#06x} shadow0={}",
+            wparam.0,
+            st,
+            CAPS_SHADOW.load(Ordering::Relaxed)
+        );
         if wparam.0 == 0x14 {
             // 路由宿主：Caps 的按下/抬起会到 TestKeyDown/TestKeyUp。
             // 按下沿主信号取低 1 位（自上次 GetAsyncKeyState 之后按过）——
@@ -1102,10 +1139,27 @@ fn track_caps(wparam: WPARAM) {
             let down = st & 0x8000 != 0;
             let was = CAPS_KEY_DOWN.swap(down, Ordering::Relaxed);
             if st & 0x0001 != 0 || (down && !was) {
+                dlog!("track_caps 翻转（路径1 down={} was={}）", down, was);
                 flip_caps();
             }
         } else if st & 0x0001 != 0 && st & 0x8000 == 0 {
+            dlog!("track_caps 翻转（路径2）");
             flip_caps();
+        }
+        // 3. GetKeyState 开关位对账（v4.14.1 补洞）：消化宿主（Caps 键不进
+        //    TSF）里按键沿永远不会置位（2026-10-20 实测：沿是 TSF 按键管理
+        //    器在 KeyDown 路由时才置位的），路径 1/2 都哑火，影子卡在 false，
+        //    开着大写还是出中文。GetKeyState 低 1 位是 Caps 的开关状态本身
+        //    （队列消息被取出时就刷新，宿主消化键也不影响），宿主轮询读不坏
+        //    它。放在沿检测之后：沿能翻时不重复动（对账只是把同一状态再存
+        //    一遍），沿哑火时兜底对齐。会泵消息的宿主里快照新鲜、真变化才
+        //    触发；不泵消息的宿主快照恒不变，这段永远不触发，等于没有。
+        let gs = windows::Win32::UI::Input::KeyboardAndMouse::GetKeyState(
+            windows::Win32::UI::Input::KeyboardAndMouse::VK_CAPITAL.0 as i32,
+        ) as u16 & 0x0001 != 0;
+        if gs != CAPS_GS_LAST.swap(gs, Ordering::Relaxed) {
+            dlog!("track_caps 对账 shadow<-{gs}");
+            CAPS_SHADOW.store(gs, Ordering::Relaxed);
         }
     }
 }
@@ -1130,6 +1184,8 @@ fn sync_caps() {
             windows::Win32::UI::Input::KeyboardAndMouse::VK_CAPITAL.0 as i32,
         ) as u16;
         CAPS_SHADOW.store(st & 0x0001 != 0, Ordering::Relaxed);
+        // 对账基线同步到刚读的快照：track_caps 的下一次对账从同一个值起算
+        CAPS_GS_LAST.store(st & 0x0001 != 0, Ordering::Relaxed);
     }
 }
 
@@ -1342,8 +1398,18 @@ impl ITfThreadMgrEventSink_Impl for TextService {
         // 静音
         Ok(())
     }
-    fn OnSetFocus(&self, _focus: Option<&ITfDocumentMgr>, _prev: Option<&ITfDocumentMgr>) -> Result<()> {
+    fn OnSetFocus(&self, focus: Option<&ITfDocumentMgr>, prev: Option<&ITfDocumentMgr>) -> Result<()> {
         // 焦点变化非常频繁，不能写日志（会把日志刷爆）。
+        // v4.16.0：焦点文档管理器真的变了（换窗口 / 换编辑控件 / 宿主
+        // 窗口关了）就把候选窗收掉 —— 「打字打到一半关掉宿主，候选窗
+        // 变僵尸挂屏幕」的根因之一就是这里只看按键接收器、不收窗；
+        // KeyEventSink::OnSetFocus 在浏览器一类常驻进程里时灵时不灵。
+        // 窗口关掉时 focus 会变成空文档管理器或另一个窗口的，指针比对
+        // 一判一个准；同一窗口内焦点移动（同一 dim）不触发，组合不动。
+        if focus.map(|f| f.as_raw()) != prev.map(|p| p.as_raw()) {
+            unsafe { cand_hide(); }
+            SENT.lock().unwrap().clear(); // 语境换了，没说完的句子作废
+        }
         // 注意：这里的重挂只在 active && !advised 时才会真的发生，见 advise_key_sink。
         self.advise_key_sink();
         Ok(())

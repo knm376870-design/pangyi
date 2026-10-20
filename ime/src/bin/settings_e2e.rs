@@ -6,6 +6,7 @@
 //! （v4.5.0 的教训）和「点药丸把窗口点关了」这类回归。
 //! v4.10.0 加「配色」行后补 T6（点「粉」→ accent=1，点回「青」收尾）。
 //! v4.13.0 加「英文模式」行后补 T8（点「开」→ english=1，点回「关」收尾）。
+//! v4.15.0 加「表情模式」行后补 T9（点「开」→ emoji=1，点回「关」收尾）。
 //!
 //! 用例：
 //!   T1 点「5」        -> max=5
@@ -15,6 +16,7 @@
 //!   T5 点「标点 关」    -> cnpunct=0
 //!   T6 点「粉」       -> accent=1（v4.10.0 配色行；点完点回「青」收尾）
 //!   T8 点「英文 开」    -> english=1（v4.13.0 英文模式行；点完点回「关」收尾）
+//!   T9 点「表情 开」    -> emoji=1（v4.15.0 表情模式行；点完点回「关」收尾）
 //!   T7 点「关闭」      -> 窗口真关（IsWindow=false）
 //!
 //! 用法：settings_e2e.exe [新DLL路径]（LOCALAPPDATA 重定向由启动器环境做）
@@ -74,7 +76,7 @@ fn main() {
         let base = std::env::var("LOCALAPPDATA").unwrap_or_default();
         let dir = format!("{base}\\Pangyi");
         let _ = std::fs::create_dir_all(&dir);
-        let cfg = "max=9\nscale=100\nlayout=v\ntheme=0\nenglish=0\ndebug=0\ncnpunct=1\ntrmode=0\naccent=0\n";
+        let cfg = "max=9\nscale=100\nlayout=v\ntheme=0\nenglish=0\ndebug=0\ncnpunct=1\ntrmode=0\naccent=0\nemoji=0\n";
         let _ = std::fs::write(format!("{dir}\\settings.txt"), cfg);
 
         let dll = std::env::args().nth(1).unwrap_or_default();
@@ -167,6 +169,13 @@ fn main() {
         logline("  点回「关」收尾（english=0，老用户默认中文模式）");
         click!(24);
         check("T8b", "english=0");
+
+        logline("=== T9 点「表情 开」: 表情模式=开（emoji=1）===");
+        click!(25);
+        check("T9", "emoji=1");
+        logline("  点回「关」收尾（emoji=0，默认不开）");
+        click!(26);
+        check("T9b", "emoji=0");
 
         logline("=== T7 点「关闭」: 窗口真关 ===");
         click!(0);

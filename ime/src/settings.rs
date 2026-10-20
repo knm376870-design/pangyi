@@ -19,6 +19,9 @@ static MAX_CANDS: AtomicUsize = AtomicUsize::new(9);
 static FONT_SCALE: AtomicI32 = AtomicI32::new(100);
 static HORIZONTAL: AtomicBool = AtomicBool::new(false);
 static ENGLISH: AtomicBool = AtomicBool::new(false);
+/// 表情模式：开 = 拼音正好撞上 emoji/颜文字 关键词时，表情候选排最前。
+/// 默认关 —— 老用户打字行为不变。
+static EMOJI: AtomicBool = AtomicBool::new(false);
 static THEME: AtomicI32 = AtomicI32::new(0); // 0 跟随系统 / 1 浅色 / 2 深色
 /// 调试日志开关。默认关 —— 开着的话每敲一个键都要写一次文件，会明显拖慢输入。
 static DEBUG: AtomicBool = AtomicBool::new(false);
@@ -38,7 +41,7 @@ static mut BG: HBRUSH = HBRUSH(0);
 /// 窗框吃掉一块，底部关闭药丸（footer_y=526..556）直接裁掉一截（v4.6.0 踩坑）。
 static mut OUTER_W: i32 = 0;
 static mut OUTER_H: i32 = 0;
-/// 悬停的药丸：0=无、-1=关闭钮、1..24=对应动作号（画悬停底色 + 手型光标用）
+/// 悬停的药丸：0=无、-1=关闭钮、1..26=对应动作号（画悬停底色 + 手型光标用）
 static HOT: AtomicI32 = AtomicI32::new(0);
 /// 是否已挂过 TrackMouseEvent（挂一次就能收 WM_MOUSELEAVE）
 static TRACKED: AtomicBool = AtomicBool::new(false);
@@ -80,6 +83,34 @@ pub fn load() {
                 "accent" => if let Ok(n) = v.parse::<i32>() {
                     ACCENT.store(n.clamp(0, 4), Ordering::Relaxed);
                 },
+                // v4.15.0 补上：老版本 save() 写 english 却不读 —— 面板里打开
+                // 英文模式，IME 每次激活都读不回 true，英文模式形同虚设。
+                "english" => ENGLISH.store(v == "1" || v.eq_ignore_ascii_case("true"), Ordering::Relaxed),
+                "emoji" => EMOJI.store(v == "1" || v.eq_ignore_ascii_case("true"), Ordering::Relaxed),
+                _ => {}
+            }
+        }
+    }
+}
+
+/// 热重载两个模式开关（english/emoji，v4.16.0）。
+///
+/// 面板在【别的进程】里点「英文模式/表情模式」只写 settings.txt，宿主里
+/// 运行中的 IME 实例激活时读的那份就旧了——用户开了开关却一个表情不出
+/// （v4.15.0「表情打不出来」的根因）。status 轮询每 500ms 查一次文件
+/// 变化时间，变了就调这个：只重读这两个纯开关，其余设置保持激活值
+/// （打字中途改候选数/主题/窗口几何会闪，不动它们）。
+pub fn reload_modes() {
+    if let Ok(s) = std::fs::read_to_string(cfg_file()) {
+        for line in s.lines() {
+            let mut it = line.splitn(2, '=');
+            let (Some(k), Some(v)) = (it.next(), it.next()) else {
+                continue;
+            };
+            let on = v.trim() == "1" || v.trim().eq_ignore_ascii_case("true");
+            match k.trim() {
+                "english" => ENGLISH.store(on, Ordering::Relaxed),
+                "emoji" => EMOJI.store(on, Ordering::Relaxed),
                 _ => {}
             }
         }
@@ -92,7 +123,7 @@ pub fn save() {
         let _ = std::fs::create_dir_all(dir);
     }
     let body = format!(
-        "max={}\nscale={}\nlayout={}\ntheme={}\nenglish={}\ndebug={}\ncnpunct={}\ntrmode={}\naccent={}\n",
+        "max={}\nscale={}\nlayout={}\ntheme={}\nenglish={}\ndebug={}\ncnpunct={}\ntrmode={}\naccent={}\nemoji={}\n",
         max_cands(), font_scale(),
         if horizontal() { "h" } else { "v" },
         THEME.load(Ordering::Relaxed),
@@ -100,7 +131,8 @@ pub fn save() {
         if debug() { 1 } else { 0 },
         if cnpunct() { 1 } else { 0 },
         TRMODE.load(Ordering::Relaxed),
-        ACCENT.load(Ordering::Relaxed)
+        ACCENT.load(Ordering::Relaxed),
+        if emoji() { 1 } else { 0 }
     );
     let _ = std::fs::write(path, body);
 }
@@ -116,6 +148,15 @@ pub fn english() -> bool {
 
 pub fn set_english(v: bool) {
     ENGLISH.store(v, Ordering::Relaxed);
+    save();
+}
+
+pub fn emoji() -> bool {
+    EMOJI.load(Ordering::Relaxed)
+}
+
+pub fn set_emoji(v: bool) {
+    EMOJI.store(v, Ordering::Relaxed);
     save();
 }
 
@@ -331,9 +372,9 @@ fn draw(dc: HDC, f: HFONT, color: COLORREF, x: i32, y: i32, s: &str) -> i32 {
 
 // 窗口与布局（逻辑像素，经 sc() 按 DPI 缩放）
 const WIN_W: i32 = 360;
-// 9 行卡底 = 108+9×44+8×8 = 568，FOOTER_Y 留 10，窗口高 = 底 + 38
-// （v4.13.0 加「英文模式」行：8 行 → 9 行，WIN_H 564→616、FOOTER_Y 526→578）
-const WIN_H: i32 = 616;
+// 10 行卡底 = 108+10×44+9×8 = 620，FOOTER_Y 留 10，窗口高 = 底 + 38
+// （v4.15.0 加「表情模式」行：9 行 → 10 行，WIN_H 616→658、FOOTER_Y 578→630）
+const WIN_H: i32 = 658;
 const HEADER_H: i32 = 96; // 头部渐变横幅（卡通 + 标题）
 const MARGIN: i32 = 12; // 卡片左右留白
 const CARDS_TOP: i32 = 108;
@@ -345,7 +386,7 @@ const PILL_PAD_X: i32 = 10;
 const PILL_PAD_Y: i32 = 4;
 const PILL_GAP: i32 = 8;
 const PILL_RADIUS: i32 = 8;
-const FOOTER_Y: i32 = 578; // 底部统计 + 关闭按钮
+const FOOTER_Y: i32 = 630; // 底部统计 + 关闭按钮
 
 /// 每行的选项：标签 + 选项文本 + 动作号
 fn rows() -> Vec<(&'static str, Vec<(&'static str, i32)>)> {
@@ -360,6 +401,9 @@ fn rows() -> Vec<(&'static str, Vec<(&'static str, i32)>)> {
         // v4.13.0：英文模式（微软同款中/英开关）。开 = 字母/标点全直通英文，
         // 不进拼音组合、不翻译；Shift 单击切换和这个开关写同一个设置。
         ("英文模式", vec![("开", 23), ("关", 24)]),
+        // v4.15.0：表情模式。开 = 拼音正好撞上表情关键词（xiao/ku/aini…）时
+        // emoji + 颜文字候选排最前，空格上屏表情。
+        ("表情模式", vec![("开", 25), ("关", 26)]),
         ("自定义短语", vec![("打开短语文件", 12)]),
     ]
 }
@@ -384,6 +428,7 @@ fn is_current(act: i32) -> bool {
         13 | 14 => act == if cnpunct() { 13 } else { 14 },
         15..=17 => act == 15 + trmode(),
         23 | 24 => act == if english() { 23 } else { 24 },
+        25 | 26 => act == if emoji() { 25 } else { 26 },
         _ => false,
     }
 }
@@ -681,6 +726,12 @@ fn pill_at(l: &Layout, x: i32, y: i32) -> i32 {
     0
 }
 
+/// 药丸的命中矩形（悬停局部重画用；v4.16.0）。0（没点中）和 -1（关闭钮）
+/// 没有悬停高亮态，返回 None。
+fn pill_rect(l: &Layout, act: i32) -> Option<RECT> {
+    l.pills.iter().find(|p| p.act == act).map(|p| p.rect)
+}
+
 // ---------------- 窗口过程 ----------------
 
 unsafe extern "system" fn proc_settings(h: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
@@ -689,10 +740,17 @@ unsafe extern "system" fn proc_settings(h: HWND, msg: u32, wp: WPARAM, lp: LPARA
         WM_ERASEBKGND => LRESULT(1), // 全部自己画，防闪（cand.rs 同款）
         WM_PAINT => {
             let mut ps = PAINTSTRUCT::default();
-            let dc = BeginPaint(h, &mut ps);
+            let wdc = BeginPaint(h, &mut ps);
             let p = palette(accent(), dark(crate::cand::is_dark()));
             let mut rc = RECT::default();
             let _ = GetClientRect(h, &mut rc);
+            // 双缓冲（v4.16.0）：整页先画到内存 DC，再一次 BitBlt 上屏 ——
+            // 鼠标滑过换悬停高亮时屏幕上永远只有完整的帧，不闪（「面板
+            // 悬停闪屏」修复；cand.rs 同款）。
+            let mem = CreateCompatibleDC(wdc);
+            let bmp = CreateCompatibleBitmap(wdc, rc.right, rc.bottom);
+            let old_bmp = SelectObject(mem, bmp);
+            let dc = mem;
             let brush = CreateSolidBrush(p.canvas);
             FillRect(dc, &rc, brush);
             let _ = DeleteObject(brush);
@@ -738,6 +796,11 @@ unsafe extern "system" fn proc_settings(h: HWND, msg: u32, wp: WPARAM, lp: LPARA
                 l.close.left + sc(PILL_PAD_X), l.close.top + sc(PILL_PAD_Y),
                 "关闭",
             );
+            // 内存帧一次上屏，然后释放临时 GDI 对象（成对创建/删除）
+            let _ = BitBlt(wdc, 0, 0, rc.right, rc.bottom, mem, 0, 0, SRCCOPY);
+            SelectObject(mem, old_bmp);
+            let _ = DeleteObject(bmp);
+            let _ = DeleteDC(mem);
             let _ = EndPaint(h, &ps);
             LRESULT(0)
         }
@@ -748,9 +811,16 @@ unsafe extern "system" fn proc_settings(h: HWND, msg: u32, wp: WPARAM, lp: LPARA
             let x = (lp.0 & 0xFFFF) as i16 as i32;
             let y = ((lp.0 >> 16) & 0xFFFF) as i16 as i32;
             let hov = pill_at(&l, x, y);
-            if hov != HOT.load(Ordering::Relaxed) {
-                HOT.store(hov, Ordering::Relaxed);
-                let _ = InvalidateRect(h, None, FALSE);
+            let old = HOT.swap(hov, Ordering::Relaxed);
+            if hov != old {
+                // v4.16.0 只重画「失去悬停的旧药丸 + 新悬停的药丸」两个
+                // 小矩形，不整窗重画 —— 鼠标滑过时页面不再整页刷新
+                // （和 WM_PAINT 双缓冲一起，悬停彻底不闪）
+                for act in [old, hov] {
+                    if let Some(r) = pill_rect(&l, act) {
+                        let _ = InvalidateRect(h, Some(&r), FALSE);
+                    }
+                }
             }
             // 只挂一次 MouseLeave 追踪（TRACKED 防重复挂）
             if !TRACKED.swap(true, Ordering::Relaxed) {
@@ -768,9 +838,17 @@ unsafe extern "system" fn proc_settings(h: HWND, msg: u32, wp: WPARAM, lp: LPARA
         // rustc 会把它当通配臂、把后面所有臂判成不可达直接从二进制里删掉（v4.6.0 大坑）。
         // 这里用字面量 0x02A3（= WM_MOUSELEAVE）。
         0x02A3 => {
-            HOT.store(0, Ordering::Relaxed);
+            let old = HOT.swap(0, Ordering::Relaxed);
             TRACKED.store(false, Ordering::Relaxed);
-            let _ = InvalidateRect(h, None, FALSE);
+            // 同样只重画刚失去悬停的那个药丸
+            if old != 0 {
+                let dc = GetDC(h);
+                let l = layout(dc);
+                let _ = ReleaseDC(h, dc);
+                if let Some(r) = pill_rect(&l, old) {
+                    let _ = InvalidateRect(h, Some(&r), FALSE);
+                }
+            }
             LRESULT(0)
         }
         WM_SETCURSOR => {
@@ -844,6 +922,8 @@ fn apply(action: i32) {
         18..=22 => ACCENT.store(action - 18, Ordering::Relaxed),
         23 => ENGLISH.store(true, Ordering::Relaxed),
         24 => ENGLISH.store(false, Ordering::Relaxed),
+        25 => EMOJI.store(true, Ordering::Relaxed),
+        26 => EMOJI.store(false, Ordering::Relaxed),
         12 => {
             // 打开自定义短语文件（phrases.txt）
             let base = std::env::var("LOCALAPPDATA").unwrap_or_else(|_| ".".into());

@@ -326,7 +326,9 @@ unsafe fn tick(h: HWND) {
             let _ = result("T9", "「你‘」", text_of() == "你‘");
             clear_edit();
             logline("=== T10a: Shift 单独按一下 → 英文模式，逗号 → , 半角 ===");
-            QUEUE = vec![0x10];
+            // v4.15.0：单击改由 status 轮询窗口侦测（50ms 拍、40~500ms 单击窗），
+            // 即时一按一松轮询采不到，按住一拍再松（~260ms）落在窗里才算单击
+            QUEUE = vec![0x8010, 0x4010];
             QI = 0;
             PHASE = 10;
         }
@@ -339,7 +341,7 @@ unsafe fn tick(h: HWND) {
             let _ = result("T10a", "「,」（英文模式标点不转）", text_of() == ",");
             clear_edit();
             logline("=== T10b: 再按 Shift 回中文，逗号 → ， ===");
-            QUEUE = vec![0x10];
+            QUEUE = vec![0x8010, 0x4010]; // 同上：按住一拍再松开 = 单击
             QI = 0;
             PHASE = 12;
         }
@@ -413,6 +415,18 @@ extern "system" fn wndproc(h: HWND, msg: u32, w: WPARAM, l: LPARAM) -> LRESULT {
 fn main() -> Result<()> {
     unsafe {
         let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
+        // 自带种子（v4.15.0）：链式启动器里前一套 fix-english 子套会把
+        // english 翻来翻去写进 settings.txt，标点套对「中文标点=开、英文
+        // 模式=关」有硬依赖，自己写一份才不脆
+        let base = std::env::var("LOCALAPPDATA").unwrap_or_default();
+        if !base.is_empty() {
+            let dir = format!("{base}\\Pangyi");
+            let _ = std::fs::create_dir_all(&dir);
+            let _ = std::fs::write(
+                format!("{dir}\\settings.txt"),
+                "max=5\nscale=100\nlayout=v\ntheme=0\nenglish=0\ndebug=1\ncnpunct=1\ntrmode=0\naccent=0\nemoji=0\n",
+            );
+        }
         // 必须在创建任何 TSF 感知控件（RichEdit）之前抢注类工厂：
         // RichEdit 创建会触发 TSF 初始化并按注册表加载已安装的旧 DLL，
         // 晚了就抢不到了（v4.3.0 实测：注册表指向 Program Files 旧版时，
