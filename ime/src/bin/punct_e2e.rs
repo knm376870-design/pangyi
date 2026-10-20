@@ -41,6 +41,7 @@ static mut EDIT: HWND = HWND(0);
 static mut PHASE: u32 = 0;
 static mut QI: usize = 0;
 static mut QUEUE: Vec<u16> = Vec::new();
+static mut WARMUP: bool = false;
 static mut LOG: String = String::new();
 static mut PROFILES: Option<ITfInputProcessorProfiles> = None;
 static mut KEEP_DLL: Option<HMODULE> = None;
@@ -240,12 +241,24 @@ unsafe fn tick(h: HWND) {
                 Err(e) => logline(&format!("拿不到 profiles: {e:?}")),
             }
             activate();
-            logline("=== T1: 无拼音按逗号 → ， ===");
-            QUEUE = vec![0xBC];
+            // 预热：链式启动器里前一套台架进程刚退出、TSF 还在清理，首拍按键
+            // 会被吃掉（v4.13.0 实测 punct 排链里跑 T1 必空文档，单跑绿）。
+            // 先打几个标点喂给清理期再清空，T1 才稳（同 trans_e2e 预热段）。
+            logline("=== 预热: 逗号句点×3 -> 清空 ===");
+            QUEUE = vec![0xBC, 0xBE, 0xBC, 0xBE, 0xBC, 0xBE];
             QI = 0;
+            WARMUP = true;
             PHASE = 1;
         }
         1 => {
+            if WARMUP {
+                WARMUP = false;
+                clear_edit();
+                logline("=== T1: 无拼音按逗号 → ， ===");
+                QUEUE = vec![0xBC];
+                QI = 0;
+                return;
+            }
             let _ = result("T1", "「，」", text_of() == "，");
             clear_edit();
             logline("=== T2: 无拼音按句点 → 。 ===");

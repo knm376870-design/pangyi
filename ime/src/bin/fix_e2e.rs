@@ -21,6 +21,20 @@
 //!    G2 拼音下按 1 正常选第一个候选（回归）
 //!    G  「候选个数=5」时按 6 不选词、字母落到文档（修复 5）
 //!    G3 拼音中 Shift+H：首选「你」上屏 + 大写 H 直通（v4.2.3）
+//!    G7 Caps 在激活前就开好 + 打 A → 大写 A 直通（v4.13.0 影子状态）
+//!    M1 gzuo+空格 → 工作（缩写+全拼混合，v4.13.0）
+//!    M2 zgren+空格 → 中国人
+//!    M3 gzuorenyuan+空格 → 工作人员
+//!    M4 zhguoren+空格 → 中国人（zh 双声母混打）
+//!    M5 gzuor+空格 → 工作（混打 + 尾巴补全）
+//!    M6 gz+空格 → 工作（纯缩写回归，混打改动不得破坏老缩写）
+//!    C1 womn + ← + e + 空格 → 我们（← 回打错处插入，v4.14.0 光标）
+//!    C2 nihao + ←← + 退格 + 空格 → 鸟（退格删光标前字母）
+//!    C3 nihaoo + ← + Del + 空格 → 你好（Del 删光标后字母）
+//!    C4 ihao + Home + ←← + n + 空格 → 你好（Home 跳串首、← 在 0 位不动）
+//!    C5 nihao + Home + End + ma + 空格 → 你好吗（End 回串尾再接着打）
+//!    C6 nihaox + ←← + → + Del + 空格 → 你好（→ 右移光标再删尾）
+//!    C7 nihao + Home + 退格 + 空格 → 你好（光标在 0 退格不动）
 //!
 //! 用法：fix_e2e.exe [新DLL路径]  （LOCALAPPDATA 由调用方重定向）
 #![allow(non_snake_case)]
@@ -52,6 +66,7 @@ static mut KEEP_UNK: Option<IUnknown> = None;
 static mut COOKIE: u32 = 0;
 static mut HOOK: HHOOK = HHOOK(0);
 static mut STALL: u32 = 0;
+static mut IN_TICK: bool = false;
 
 /// 只吃「打到我们自己窗口」的真人按键：测试靠 SendInput 注入按键（带
 /// LLKHF_INJECTED 0x10 标志，一律放行）。前台是测试窗时吞掉真人按键，
@@ -86,8 +101,18 @@ unsafe fn text_of() -> String {
     String::from_utf16_lossy(&buf[..n.min(buf.len())])
 }
 unsafe fn clear_edit() {
+    // 先 ESC 取消可能残留的 TSF 组合（丢键干扰时上一用例的组合没提交，
+    // 不清掉会串进下一个用例 —— 2026-10-18 实测 [nigzuo你工作] 连锁），
+    // 再清文档。ESC 没有组合时只是直通，RichEdit 无副作用。
+    send_code(0x1B);
+    pump_ms(120);
     let e = wide("");
     SendMessageW(EDIT, WM_SETTEXT, WPARAM(0), LPARAM(e.as_ptr() as isize));
+    // WM_SETTEXT 之后也泵一拍：宿主（RichEdit）的文本替换可能要等消息泵
+    // 才落进 TSF 文本仓库，落在下一用例打字中途会把刚开的组合干掉
+    // （2026-10-18 M3 出现 [gz工作人员]：组合在打第 3 个键前被宿主终止，
+    // 前两个拼音字母变成正文）。清完再给 120ms 让它落地。
+    pump_ms(120);
 }
 
 /// 抢前台。用户点过别的窗口后 Windows 会挂前台锁，SetForegroundWindow
@@ -138,6 +163,22 @@ unsafe fn focus_ours() {
     SetFocus(EDIT);
     // 焦点刚到手时给 TSF 一点时间挂好按键接收器，键才不会白敲
     std::thread::sleep(std::time::Duration::from_millis(100));
+}
+
+/// 手动泵消息 ms 毫秒：tick 处理器里同步干的活（注入按键、激活 TSF）之后
+/// 队列里的消息要等 tick 返回才会被泵 —— 注入的按键在「激活前」需要先被
+/// 宿主消化掉（比如 G7 的 Caps 要先过宿主队列，Activate 时的 GetKeyState
+/// 快照才新鲜）。WM_TIMER 是低优先级消息，泵队列里没别的消息不会重入。
+unsafe fn pump_ms(ms: u64) {
+    let t0 = std::time::Instant::now();
+    let mut m = MSG::default();
+    while t0.elapsed().as_millis() < ms as u128 {
+        while PeekMessageW(&mut m, None, 0, 0, PM_REMOVE).as_bool() {
+            let _ = TranslateMessage(&m);
+            DispatchMessageW(&m);
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
 }
 
 /// 队列编码：0x8000|vk = 只按下；0x4000|vk = 只抬起；否则一按一松。
@@ -302,6 +343,21 @@ unsafe fn abort(h: HWND, why: &str) {
 }
 
 unsafe fn tick(h: HWND) {
+    // 重入保护：tick 里的 pump_ms 会嵌套泵消息，260ms 定时器在里面又触发
+    // WM_TIMER 的话会无限递归（2026-10-18 实测栈溢出）。重入的这一拍直接丢。
+    if IN_TICK {
+        return;
+    }
+    IN_TICK = true;
+    // RAII 复位：tick 中途有多个提前 return（抢不到前台中止、旧 DLL 作废），
+    // 手动在每个出口复位必漏。守卫随函数退出自动清。
+    struct TickGuard;
+    impl Drop for TickGuard {
+        fn drop(&mut self) {
+            unsafe { IN_TICK = false; }
+        }
+    }
+    let _tg = TickGuard;
     if QI < QUEUE.len() {
         // 每拍都确认前台还是自己再发键：中途被用户点走的话，SendInput 的
         // 键会打进用户正在用的别的应用（2026-10-10 实测 4/12 —— C 只到
@@ -327,6 +383,14 @@ unsafe fn tick(h: HWND) {
             let cfg = std::fs::read_to_string(format!("{base}\\Pangyi\\settings.txt"))
                 .unwrap_or_else(|_| "(没有 settings.txt)".into());
             logline(&format!("测试用 settings.txt: {}", cfg.replace('\n', " ")));
+            // G7 前置：输入法激活之前就把 Caps 开好 —— 复现「Caps 早就在
+            // 别的应用/更早的时刻开了，打字输不进大写」的场景。
+            // 注入后先泵消息让宿主消化掉 Caps 键（激活时 GetKeyState 快照
+            // 才新鲜；真实场景里 Caps 在别的应用按完，焦点切过来时宿主
+            // 早已泵过消息，时序就是这样）。
+            focus_ours();
+            send_code(0x14);
+            pump_ms(200);
             let _ = CoCreateInstance::<_, ITfThreadMgr>(&CLSID_TF_ThreadMgr, None, CLSCTX_INPROC_SERVER)
                 .map(|tm| {
                     let _ = tm.Activate();
@@ -351,33 +415,43 @@ unsafe fn tick(h: HWND) {
                 return;
             }
             logline("进程内只有新 DLL，开始测");
-            logline("=== A: 打 nihao 后按 ESC，文档应为空（旧版残留 nihao）===");
-            QUEUE = vec![0x4E, 0x49, 0x48, 0x41, 0x4F, 0x1B]; // n i h a o ESC
+            logline("=== G7: 激活前 Caps 已开，打 A —— 大写 A 直通 ===");
+            QUEUE = vec![0x41]; // A
             QI = 0;
             PHASE = 1;
         }
         1 => {
+            let t = text_of();
+            let _ = result("G7", "正好一个大写 A（激活前开好的 Caps 也能直通）", t == "A");
+            clear_edit();
+            send_code(0x14); // Caps 关（影子状态靠按键沿翻转）
+            logline("=== A: 打 nihao 后按 ESC，文档应为空（旧版残留 nihao）===");
+            QUEUE = vec![0x4E, 0x49, 0x48, 0x41, 0x4F, 0x1B]; // n i h a o ESC
+            QI = 0;
+            PHASE = 2;
+        }
+        2 => {
             let _ = result("A", "空（ESC 取消无残留）", text_of().is_empty());
             clear_edit();
             logline("=== B: 打 ni 后退格两次删空，文档应为空 ===");
             QUEUE = vec![0x4E, 0x49, 0x08, 0x08]; // n i BS BS
             QI = 0;
-            PHASE = 2;
+            PHASE = 3;
         }
-        2 => {
+        3 => {
             let _ = result("B", "空（删空无残留）", text_of().is_empty());
             clear_edit();
             logline("=== C: 单独按一下 Shift，再打 nihao+空格，应是英文直通 ===");
             QUEUE = vec![0x10]; // Shift 单独按一下
             QI = 0;
-            PHASE = 3;
-        }
-        3 => {
-            QUEUE = vec![0x4E, 0x49, 0x48, 0x41, 0x4F, 0x20]; // n i h a o 空格
-            QI = 0;
             PHASE = 4;
         }
         4 => {
+            QUEUE = vec![0x4E, 0x49, 0x48, 0x41, 0x4F, 0x20]; // n i h a o 空格
+            QI = 0;
+            PHASE = 5;
+        }
+        5 => {
             let t = text_of();
             let en = t.contains("nihao") && !t.contains('你');
             let _ = result("C", "英文直通 nihao、不出「你」", en);
@@ -385,14 +459,14 @@ unsafe fn tick(h: HWND) {
             logline("=== D: 再按一下 Shift，回到中文 ===");
             QUEUE = vec![0x10];
             QI = 0;
-            PHASE = 5;
-        }
-        5 => {
-            QUEUE = vec![0x4E, 0x49, 0x48, 0x41, 0x4F, 0x20];
-            QI = 0;
             PHASE = 6;
         }
         6 => {
+            QUEUE = vec![0x4E, 0x49, 0x48, 0x41, 0x4F, 0x20];
+            QI = 0;
+            PHASE = 7;
+        }
+        7 => {
             let t = text_of();
             let _ = result("D", "出「你好」（切回中文）", t.contains('你'));
             clear_edit();
@@ -400,27 +474,27 @@ unsafe fn tick(h: HWND) {
             // Shift 按下（只按不松）→ A 一按一松 → Shift 抬起 → ESC
             QUEUE = vec![0x8010, 0x41, 0x4010, 0x1B];
             QI = 0;
-            PHASE = 7;
+            PHASE = 8;
         }
-        7 => {
+        8 => {
             let t = text_of();
             let _ = result("E", "正好一个大写 A（直通输出，且 Shift+A 不算单独按 Shift）", t == "A");
             clear_edit();
             logline("=== G2: 打 ni 按 1，应选第一个候选「你」 ===");
             QUEUE = vec![0x4E, 0x49, 0x31]; // n i '1'
             QI = 0;
-            PHASE = 8;
+            PHASE = 9;
         }
-        8 => {
+        9 => {
             let t = text_of();
             let _ = result("G2", "出「你」", t.contains('你'));
             clear_edit();
             logline("=== F: E 之后再打 nihao+空格，应仍是中文「你好」 ===");
             QUEUE = vec![0x4E, 0x49, 0x48, 0x41, 0x4F, 0x20];
             QI = 0;
-            PHASE = 9;
+            PHASE = 10;
         }
-        9 => {
+        10 => {
             let t = text_of();
             let _ = result("F", "出「你好」（Shift+A 没有误切换）", t.contains('你'));
             clear_edit();
@@ -428,9 +502,9 @@ unsafe fn tick(h: HWND) {
             // 末尾补一个 ESC：把残余拼音 ni 取消掉，别污染下一个阶段
             QUEUE = vec![0x4E, 0x49, 0x36, 0x1B]; // n i '6' ESC
             QI = 0;
-            PHASE = 10;
+            PHASE = 11;
         }
-        10 => {
+        11 => {
             let t = text_of();
             let _ = result("G", "含字符 '6'、不含「拟」（旧版会提交看不见的第 6 候选）", t.contains('6') && !t.contains('拟'));
             clear_edit();
@@ -438,18 +512,18 @@ unsafe fn tick(h: HWND) {
             // n i Shift按下 H Shift抬起
             QUEUE = vec![0x4E, 0x49, 0x8010, 0x48, 0x4010];
             QI = 0;
-            PHASE = 11;
+            PHASE = 12;
         }
-        11 => {
+        12 => {
             let t = text_of();
             let _ = result("G3", "正好「你H」（首选上屏 + 大写直通）", t == "你H");
             clear_edit();
             logline("=== G4: 打 ni 按逗号 —— 首选「你」上屏 + 逗号不丢（旧版标点被 TSF 吞掉）===");
             QUEUE = vec![0x4E, 0x49, 0xBC]; // n i ','
             QI = 0;
-            PHASE = 12;
+            PHASE = 13;
         }
-        12 => {
+        13 => {
             let t = text_of();
             // v4.3.0 起中文标点默认开：逗号转全角。这里断言的是「不丢 + 首选上屏」，
             // 标点跟随当前版本的全角行为。
@@ -458,20 +532,137 @@ unsafe fn tick(h: HWND) {
             logline("=== G5: Caps 开 + 字母 A + Caps 关 —— 大写 A 直通（Caps 不吞字母）===");
             QUEUE = vec![0x14, 0x41, 0x14]; // Caps A Caps
             QI = 0;
-            PHASE = 13;
+            PHASE = 14;
         }
-        13 => {
+        14 => {
             let t = text_of();
             let _ = result("G5", "正好一个大写 A（Caps 直通）", t == "A");
             clear_edit();
             logline("=== G6: 打 ni、Caps 开、按 H、Caps 关 —— 首选「你」上屏 + 大写 H ===");
             QUEUE = vec![0x4E, 0x49, 0x14, 0x48, 0x14]; // n i Caps H Caps
             QI = 0;
-            PHASE = 14;
+            PHASE = 15;
         }
-        14 => {
+        15 => {
             let t = text_of();
             let _ = result("G6", "正好「你H」（Caps 下首选上屏 + 大写）", t == "你H");
+            clear_edit();
+            logline("=== M1: gzuo + 空格 —— 缩写+全拼混合 → 工作（v4.13.0）===");
+            QUEUE = vec![0x47, 0x5A, 0x55, 0x4F, 0x20]; // g z u o 空格
+            QI = 0;
+            PHASE = 16;
+        }
+        16 => {
+            let t = text_of();
+            let _ = result("M1", "正好「工作」", t == "工作");
+            clear_edit();
+            logline("=== M2: zgren + 空格 —— 单字母缩写+全拼+全拼 → 中国人 ===");
+            QUEUE = vec![0x5A, 0x47, 0x52, 0x45, 0x4E, 0x20]; // z g r e n 空格
+            QI = 0;
+            PHASE = 17;
+        }
+        17 => {
+            let t = text_of();
+            let _ = result("M2", "正好「中国人」", t == "中国人");
+            clear_edit();
+            logline("=== M3: gzuorenyuan + 空格 —— 混打整句 → 工作人员 ===");
+            QUEUE = vec![0x47, 0x5A, 0x55, 0x4F, 0x52, 0x45, 0x4E, 0x59, 0x55, 0x41, 0x4E, 0x20]; // g z u o r e n y u a n 空格
+            QI = 0;
+            PHASE = 18;
+        }
+        18 => {
+            let t = text_of();
+            let _ = result("M3", "正好「工作人员」", t == "工作人员");
+            clear_edit();
+            logline("=== M4: zhguoren + 空格 —— zh 双声母混打 → 中国人 ===");
+            QUEUE = vec![0x5A, 0x48, 0x47, 0x55, 0x4F, 0x52, 0x45, 0x4E, 0x20]; // z h g u o r e n 空格
+            QI = 0;
+            PHASE = 19;
+        }
+        19 => {
+            let t = text_of();
+            let _ = result("M4", "正好「中国人」", t == "中国人");
+            clear_edit();
+            logline("=== M5: gzuor + 空格 —— 混打 + 尾巴补全，首选仍是整词 → 工作 ===");
+            QUEUE = vec![0x47, 0x5A, 0x55, 0x4F, 0x52, 0x20]; // g z u o r 空格
+            QI = 0;
+            PHASE = 20;
+        }
+        20 => {
+            let t = text_of();
+            let _ = result("M5", "正好「工作」", t == "工作");
+            clear_edit();
+            logline("=== M6: gz + 空格 —— 纯缩写回归 → 工作 ===");
+            QUEUE = vec![0x47, 0x5A, 0x20]; // g z 空格
+            QI = 0;
+            PHASE = 21;
+        }
+        21 => {
+            let t = text_of();
+            let _ = result("M6", "正好「工作」", t == "工作");
+            clear_edit();
+            logline("=== C1: womn + ← + e + 空格 —— 回到打错处插入 → 我们（v4.14.0 光标）===");
+            QUEUE = vec![0x57, 0x4F, 0x4D, 0x4E, 0x25, 0x45, 0x20]; // w o m n ← e 空格
+            QI = 0;
+            PHASE = 22;
+        }
+        22 => {
+            let t = text_of();
+            let _ = result("C1", "正好「我们」", t == "我们");
+            clear_edit();
+            logline("=== C2: nihao + ←← + 退格 + 空格 —— 退格删光标前字母 → 鸟 ===");
+            QUEUE = vec![0x4E, 0x49, 0x48, 0x41, 0x4F, 0x25, 0x25, 0x08, 0x20]; // n i h a o ← ← BS 空格
+            QI = 0;
+            PHASE = 23;
+        }
+        23 => {
+            let t = text_of();
+            let _ = result("C2", "正好「鸟」", t == "鸟");
+            clear_edit();
+            logline("=== C3: nihaoo + ← + Del + 空格 —— Del 删光标后字母 → 你好 ===");
+            QUEUE = vec![0x4E, 0x49, 0x48, 0x41, 0x4F, 0x4F, 0x25, 0x2E, 0x20]; // n i h a o o ← Del 空格
+            QI = 0;
+            PHASE = 24;
+        }
+        24 => {
+            let t = text_of();
+            let _ = result("C3", "正好「你好」", t == "你好");
+            clear_edit();
+            logline("=== C4: ihao + Home + ←← + n + 空格 —— Home 跳串首、← 在 0 位不动 → 你好 ===");
+            QUEUE = vec![0x49, 0x48, 0x41, 0x4F, 0x24, 0x25, 0x25, 0x4E, 0x20]; // i h a o Home ← ← n 空格
+            QI = 0;
+            PHASE = 25;
+        }
+        25 => {
+            let t = text_of();
+            let _ = result("C4", "正好「你好」", t == "你好");
+            clear_edit();
+            logline("=== C5: nihao + Home + End + ma + 空格 —— End 回串尾接着打 → 你好吗 ===");
+            QUEUE = vec![0x4E, 0x49, 0x48, 0x41, 0x4F, 0x24, 0x23, 0x4D, 0x41, 0x20]; // n i h a o Home End m a 空格
+            QI = 0;
+            PHASE = 26;
+        }
+        26 => {
+            let t = text_of();
+            let _ = result("C5", "正好「你好吗」", t == "你好吗");
+            clear_edit();
+            logline("=== C6: nihaox + ←← + → + Del + 空格 —— → 右移光标再删尾 → 你好 ===");
+            QUEUE = vec![0x4E, 0x49, 0x48, 0x41, 0x4F, 0x58, 0x25, 0x25, 0x27, 0x2E, 0x20]; // n i h a o x ← ← → Del 空格
+            QI = 0;
+            PHASE = 27;
+        }
+        27 => {
+            let t = text_of();
+            let _ = result("C6", "正好「你好」", t == "你好");
+            clear_edit();
+            logline("=== C7: nihao + Home + 退格 + 空格 —— 光标在 0 退格不动 → 你好 ===");
+            QUEUE = vec![0x4E, 0x49, 0x48, 0x41, 0x4F, 0x24, 0x08, 0x20]; // n i h a o Home BS 空格
+            QI = 0;
+            PHASE = 28;
+        }
+        28 => {
+            let t = text_of();
+            let _ = result("C7", "正好「你好」", t == "你好");
             logline("=== 进程内 pangyi 模块（应只有 target\\release 的新 DLL）===");
             log_modules();
             logline("=== 完 ===");

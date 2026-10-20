@@ -38,7 +38,7 @@ static mut BG: HBRUSH = HBRUSH(0);
 /// 窗框吃掉一块，底部关闭药丸（footer_y=526..556）直接裁掉一截（v4.6.0 踩坑）。
 static mut OUTER_W: i32 = 0;
 static mut OUTER_H: i32 = 0;
-/// 悬停的药丸：0=无、-1=关闭钮、1..22=对应动作号（画悬停底色 + 手型光标用）
+/// 悬停的药丸：0=无、-1=关闭钮、1..24=对应动作号（画悬停底色 + 手型光标用）
 static HOT: AtomicI32 = AtomicI32::new(0);
 /// 是否已挂过 TrackMouseEvent（挂一次就能收 WM_MOUSELEAVE）
 static TRACKED: AtomicBool = AtomicBool::new(false);
@@ -331,7 +331,9 @@ fn draw(dc: HDC, f: HFONT, color: COLORREF, x: i32, y: i32, s: &str) -> i32 {
 
 // 窗口与布局（逻辑像素，经 sc() 按 DPI 缩放）
 const WIN_W: i32 = 360;
-const WIN_H: i32 = 564;
+// 9 行卡底 = 108+9×44+8×8 = 568，FOOTER_Y 留 10，窗口高 = 底 + 38
+// （v4.13.0 加「英文模式」行：8 行 → 9 行，WIN_H 564→616、FOOTER_Y 526→578）
+const WIN_H: i32 = 616;
 const HEADER_H: i32 = 96; // 头部渐变横幅（卡通 + 标题）
 const MARGIN: i32 = 12; // 卡片左右留白
 const CARDS_TOP: i32 = 108;
@@ -343,7 +345,7 @@ const PILL_PAD_X: i32 = 10;
 const PILL_PAD_Y: i32 = 4;
 const PILL_GAP: i32 = 8;
 const PILL_RADIUS: i32 = 8;
-const FOOTER_Y: i32 = 526; // 底部统计 + 关闭按钮
+const FOOTER_Y: i32 = 578; // 底部统计 + 关闭按钮
 
 /// 每行的选项：标签 + 选项文本 + 动作号
 fn rows() -> Vec<(&'static str, Vec<(&'static str, i32)>)> {
@@ -355,6 +357,9 @@ fn rows() -> Vec<(&'static str, Vec<(&'static str, i32)>)> {
         ("配色", vec![("青", 18), ("粉", 19), ("橙", 20), ("紫", 21), ("绿", 22)]),
         ("中文标点", vec![("开", 13), ("关", 14)]),
         ("翻译模式", vec![("关", 15), ("逐字", 16), ("整句", 17)]),
+        // v4.13.0：英文模式（微软同款中/英开关）。开 = 字母/标点全直通英文，
+        // 不进拼音组合、不翻译；Shift 单击切换和这个开关写同一个设置。
+        ("英文模式", vec![("开", 23), ("关", 24)]),
         ("自定义短语", vec![("打开短语文件", 12)]),
     ]
 }
@@ -378,6 +383,7 @@ fn is_current(act: i32) -> bool {
         18..=22 => act == 18 + accent(),
         13 | 14 => act == if cnpunct() { 13 } else { 14 },
         15..=17 => act == 15 + trmode(),
+        23 | 24 => act == if english() { 23 } else { 24 },
         _ => false,
     }
 }
@@ -660,7 +666,7 @@ unsafe fn layout(dc: HDC) -> Layout {
     }
 }
 
-/// 命中测试：返回动作号（1..22）、-1=关闭钮、0=没点中
+/// 命中测试：返回动作号（1..24）、-1=关闭钮、0=没点中
 fn pill_at(l: &Layout, x: i32, y: i32) -> i32 {
     for pill in &l.pills {
         let r = pill.rect;
@@ -836,6 +842,8 @@ fn apply(action: i32) {
         14 => CNPUNCT.store(false, Ordering::Relaxed),
         15..=17 => TRMODE.store(action - 15, Ordering::Relaxed),
         18..=22 => ACCENT.store(action - 18, Ordering::Relaxed),
+        23 => ENGLISH.store(true, Ordering::Relaxed),
+        24 => ENGLISH.store(false, Ordering::Relaxed),
         12 => {
             // 打开自定义短语文件（phrases.txt）
             let base = std::env::var("LOCALAPPDATA").unwrap_or_else(|_| ".".into());
@@ -882,7 +890,7 @@ unsafe fn init() {
     RegisterClassW(&wc);
     let title: Vec<u16> = format!("旁译 设置  v{}\0", env!("CARGO_PKG_VERSION")).encode_utf16().collect();
     // 普通窗口：有标题栏、有关闭按钮，能正常关掉。
-    // 尺寸给的是「客户区 360×564 对应的外层尺寸」——见 OUTER_W 注释。
+    // 尺寸给的是「客户区 360×616 对应的外层尺寸」——见 OUTER_W 注释。
     let style = WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX;
     let mut outer = RECT { left: 0, top: 0, right: sc(WIN_W), bottom: sc(WIN_H) };
     let _ = AdjustWindowRectEx(&mut outer, style, FALSE, WINDOW_EX_STYLE(0));
@@ -945,7 +953,7 @@ pub unsafe extern "system" fn settings_open_export() -> isize {
     WND.0
 }
 
-/// act=0 关闭钮 / 1..22 药丸 的可点击矩形写进 out[4] = l,t,r,b；找不到返回 0。
+/// act=0 关闭钮 / 1..24 药丸 的可点击矩形写进 out[4] = l,t,r,b；找不到返回 0。
 /// 矩形和绘制/命中走同一个 layout()，保证台架点的就是画的那块。
 #[no_mangle]
 pub unsafe extern "system" fn settings_action_rect_export(act: u32, out: *mut i32) -> u32 {

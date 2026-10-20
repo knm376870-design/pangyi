@@ -25,11 +25,21 @@ use windows::Win32::UI::TextServices::{
     ITfClientId, ITfComposition, ITfCompositionSink, ITfCompositionSink_Impl, ITfContextComposition,
     ITfDocumentMgr, ITfEditSession, ITfEditSession_Impl, ITfTextInputProcessorEx,
     ITfTextInputProcessorEx_Impl, ITfThreadMgrEventSink, ITfThreadMgrEventSink_Impl,
-    ITfSource, ITfThreadMgr, TF_CONTEXT_EDIT_CONTEXT_FLAGS, TF_ES_READWRITE, TF_ES_SYNC, TF_SELECTION,
+    ITfSource, ITfThreadMgr, TF_ANCHOR_START, TF_CONTEXT_EDIT_CONTEXT_FLAGS, TF_ES_READWRITE, TF_ES_SYNC,
+    TF_SELECTION,
 };
 
 static SHIFT_DOWN_AT: AtomicU32 = AtomicU32::new(0);
 static SHIFT_DIRTY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Caps Lock 影子状态（v4.13.0）：跟踪 0x14 键的按下沿翻转。
+/// 旧的 caps_on() 用 GetKeyState 读队列快照，在 TSF 回调线程上常是过期值
+/// （Caps 早就在别的应用/更早的时候开了，快照还是 false）→ 大写字母全掉进
+/// 拼音串里出不来。影子状态不依赖队列快照：Caps 键经过 TSF 时 OnTestKeyDown
+/// 一定能看见按下沿；看不见的（换焦点回来）由 Activate 时 GetKeyState 兜底。
+static CAPS_SHADOW: AtomicBool = AtomicBool::new(false);
+/// 0x14 键当前是否物理按住（挡自动重复：按住 Caps 会连发 keydown）
+static CAPS_KEY_DOWN: AtomicBool = AtomicBool::new(false);
 
 static PENDING_CAND: Mutex<Option<(i32, i32)>> = Mutex::new(None);
 
@@ -128,6 +138,10 @@ struct TextService {
     /// 连接点被占满时我们要一直有机会重试，但不能每来一次焦点事件就猛打一次。
     last_advise_ms: Cell<u32>,
     buf: RefCell<String>,
+    /// 拼音串里的插入位置（字节下标，拼音全是 ASCII 所以字节=字符）。
+    /// v4.14.0：←/→ 移动光标、字母插在光标处、退格/Delete 吃光标，
+    /// 微软拼音同款「改前面打错的字母」。
+    cursor: Cell<usize>,
 }
 
 impl TextService {
@@ -144,6 +158,7 @@ impl TextService {
             active: Cell::new(false),
             last_advise_ms: Cell::new(0),
             buf: RefCell::new(String::new()),
+            cursor: Cell::new(0),
         }
     }
 }
@@ -337,10 +352,24 @@ impl TextService {
             unsafe { cand_update(x, y); }
         }
         if let Some(ctx) = pic {
-            let s: ITfEditSession = UpdateSession { text: key.encode_utf16().collect() }.into();
+            let s: ITfEditSession = UpdateSession {
+                ctx: ctx.clone(),
+                text: key.encode_utf16().collect(),
+                sel: self.cursor.get(),
+            }
+            .into();
             let flags = TF_CONTEXT_EDIT_CONTEXT_FLAGS(TF_ES_SYNC.0 | TF_ES_READWRITE.0);
             let _ = unsafe { ctx.RequestEditSession(self.client_id.get(), &s, flags) };
         }
+    }
+
+    /// 拼音光标动了（←/→ Home/End）：把组合里的选中位置同步过去。
+    /// 单独一个编辑会话 —— 不改文字，只挪竖线。
+    fn move_comp_caret(&self, pic: Option<&ITfContext>) {
+        let Some(ctx) = pic else { return };
+        let s: ITfEditSession = CaretSession { ctx: ctx.clone(), sel: self.cursor.get() }.into();
+        let flags = TF_CONTEXT_EDIT_CONTEXT_FLAGS(TF_ES_SYNC.0 | TF_ES_READWRITE.0);
+        let _ = unsafe { ctx.RequestEditSession(self.client_id.get(), &s, flags) };
     }
 }
 
@@ -352,7 +381,9 @@ impl TextService {
         }
         // 先读设置：log() 要靠 settings::debug() 决定要不要写，顺序不能反
         unsafe { settings::load(); }
-        log("Activate v4.12.0");
+        // Caps 影子状态对表：焦点回来时 Caps 可能早就在别处开好了
+        sync_caps();
+        log("Activate v4.14.0");
         log(&format!(
             "cnpunct={} english={} trmode={} accent={}",
             crate::settings::cnpunct(),
@@ -374,6 +405,7 @@ impl TextService {
 
         // 新会话开始：把上一次留下的状态清干净，否则上一个窗口的拼音串会漏进来
         self.buf.borrow_mut().clear();
+        self.cursor.set(0);
         UI_CANDS.lock().unwrap().clear();
         ALL_CANDS.lock().unwrap().clear();
         PAGE.store(0, Ordering::Relaxed);
@@ -499,6 +531,7 @@ impl TextService {
         self.keystroke.borrow_mut().take();
         self.tm.borrow_mut().take();
         self.buf.borrow_mut().clear();
+        self.cursor.set(0);
         UI_CANDS.lock().unwrap().clear();
         ALL_CANDS.lock().unwrap().clear();
         PAGE.store(0, Ordering::Relaxed);
@@ -511,6 +544,7 @@ impl TextService {
 
 impl ITfCompositionSink_Impl for TextService {
     fn OnCompositionTerminated(&self, _ec: u32, _c: Option<&ITfComposition>) -> Result<()> {
+        dlog!("OnCompositionTerminated fired（组合被宿主/TSF 终结）");
         *COMPOSITION.lock().unwrap() = None;
         Ok(())
     }
@@ -531,6 +565,8 @@ impl ITfKeyEventSink_Impl for TextService {
     }
 
     fn OnTestKeyDown(&self, _pic: Option<&ITfContext>, wparam: WPARAM, _lp: LPARAM) -> Result<BOOL> {
+        // Caps 影子状态维护放最前面：大写分支（下面 line 570 一带）全靠它
+        track_caps(wparam);
         // Shift 的按下/抬起在测试回调里直接记，不靠 OnKeyDown/OnKeyUp：
         // 按 TSF 契约，OnKeyDown/OnKeyUp 只在测试回调返回 TRUE 时才会被回调，
         // 而 Shift 不能被 claim（会吞掉 Shift+字母、Shift+方向键）。
@@ -578,6 +614,8 @@ impl ITfKeyEventSink_Impl for TextService {
         Ok(BOOL(want as i32))
     }
     fn OnTestKeyUp(&self, _pic: Option<&ITfContext>, w: WPARAM, _l: LPARAM) -> Result<BOOL> {
+        // Caps 抬起也跟踪：CAPS_KEY_DOWN 靠它复位，下次按下才能再翻影子状态
+        track_caps(w);
         // 单独按一下 Shift（没夹着别的键、400ms 内松开）= 切中/英。
         // 放在测试回调而不是 OnKeyUp，原因见 OnTestKeyDown 的注释。
         if w.0 == 0x10 {
@@ -638,6 +676,7 @@ impl ITfKeyEventSink_Impl for TextService {
                 let w = unsafe { cand::current() }
                     .or_else(|| UI_CANDS.lock().unwrap().first().map(|(w, _)| w.clone()));
                 self.buf.borrow_mut().clear();
+                self.cursor.set(0);
                 UI_CANDS.lock().unwrap().clear();
                 unsafe { cand_hide(); }
                 let letter = ch.to_ascii_uppercase();
@@ -655,10 +694,15 @@ impl ITfKeyEventSink_Impl for TextService {
             return Ok(BOOL(1));
         }
 
-        // 字母：进组合
+        // 字母：进组合（v4.14.0 插在光标处 —— ←/→ 移过光标后，字母从那里接着打）
         if ch.is_ascii_alphabetic() {
             if crate::settings::english() { return Ok(BOOL(0)); }
-            self.buf.borrow_mut().push(ch.to_ascii_lowercase());
+            {
+                let mut b = self.buf.borrow_mut();
+                let c = self.cursor.get().min(b.len());
+                b.insert(c, ch.to_ascii_lowercase());
+                self.cursor.set(c + 1);
+            }
             let key = self.buf.borrow().clone();
             unsafe { cand::set_preedit(&key); }
             set_all_cands(dict::lookup(&key));
@@ -666,7 +710,7 @@ impl ITfKeyEventSink_Impl for TextService {
             if let Some(ctx) = pic {
                 let text: Vec<u16> = key.encode_utf16().collect();
                 let sink: ITfCompositionSink = match unsafe { self.cast() } { Ok(s) => s, Err(_) => return Ok(BOOL(1)) };
-                let s: ITfEditSession = CompSession { ctx: ctx.clone(), text, sink }.into();
+                let s: ITfEditSession = CompSession { ctx: ctx.clone(), text, sink, sel: self.cursor.get() }.into();
                 let flags = TF_CONTEXT_EDIT_CONTEXT_FLAGS(TF_ES_SYNC.0 | TF_ES_READWRITE.0);
                 let _ = unsafe { ctx.RequestEditSession(self.client_id.get(), &s, flags) };
             }
@@ -678,10 +722,28 @@ impl ITfKeyEventSink_Impl for TextService {
 
         let has_buf = !self.buf.borrow().is_empty();
 
-        // 退格：删拼音
+        // 退格：删光标前一个字母（v4.14.0 光标在最前就没得删，微软同款）
         if wparam.0 == 0x08 {
             if !has_buf { return Ok(BOOL(0)); }
-            self.buf.borrow_mut().pop();
+            {
+                let c = self.cursor.get();
+                if c == 0 { return Ok(BOOL(1)); }
+                self.buf.borrow_mut().remove(c - 1);
+                self.cursor.set(c - 1);
+            }
+            self.refresh_composition(pic);
+            return Ok(BOOL(1));
+        }
+
+        // Delete：删光标后一个字母（光标在最后就没得删）
+        if wparam.0 == 0x2E {
+            if !has_buf { return Ok(BOOL(0)); }
+            {
+                let c = self.cursor.get();
+                if c >= self.buf.borrow().len() { return Ok(BOOL(1)); }
+                self.buf.borrow_mut().remove(c);
+                // 删的是后面的字母，光标位置不动
+            }
             self.refresh_composition(pic);
             return Ok(BOOL(1));
         }
@@ -696,6 +758,7 @@ impl ITfKeyEventSink_Impl for TextService {
             // 理论上 claim() 只会放行当前页里真有的候选，这里再兜一次底
             let Some(w) = word else { return Ok(BOOL(0)); };
             self.buf.borrow_mut().clear();
+            self.cursor.set(0);
             UI_CANDS.lock().unwrap().clear();
             unsafe { cand_hide(); }
             self.commit_word(pic, &w);
@@ -714,25 +777,44 @@ impl ITfKeyEventSink_Impl for TextService {
             return Ok(BOOL(1));
         }
 
-        // ← / →：竖排时在「中文 / 俄语」两边之间切换 —— 蓝条挪到俄语列，
-        // 上屏就只出俄语（中文不用输入）；再按 ← 挪回中文侧。
-        // 横排没有左右两栏，←→ 就当作 ↑↓ 移动用。
+        // ← / →：移动拼音里的插入光标（微软拼音同款 —— 改前面打错的字母）。
+        // v4.14.0 起 ←/→ 专职动光标；v4.9.0 的「俄语侧」入口挪到「光标已在
+        // 最右时再按 →」：已经在俄语侧时保持原语义（→ 循环义项 / ← 回中文侧），
+        // 横排没有俄语侧，←→ 就只动光标。
         if matches!(wparam.0 as u32, 0x25 | 0x27) {
             if !has_buf { return Ok(BOOL(0)); }
-            if UI_CANDS.lock().unwrap().len() == 0 { return Ok(BOOL(0)); }
-            if crate::settings::horizontal() {
-                let right = (wparam.0 as u32) == 0x27;
-                move_sel(if right { 1 } else { -1 });
-            } else if (wparam.0 as u32) == 0x27 {
-                // v4.9.0：已在俄语侧时 → 循环义项（多义项挑一个），
-                // 中文侧时 → 照旧进俄语侧
-                unsafe {
-                    if cand::ru_sel() { cand::ru_sense_next(); } else { cand::set_ru_sel(true); }
+            let right = (wparam.0 as u32) == 0x27;
+            if unsafe { cand::ru_sel() } {
+                if right {
+                    unsafe { cand::ru_sense_next(); }
+                } else {
+                    unsafe { cand::set_ru_sel(false); }
                 }
             } else {
-                unsafe { cand::set_ru_sel(false); }
+                let len = self.buf.borrow().len();
+                let c = self.cursor.get();
+                if right {
+                    if c < len {
+                        self.cursor.set(c + 1);
+                    } else if !crate::settings::horizontal() && !UI_CANDS.lock().unwrap().is_empty() {
+                        // 光标已经在最右：进俄语侧（v4.9.0 入口不变）
+                        unsafe { cand::set_ru_sel(true); }
+                    }
+                } else if c > 0 {
+                    self.cursor.set(c - 1);
+                }
+                // 光标动了就把组合里的选中位置同步过去（文档里的竖线跟着走）
+                self.move_comp_caret(pic);
             }
-            dlog!("←/→ wparam={} 现在 ru_sel={} ru_sense={}", wparam.0, unsafe { cand::ru_sel() }, unsafe { cand::ru_sense() });
+            dlog!("←/→ wparam={} cursor={} ru_sel={} ru_sense={}", wparam.0, self.cursor.get(), unsafe { cand::ru_sel() }, unsafe { cand::ru_sense() });
+            return Ok(BOOL(1));
+        }
+
+        // Home / End：拼音光标跳到最前 / 最后
+        if matches!(wparam.0 as u32, 0x24 | 0x23) {
+            if !has_buf { return Ok(BOOL(0)); }
+            self.cursor.set(if (wparam.0 as u32) == 0x24 { 0 } else { self.buf.borrow().len() });
+            self.move_comp_caret(pic);
             return Ok(BOOL(1));
         }
 
@@ -752,6 +834,7 @@ impl ITfKeyEventSink_Impl for TextService {
             let w = unsafe { cand::current() }
                 .or_else(|| UI_CANDS.lock().unwrap().first().map(|(w, _)| w.clone()));
             self.buf.borrow_mut().clear();
+            self.cursor.set(0);
             UI_CANDS.lock().unwrap().clear();
             unsafe { cand_hide(); }
             dlog!("上屏 word={:?}", w);
@@ -763,6 +846,7 @@ impl ITfKeyEventSink_Impl for TextService {
         if wparam.0 == 0x1B {
             if !has_buf { return Ok(BOOL(0)); }
             self.buf.borrow_mut().clear();
+            self.cursor.set(0);
             UI_CANDS.lock().unwrap().clear();
             unsafe { cand_hide(); }
             if let Some(ctx) = pic {
@@ -805,6 +889,7 @@ impl ITfKeyEventSink_Impl for TextService {
                 }
             });
             self.buf.borrow_mut().clear();
+            self.cursor.set(0);
             UI_CANDS.lock().unwrap().clear();
             unsafe { cand_hide(); }
             match (w, c) {
@@ -983,17 +1068,68 @@ fn shift_down() -> bool {
 }
 
 /// Caps Lock 灯是不是亮着（亮着时字母应直通英文大写，和微软一样）。
-/// 注意：GetAsyncKeyState 的低 1 位是「上次查询后按过没有」，不是开关状态
-/// （实测 Caps 按下瞬间为 true、下一键查询就变 false），不能用；
-/// GetKeyState 的低 1 位才是真正的开关状态（队列快照，TSF 回调线程上
-/// 对 Shift 这类瞬时键是过期的，但 Caps 开关位试试是不是也过期）。
+/// 读影子状态（见 CAPS_SHADOW 的注释）：GetKeyState 的队列快照在 TSF 回调
+/// 线程上会过期，Caps 开在别的应用/更早时刻时读到 false，字母掉进拼音串。
 fn caps_on() -> bool {
+    CAPS_SHADOW.load(Ordering::Relaxed)
+}
+
+/// 跟踪 Caps 按下沿、维护影子状态。OnTestKeyDown/OnTestKeyUp 里每个键都调。
+/// 两条互补的检测路（同一物理按下不会重复翻转）：
+///
+/// 1. 宿主把 Caps 路由给 TSF（wparam==0x14）：按下沿翻转 —— 0x14 键从
+///    「没按住」变「按住」。GetAsyncKeyState 高 1 位是实时物理状态，按住
+///    Caps 自动重复连发 keydown 时它一直是 1，第二次及以后不再翻转。
+///    本路径的查询同时消费了低 1 位，路径 2 不会再为这次按下翻第二次。
+/// 2. 宿主不路由 Caps（RichEdit 一类把 VK_CAPITAL 自己消化掉的宿主）：
+///    低 1 位沿 —— GetAsyncKeyState 低 1 位 = 「上次本线程查询后按过」。
+///    每次字母键进来都查一次：按键已松开且低 1 位亮 = 两次查询之间
+///    按过 Caps，翻转。按住期间的自动重复（高 1 位=1）跳过。
+fn track_caps(wparam: WPARAM) {
     unsafe {
-        (windows::Win32::UI::Input::KeyboardAndMouse::GetKeyState(
+        let st = windows::Win32::UI::Input::KeyboardAndMouse::GetAsyncKeyState(
             windows::Win32::UI::Input::KeyboardAndMouse::VK_CAPITAL.0 as i32,
-        ) as u16
-            & 0x0001)
-            != 0
+        ) as u16;
+        if wparam.0 == 0x14 {
+            // 路由宿主：Caps 的按下/抬起会到 TestKeyDown/TestKeyUp。
+            // 按下沿主信号取低 1 位（自上次 GetAsyncKeyState 之后按过）——
+            // 每次 poll 都会清掉它，天然是沿信号。快速敲击时事件送达前键已
+            // 松开，高位「按住中」靠不住（2026-10-18 harness 实测：注入的
+            // Caps 按下路由过来时 async=0001，高位已经是 0 —— 只看高位
+            // 就会漏翻转，影子卡死 false，大写字母全被当拼音吃进组合）。
+            // 高位 + CAPS_KEY_DOWN 交换作兜底：别的进程抢先 poll 清掉低位、
+            // 键还按着时，按下沿照样翻一次；长按自动重复两条都不满足，不翻。
+            let down = st & 0x8000 != 0;
+            let was = CAPS_KEY_DOWN.swap(down, Ordering::Relaxed);
+            if st & 0x0001 != 0 || (down && !was) {
+                flip_caps();
+            }
+        } else if st & 0x0001 != 0 && st & 0x8000 == 0 {
+            flip_caps();
+        }
+    }
+}
+
+fn flip_caps() {
+    CAPS_SHADOW.store(!CAPS_SHADOW.load(Ordering::Relaxed), Ordering::Relaxed);
+}
+
+/// Activate 时把影子状态和系统对一次表（兜底：Caps 在拿到焦点前就开好了，
+/// 我们没看见过按下沿）。GetKeyState 在会泵消息的宿主线程上是新鲜的；
+/// 对不上的宿主（原始输入类应用）由 track_caps 的低 1 位沿继续兜。
+/// 先查一次 GetAsyncKeyState 把「上次查询后按过」的旧账清掉，再读快照 ——
+/// 不然激活前的旧按键会在第一个字母那里被低 1 位沿重复算一遍。
+/// CAPS_KEY_DOWN 一并复位：焦点切换可能把「按住」状态留成脏的。
+fn sync_caps() {
+    CAPS_KEY_DOWN.store(false, Ordering::Relaxed);
+    unsafe {
+        windows::Win32::UI::Input::KeyboardAndMouse::GetAsyncKeyState(
+            windows::Win32::UI::Input::KeyboardAndMouse::VK_CAPITAL.0 as i32,
+        );
+        let st = windows::Win32::UI::Input::KeyboardAndMouse::GetKeyState(
+            windows::Win32::UI::Input::KeyboardAndMouse::VK_CAPITAL.0 as i32,
+        ) as u16;
+        CAPS_SHADOW.store(st & 0x0001 != 0, Ordering::Relaxed);
     }
 }
 
@@ -1089,9 +1225,12 @@ fn claim(wparam: WPARAM, has_buf: bool, english: bool) -> bool {
             let idx = (wparam.0 as usize) - 0x31;
             !shift_down() && idx < UI_CANDS.lock().unwrap().len()
         }
-        // 方向键选词：当前页真有候选才拦，否则放行给应用移动光标。
+        // ←/→ 有拼音时拦下来移动拼音光标（v4.14.0：改前面打错的字母），
+        // 没拼音放行给应用移动正文光标；Delete / Home / End 同理。
+        0x25 | 0x27 | 0x2E | 0x24 | 0x23 => true,
+        // ↑/↓ 选词：当前页真有候选才拦，否则放行给应用移动光标。
         // （v4.5.0 前这里无条件 true，空候选时 ←→ 会被 TSF 吞掉）
-        0x25..=0x28 => !UI_CANDS.lock().unwrap().is_empty(),
+        0x26 | 0x28 => !UI_CANDS.lock().unwrap().is_empty(),
         0x21 | 0x22 => true,                      // PageUp / PageDown
         _ => is_punct_vk(wparam.0 as u32),
     }
@@ -1235,11 +1374,30 @@ unsafe fn cand_hide() { cand::hide(); }
 
 // ============================ 组合（拼音下划线）============================
 
+/// 把组合里的选中位置挪到拼音光标处：组合范围起点塌缩成竖线，再右移 sel 格。
+/// 文档里的插入竖线跟着走，宿主才知道下一个字母插在哪（v4.14.0 光标编辑）。
+unsafe fn comp_set_caret(ctx: &ITfContext, ec: u32, sel: usize) {
+    let g = COMPOSITION.lock().unwrap();
+    if let Some(comp) = g.as_ref() {
+        if let Ok(r) = comp.GetRange() {
+            let mut care = r.clone();
+            let _ = care.Collapse(ec, TF_ANCHOR_START);
+            let mut moved = 0i32;
+            let _ = care.ShiftStart(ec, sel as i32, &mut moved, std::ptr::null());
+            let mut tfs = [TF_SELECTION::default()];
+            *tfs[0].range = Some(care);
+            let _ = ctx.SetSelection(ec, &mut tfs);
+        }
+    }
+}
+
 #[implement(ITfEditSession)]
 struct CompSession {
     ctx: ITfContext,
     text: Vec<u16>,
     sink: ITfCompositionSink,
+    /// 拼音光标位置（字节下标）：SetText 后把选中位置挪过去
+    sel: usize,
 }
 
 impl ITfEditSession_Impl for CompSession {
@@ -1255,11 +1413,15 @@ impl ITfEditSession_Impl for CompSession {
                 let g = COMPOSITION.lock().unwrap();
                 match g.as_ref().unwrap().GetRange() {
                     Ok(r) => r,
-                    Err(_) => return Ok(()),
+                    Err(_) => {
+                        dlog!("CompSession: 旧组合 GetRange 失败（组合已死但还没收到 Terminated），本键不更新组合");
+                        return Ok(());
+                    }
                 }
             } else {
                 match (&*sel[0].range).as_ref() { Some(r) => r.clone(), None => return Ok(()) }
             };
+            dlog!("CompSession have={have} len={} sel_ok={}", self.text.len(), n);
 
             if !have {
                 if let Ok(cc) = self.ctx.cast::<ITfContextComposition>() {
@@ -1272,10 +1434,18 @@ impl ITfEditSession_Impl for CompSession {
                 let g = COMPOSITION.lock().unwrap();
                 if let Some(comp) = g.as_ref() {
                     if let Ok(r) = comp.GetRange() {
-                        let _ = r.SetText(ec, 0, &self.text);
+                        let hr = r.SetText(ec, 0, &self.text);
+                        dlog!("CompSession SetText len={} -> {hr:?}", self.text.len());
+                    } else {
+                        dlog!("CompSession: StartComposition 后的 GetRange 失败");
                     }
+                } else {
+                    dlog!("CompSession: StartComposition 没成功，组合没建起来");
                 }
             }
+
+            // 光标位置同步进组合（v4.14.0：字母插在光标处，竖线要跟过去）
+            comp_set_caret(&self.ctx, ec, self.sel);
 
             // 把候选窗放到光标下方；取不到文本范围就退回系统光标位置（否则候选窗根本不出现）
             let mut placed = false;
@@ -1348,19 +1518,57 @@ impl ITfEditSession_Impl for DoneSession {
     }
 }
 
-/// 只更新组合里的文字（退格时用），不结束组合
+/// 只更新组合里的文字（退格 / Delete 时用），不结束组合
 #[implement(ITfEditSession)]
 struct UpdateSession {
+    ctx: ITfContext,
     text: Vec<u16>,
+    /// 拼音光标位置：改完文字后把选中位置挪过去
+    sel: usize,
 }
 
 impl ITfEditSession_Impl for UpdateSession {
     fn DoEditSession(&self, ec: u32) -> Result<()> {
         unsafe {
-            let g = COMPOSITION.lock().unwrap();
-            if let Some(comp) = g.as_ref() {
-                if let Ok(r) = comp.GetRange() {
-                    let _ = r.SetText(ec, 0, &self.text);
+            {
+                let g = COMPOSITION.lock().unwrap();
+                if let Some(comp) = g.as_ref() {
+                    if let Ok(r) = comp.GetRange() {
+                        let _ = r.SetText(ec, 0, &self.text);
+                    }
+                }
+            } // 先放锁：comp_set_caret 自己会拿 COMPOSITION 锁，持锁调它 = 自死锁
+            comp_set_caret(&self.ctx, ec, self.sel);
+        }
+        Ok(())
+    }
+}
+
+/// 只挪组合里的选中位置（←/→ Home/End 移动光标时用），不改文字。
+/// 候选窗跟着竖线走，不然候选还停在旧光标下。
+#[implement(ITfEditSession)]
+struct CaretSession {
+    ctx: ITfContext,
+    sel: usize,
+}
+
+impl ITfEditSession_Impl for CaretSession {
+    fn DoEditSession(&self, ec: u32) -> Result<()> {
+        unsafe {
+            comp_set_caret(&self.ctx, ec, self.sel);
+            if COMPOSITION.lock().unwrap().is_some() {
+                if let Ok(view) = self.ctx.GetActiveView() {
+                    let mut sel = [TF_SELECTION::default()];
+                    let mut n = 0u32;
+                    if self.ctx.GetSelection(ec, 0, &mut sel, &mut n).is_ok() && n > 0 {
+                        if let Some(r) = (&*sel[0].range).as_ref() {
+                            let mut rc = RECT::default();
+                            let mut clipped = BOOL(0);
+                            if view.GetTextExt(ec, r, &mut rc, &mut clipped).is_ok() {
+                                *PENDING_CAND.lock().unwrap() = Some((rc.left, rc.bottom + 6));
+                            }
+                        }
+                    }
                 }
             }
         }

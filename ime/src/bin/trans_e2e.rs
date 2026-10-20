@@ -43,6 +43,7 @@ static mut EDIT: HWND = HWND(0);
 static mut PHASE: u32 = 0;
 static mut QI: usize = 0;
 static mut QUEUE: Vec<u16> = Vec::new();
+static mut WARMUP: bool = false;
 static mut LOG: String = String::new();
 static mut PROFILES: Option<ITfInputProcessorProfiles> = None;
 static mut KEEP_DLL: Option<HMODULE> = None;
@@ -242,12 +243,24 @@ unsafe fn tick(h: HWND) {
                 Err(e) => logline(&format!("拿不到 profiles: {e:?}")),
             }
             activate();
-            logline("=== T1 逐字: ni+空格 -> 你 ты ===");
-            QUEUE = vec![0x4E, 0x49, 0x20];
+            // 预热：链式启动器里前一套台架进程刚退出、TSF 还在清理，首拍按键
+            // 会被吃掉（v4.13.0 实测 trans 排链里跑 T1 必空文档，单跑绿）。
+            // 先打一发 ni+空格+nihao+空格 喂给清理期再清空，T1 才稳。
+            logline("=== 预热: ni+空格+nihao+空格 -> 清空 ===");
+            QUEUE = vec![0x4E, 0x49, 0x20, 0x4E, 0x49, 0x48, 0x41, 0x4F, 0x20];
             QI = 0;
+            WARMUP = true;
             PHASE = 1;
         }
         1 => {
+            if WARMUP {
+                WARMUP = false;
+                clear_edit();
+                logline("=== T1 逐字: ni+空格 -> 你 ты ===");
+                QUEUE = vec![0x4E, 0x49, 0x20];
+                QI = 0;
+                return;
+            }
             let _ = result("T1", "「你 ты」", text_of() == "你 ты");
             clear_edit();
             logline("=== T2 逐字: nihao+空格 -> 你好 привет ===");

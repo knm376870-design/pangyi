@@ -5,6 +5,7 @@
 //! 断言 settings.txt 里对应配置真的变了 —— 专防「画的是一块、点的是另一块」
 //! （v4.5.0 的教训）和「点药丸把窗口点关了」这类回归。
 //! v4.10.0 加「配色」行后补 T6（点「粉」→ accent=1，点回「青」收尾）。
+//! v4.13.0 加「英文模式」行后补 T8（点「开」→ english=1，点回「关」收尾）。
 //!
 //! 用例：
 //!   T1 点「5」        -> max=5
@@ -13,6 +14,7 @@
 //!   T4 点「整句」      -> trmode=2
 //!   T5 点「标点 关」    -> cnpunct=0
 //!   T6 点「粉」       -> accent=1（v4.10.0 配色行；点完点回「青」收尾）
+//!   T8 点「英文 开」    -> english=1（v4.13.0 英文模式行；点完点回「关」收尾）
 //!   T7 点「关闭」      -> 窗口真关（IsWindow=false）
 //!
 //! 用法：settings_e2e.exe [新DLL路径]（LOCALAPPDATA 重定向由启动器环境做）
@@ -158,6 +160,13 @@ fn main() {
         check("T6", "accent=1");
         logline("  点回「青」收尾（accent=0，老用户默认色）");
         click!(18);
+
+        logline("=== T8 点「英文 开」: 英文模式=开（english=1）===");
+        click!(23);
+        check("T8", "english=1");
+        logline("  点回「关」收尾（english=0，老用户默认中文模式）");
+        click!(24);
+        check("T8b", "english=0");
 
         logline("=== T7 点「关闭」: 窗口真关 ===");
         click!(0);

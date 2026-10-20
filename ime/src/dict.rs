@@ -50,6 +50,15 @@ struct Index {
     prefix_top: HashMap<&'static str, Vec<(&'static str, u64)>>,
     learned: Mutex<HashMap<String, u32>>,
     total_freq: f64,
+    /// v4.13.0 混打：26 个首字母桶（first_ini['g' - 'a'] = 拼音以 g 开头的词条行）。
+    /// 桶内保持词典原顺序 —— dict.tsv 本身按词频降序，所以桶天然按词频排好，
+    /// 混打扫描按序取前几条即可，不用再排序。
+    first_ini: Vec<Vec<&'static str>>,
+    /// 音节表：所有单字词的拼音（混打切分按「一字一音节」找边界用）
+    syll: HashSet<&'static str>,
+    /// 混打切分的音节长度缓存（行指针 -> 各音节字符数）。惰性算：一次会话
+    /// 只会扫到各桶靠前的几千行，不用为 29 万行都切一遍。
+    lens: Mutex<HashMap<usize, &'static [u16]>>,
 }
 
 fn learned_file() -> String {
@@ -100,10 +109,12 @@ fn index() -> &'static Index {
         let lines: Vec<&'static str> = RAW.lines().skip(1).collect();
         let mut exact: Vec<Row> = Vec::with_capacity(64000);
         let mut ini: Vec<Row> = Vec::with_capacity(320000);
+        let mut first_ini: Vec<Vec<&'static str>> = (0..26).map(|_| Vec::new()).collect();
+        let mut syll: HashSet<&'static str> = HashSet::with_capacity(512);
         for line in &lines {
             // 一条记录 8 列，边遍历边取，不 collect
             let mut it = line.split('\t');
-            let _simp = it.next().unwrap_or("");
+            let simp = it.next().unwrap_or("");
             let _trad = it.next();
             let py = match it.next() { Some(s) => s, None => continue };
             let _disp = it.next();
@@ -124,6 +135,16 @@ fn index() -> &'static Index {
             total_freq += line_freq(*line) as f64;
             if !ini_key.is_empty() {
                 ini.push((ini_key, *line));
+            }
+            // 混打首字母桶（v4.13.0）：只收小写 a-z 开头的拼音
+            if let Some(c) = py.chars().next() {
+                if c.is_ascii_lowercase() {
+                    first_ini[c as usize - 'a' as usize].push(*line);
+                }
+            }
+            // 音节表：单字词的拼音就是合法音节（和 gen_abbr 同款收集规则）
+            if simp.chars().count() == 1 {
+                syll.insert(py);
             }
         }
         // 首字母缩写键（v4.2.2）：词典第八列只覆盖 12 万条，还有 17 万条
@@ -207,6 +228,9 @@ fn index() -> &'static Index {
             prefix_top,
             learned: Mutex::new(load_learned()),
             total_freq: total_freq.max(1.0),
+            first_ini,
+            syll,
+            lens: Mutex::new(HashMap::new()),
         }
     })
 }
@@ -309,6 +333,131 @@ fn seg_dfs(
     }
 }
 
+// ---------------- 混打匹配（v4.13.0：缩写 + 全拼混合，gzuo → 工作） ----------------
+//
+// 用户「第一个字打缩写、后面打全拼」（gzuo / zgren / zhguoren）时，输入既不是
+// 拼音前缀也不是缩写前缀，旧 lookup 的整串匹配全落空。这里按微软的行为做：
+// 每个词允许每个音节独立选择「全拼 | zh/ch/sh 双声母 | 首字母」三种打法，
+// 组合出的编码切在输入串前面就算匹配（gzuo = g(ong) + zuo → 工作）。
+
+/// 混打扫描：每个 DP 位置最多试多少个桶内词条。桶按词频降序，目标词几乎都
+/// 在前几百名内；800 条对每键候选刷新只有几十微秒，垃圾输入（qwqwe 这种
+/// 每个位置都扫满）也就 1ms 出头。
+const MAX_MIXED_SCAN: usize = 800;
+/// 每个位置最多收几条混打匹配（词频最高的前几条就够 DP 挑了）
+const MAX_MIXED_TAKE: usize = 6;
+
+/// 运行时音节切分：把词拼音按「一字一音节」切成长度表（字符数）。
+/// 与编译期 gen_abbr 的 seg_dfs 同规则、取同一种切法（第一个找到的），
+/// 但不泄漏、只返回长度 —— 这里是热路径，能跑多快跑多快。
+fn syll_lens_rt(py: &str, want: usize, syll: &HashSet<&'static str>) -> Option<Box<[u16]>> {
+    if want < 2 {
+        return None;
+    }
+    let chars: Vec<char> = py.chars().collect();
+    if chars.len() < want {
+        return None;
+    }
+    let mut lens: Vec<u16> = Vec::with_capacity(want);
+    dfs_lens(&chars, 0, want, syll, &mut lens).then(|| lens.into_boxed_slice())
+}
+
+/// seg_dfs 的不泄漏版本：只记音节长度，找到第一种完整切法就返回 true
+fn dfs_lens(chars: &[char], pos: usize, want: usize, syll: &HashSet<&'static str>, cur: &mut Vec<u16>) -> bool {
+    let rem_syl = want - cur.len();
+    let rem_ch = chars.len() - pos;
+    if rem_syl == 0 {
+        return pos == chars.len();
+    }
+    if rem_ch < rem_syl || rem_ch > rem_syl * 6 {
+        return false;
+    }
+    let maxl = (rem_ch - (rem_syl - 1)).min(6);
+    for len in 1..=maxl {
+        let cand: String = chars[pos..pos + len].iter().collect();
+        if !syll.contains(cand.as_str()) {
+            continue;
+        }
+        cur.push(len as u16);
+        if dfs_lens(chars, pos + len, want, syll, cur) {
+            return true;
+        }
+        cur.pop();
+    }
+    false
+}
+
+/// 某行的音节长度表（惰性算 + 缓存）。缓存键用行指针：同一个 &'static str
+/// 每次都是同一个切片，指针即身份，比哈希整行内容快。
+fn line_lens(idx: &Index, line: &'static str) -> Option<&'static [u16]> {
+    let key = line.as_ptr() as usize;
+    if let Some(l) = idx.lens.lock().unwrap().get(&key) {
+        return Some(l);
+    }
+    let wc = line_word(line).chars().count();
+    let lens = syll_lens_rt(line_py(line), wc, &idx.syll)?;
+    let leaked: &'static [u16] = Box::leak(lens);
+    idx.lens.lock().unwrap().insert(key, leaked);
+    Some(leaked)
+}
+
+/// 混打匹配：词的每个音节按「全拼 | zh/ch/sh 双声母 | 首字母」三种打法任意
+/// 组合，组合出的编码是 seg 的前缀时返回消费掉的字符数（词完整打完，seg 剩余
+/// 部分交给 DP 继续切）。词只打了一半 / 打错时返回 None。
+/// 每音节先试全拼再试双声母再试首字母 —— 用户打的是全拼就按全拼消费，同一
+/// 个词不会被拆成两种消费方式。
+/// 双声母/首字母的"词没打完"判据：**消费完正好到输入末尾**才算没打完
+/// （zhongguorenm 的「你们」=n+m，留成尾巴 m 做补全）。词后面还有输入
+/// 时允许：zgren 的「中国」=z+g 拆出来，后面 exact 的 ren 接上 ——
+/// 整词线 中国人 词频 0 排在首字母桶末尾，扫描够不着（v4.13.0 M2）。
+fn mixed_match(idx: &Index, line: &'static str, seg: &[char]) -> Option<usize> {
+    let lens = line_lens(idx, line)?;
+    let mut k = 0usize; // seg 已消费的字符数
+    let mut pit = line_py(line).chars();
+    for &l in lens {
+        let l = l as usize;
+        if k >= seg.len() {
+            return None; // 音节还没消费完，缓冲区先没了 → 词只打了一半
+        }
+        // 固定数组收音节（最长 zhuang = 6 字符），不分配
+        let mut syl = ['\0'; 6];
+        let mut sl = 0usize;
+        for slot in syl.iter_mut().take(l) {
+            match pit.next() {
+                Some(c) => {
+                    *slot = c;
+                    sl += 1;
+                }
+                None => return None,
+            }
+        }
+        let syl = &syl[..sl];
+        // 1) 全拼
+        if seg.len() - k >= l && &seg[k..k + l] == syl {
+            k += l;
+            continue;
+        }
+        // 2) zh/ch/sh 双声母 —— 最后一个音节只打双声母、消费完正好到
+        //    输入末尾 = 词没打完，返回 None（v4.13.0 回归：zhrmghg 的
+        //    「共和国」=g+h+g 被当整词，顶掉精确缩写「中华人民共和国」）。
+        if l >= 2 && matches!(&syl[..2], ['z', 'h'] | ['c', 'h'] | ['s', 'h']) {
+            if seg.len() - k >= 2 && &seg[k..k + 2] == &syl[..2] && k + 2 < seg.len() {
+                k += 2;
+                continue;
+            }
+        }
+        // 3) 首字母 —— 消费完就到输入末尾时不许（zhongguorenm 的
+        //    「你们」=n+m 必须留成尾巴 m 做补全，不能算整词 —— v4.13.0
+        //    回归，修）；词后面还有输入时允许（见函数头注释）。
+        if seg[k] == syl[0] && k + 1 < seg.len() {
+            k += 1;
+            continue;
+        }
+        return None;
+    }
+    Some(k)
+}
+
 fn line_score(line: &str) -> u64 {
     line_freq(line) * 10 + line_word(line).chars().count() as u64
 }
@@ -328,6 +477,9 @@ fn hit_of(line: &'static str) -> Option<Hit> {
     let src = it.next().unwrap_or("");
     let tier = match src {
         "pivot-ext" => 1,
+        // nogloss（jieba 扩容的无释义行）与机器枢轴同档罚 1.0：有译文的词
+        // 优先（H2：绵羊压过沔阳），但无释义词仍可翻页选到（沔阳在绵阳之前）。
+        "nogloss" => 1,
         "english" => 2,
         _ => 0,
     };
@@ -389,12 +541,17 @@ fn dedup_words(out: &mut Vec<Hit>) {
 /// 只看词典词频（jieba）会把书面/正式词排前面 —— 例如 lvxing 把「履行」排在
 /// 「旅行」前面、yisheng 把「一声」排在「医生」前面。再掺一份语料词频
 /// （语言模型的 unigram，训练语料是真实文本）就能掰回来。
+/// v4.14.0 权重 0.5/0.5 → 0.65/0.35：zhwiki 主库语料偏百科书面（在建 4406 vs
+/// 再见 430、河水 2020 vs 喝水 201），语料占一半会把日常词压到第二；
+/// 词频为主、语料为辅后，双偏书面的少数对（再见/喝水/医院/经理）靠
+/// 词典覆盖行兜底。语料降到 0 会把「一声」(词频16017) 顶回「医生」前面，
+/// 所以不能全砍。
 fn blended_rank(freq: u64, word: &str, tier: u8) -> f64 {
     if freq == u64::MAX {
         return f64::INFINITY;   // 自定义短语永远排最前
     }
     let corpus = lm_uni().get(word).copied().unwrap_or(0) as f64;
-    let base = 0.5 * ((freq as f64) + 1.0).ln() + 0.5 * (corpus + 1.0).ln();
+    let base = 0.65 * ((freq as f64) + 1.0).ln() + 0.35 * (corpus + 1.0).ln();
     // 按来源置信度降权：机器枢轴猜的、只有英文释义的，不许压过有可靠来源的词。
     // （机器翻的"河水"频次 917，不该把有据可查的"喝水"302 顶下去）
     let penalty = match tier {
@@ -496,11 +653,25 @@ pub fn lookup(ascii: &str) -> Vec<Hit> {
     //      要进池参与排序，整句本体稍后放最前。
     //      旧版整串切不完就什么都不给（zhongguorenm 之类前面全是空窗），
     //      尾巴补全保证窗口永远有候选 —— "多打几个字母候选就没了"的另一半。
-    let sentence_plan = if ascii.chars().count() >= 5 {
+    //      输入本身就是已知缩写键时不跑：zhrmghg/zgrmjfj 的答案就是
+    //      缩写候选（中华人民共和国），混打 DP 在这种串上只会拼出
+    //      「主任呣共和国」这类垃圾顶掉正确答案（v4.13.0 回归，修）。
+    let is_abbrev = {
+        let a = idx.ini.partition_point(|(k, _)| *k < ascii);
+        idx.ini.get(a).is_some_and(|&(k, _)| k == ascii)
+    };
+    let mut sentence_plan = if !is_abbrev && ascii.chars().count() >= 5 {
         sentence(ascii)
     } else {
         None
     };
+    // 混打兜底（v4.13.0）：3~4 字母的「缩写+全拼」混合串（gzuo/zgren）在
+    // 精确/前缀/缩写里全都查不到、候选池是空的 —— 这时跑一遍整句 DP
+    // （含混打转移）兜底，保证"打任何东西都能打出来"。池里有货的 3~4
+    // 字母输入不跑，行为不变。
+    if sentence_plan.is_none() && out.is_empty() && ascii.chars().count() >= 3 && ascii.chars().count() < 5 {
+        sentence_plan = sentence(ascii);
+    }
     if let Some((_, tail)) = &sentence_plan {
         if !tail.is_empty() {
             for h in prefix_hits(tail, 8) {
@@ -915,29 +1086,14 @@ pub fn sentence(pinyin: &str) -> Option<(Vec<Hit>, String)> {
             Some(c) => c.clone(),
             None => continue,
         };
-        for len in 1..=(n - i).min(14) {
-            let key: String = chars[i..i + len].iter().collect();
-            let lines = exact_group(idx, key.as_str());
-            if lines.is_empty() {
-                continue;
-            }
-            // 同一个拼音可能有多个词（如 shijie → 世纪/世界），全都要试，
-            // 交给动态规划按上下文挑最好的，而不是这里就定死。
-            // 取前 48 条再排序：词典文件本身按词频降序，同一个读音的前几十条
-            // 就是最高频的那些（实测全库 17 万个读音组里只有 12 个组的前 6 名
-            // 会因此不同）。不设上限的话，"yi"这种 500 多条的读音组每次转移
-            // 都要解析+排序 500 行，长句子输入从 0.4ms 涨到 1.5ms。
-            // sort_by_cached_key：词频只解析一次/行（sort_by_key 是每次比较都解析）。
-            let mut alts: Vec<&'static str> =
-                lines.iter().take(48).map(|(_, l)| *l).collect();
-            alts.sort_by_cached_key(|l| std::cmp::Reverse(line_freq(l)));
-            for line in alts.into_iter().take(6) {
+        // 打分 + 更新 best 的公共转移（整音节路径和混打路径共用同一套打分）
+        let mut try_line = |line: &'static str, consumed: usize| {
             let freq = line_freq(line).max(1) as f64;
             let wlen = line_word(line).chars().count() as f64;
             // 打分（离线词模型：词频 + 长度先验 + 单字惩罚）
-            //   ln(词频)      —— 常用词得分高
-            //   + 12*(字数-1) —— 长词强偏好
-            //   - 8（单字）   —— 单字词频被"作为字的频率"抬高了，必须压一压，
+            //   ln(词频/总词频) —— 常用词得分高
+            //   + 2.5*(字数-1)*词频缩放 —— 长词偏好（低频长词加成缩水，见下）
+            //   - 5（低频单字） —— 单字词频被"作为字的频率"抬高了，必须压一压，
             //                    否则 jintiantianqihenhao 会被切成"进/提/按..."
             // 语言模型（log 空间，避免两个概率分布量纲不一致）：
             //   log P(词)  = 0.75*log(词典频率占比) + 0.25*log(语料频率占比)
@@ -956,7 +1112,11 @@ pub fn sentence(pinyin: &str) -> Option<(Vec<Hit>, String)> {
                 if u > 0.0 && b > 0.0 {
                     0.8 * (b / u).ln() + 0.2 * log_p_uni
                 } else {
-                    log_p_uni - 3.0
+                    // 没见过的搭配 -3.0 太重：旧 LM 只有 10 万条搭配，绝大多数
+                    // 词对都落在这一档，等于组合几乎全靠单字上下文硬撑。
+                    // 降到 -1.5，让 unigram 证据占主导（v4.14.0 换大 LM 后
+                    // 命中搭配的词对更多，这一档的份量更要轻）。
+                    log_p_uni - 1.5
                 }
             };
             // 单字词旧版统一 -5：本意是压住被"作为字的频率"抬高的生僻字
@@ -967,16 +1127,66 @@ pub fn sentence(pinyin: &str) -> Option<(Vec<Hit>, String)> {
             // jintiantianqihenhao 仍切「今天/天气/很好」：今天(词频15万+长词
             // 加成)本来就压得过 进/提/按，不靠这一刀。
             let single_pen = if wlen <= 1.0 && freq < 120.0 { 5.0 } else { 0.0 };
+            // 低频词一刀切 -6 太狠：词典 88.7% 的行 freq<120（v4.14.0 扩容后
+            // 比例更高），等于这些词基本不能参与整句组合 —— 「词组组合太少」
+            // 的一大来源。降到 -2/-3：能组合了，但依旧输给高频词，排序不乱。
+            // 长度加成按词频缩放（freq<120 按比例缩水）：原来稀词（青帮 18）
+            // 也拿满 2.5/字，配上一刀切放宽后 qingbang 会切「青帮」而不是
+            // 「请+帮」（请35284/帮51944 拆两个词要付两次总词频归一化，
+            // 稀词靠满额长度加成反超）。低频罚 -2→-3 补上这个口子。
+            let len_bonus = 2.5 * (wlen - 1.0) * (freq.min(120.0) / 120.0);
             let score = cur.0 + log_p
-                + 2.5 * (wlen - 1.0)
+                + len_bonus
                 - single_pen
-                - if freq < 120.0 { 6.0 } else { 0.0 };
-            let end = i + len;
+                - if freq < 120.0 { 3.0 } else { 0.0 };
+            let end = i + consumed;
             if best[end].as_ref().map(|(s, _)| score > *s).unwrap_or(true) {
                 let mut seq = cur.1.clone();
                 seq.push(line);
                 best[end] = Some((score, seq));
             }
+        };
+        let mut exact_hit = false;
+        for len in 1..=(n - i).min(14) {
+            let key: String = chars[i..i + len].iter().collect();
+            let lines = exact_group(idx, key.as_str());
+            if lines.is_empty() {
+                continue;
+            }
+            exact_hit = true;
+            // 同一个拼音可能有多个词（如 shijie → 世纪/世界），全都要试，
+            // 交给动态规划按上下文挑最好的，而不是这里就定死。
+            // 取前 48 条再排序：词典文件本身按词频降序，同一个读音的前几十条
+            // 就是最高频的那些（实测全库 17 万个读音组里只有 12 个组的前 6 名
+            // 会因此不同）。不设上限的话，"yi"这种 500 多条的读音组每次转移
+            // 都要解析+排序 500 行，长句子输入从 0.4ms 涨到 1.5ms。
+            // sort_by_cached_key：词频只解析一次/行（sort_by_key 是每次比较都解析）。
+            let mut alts: Vec<&'static str> =
+                lines.iter().take(48).map(|(_, l)| *l).collect();
+            alts.sort_by_cached_key(|l| std::cmp::Reverse(line_freq(l)));
+            for line in alts.into_iter().take(6) {
+                try_line(line, len);
+            }
+        }
+        // 混打转移（v4.13.0）：这个位置连一个完整音节都切不出来（缩写/混打/
+        // 打错）时，按首字母桶找「每音节 全拼|zh/ch/sh|首字母」编码能完整
+        // 消费的词。整音节路径有命中就不跑 —— 正常打全拼零开销（混打在那
+        // 种输入里只会找到和整音节一样的重复转移）。
+        if !exact_hit && n - i >= 2 {
+            let c = chars[i];
+            if c.is_ascii_lowercase() {
+                let mut scanned = 0usize;
+                let mut got = 0usize;
+                for &line in &idx.first_ini[c as usize - 'a' as usize] {
+                    if scanned >= MAX_MIXED_SCAN || got >= MAX_MIXED_TAKE {
+                        break;
+                    }
+                    scanned += 1;
+                    if let Some(consumed) = mixed_match(idx, line, &chars[i..]) {
+                        try_line(line, consumed);
+                        got += 1;
+                    }
+                }
             }
         }
     }
